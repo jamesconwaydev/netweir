@@ -24,6 +24,10 @@ impl Drop for Running {
 }
 
 fn running() -> Option<Running> {
+    running_with(&[])
+}
+
+fn running_with(extra: &[&str]) -> Option<Running> {
     let executable = chrome()?;
     static COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
     // One each: Chromes sharing a profile hand off to the first.
@@ -35,8 +39,9 @@ fn running() -> Option<Running> {
             "--remote-debugging-port=0",
             "--no-first-run",
             &format!("--user-data-dir={}", profile.display()),
-            "about:blank",
         ])
+        .args(extra)
+        .arg("about:blank")
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .spawn()
@@ -244,4 +249,31 @@ async fn a_websocket_that_isnt_devtools_says_so() {
         .err()
         .expect("an echo isn't a browser");
     assert!(err.to_string().contains("DevTools"), "{err}");
+}
+
+#[tokio::test]
+async fn a_connected_chrome_whose_hints_a_flag_emptied_is_left_as_it_is() {
+    let Some(chrome) = running_with(&[
+        "--user-agent=Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/154.0.0.0 Safari/537.36",
+    ]) else {
+        return;
+    };
+    let browser = Browser::connect(&chrome.ws, LaunchOptions::default())
+        .await
+        .unwrap();
+    let page = browser.new_page().await.unwrap();
+    page.goto("about:blank", WaitUntil::Load, None)
+        .await
+        .unwrap();
+    // Overriding with the empty hints Chrome reports under the flag would
+    // send them as empty headers; Chrome is left to its own.
+    assert!(
+        !browser
+            .methods_sent()
+            .iter()
+            .any(|m| m == "Network.setUserAgentOverride"),
+        "{:?}",
+        browser.methods_sent()
+    );
+    browser.close().await.unwrap();
 }

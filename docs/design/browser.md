@@ -238,9 +238,13 @@ they own. Closing the browser closes every page.
   disallows is failed before it's sent, and the request is dropped for
   robots. Frames within the page, and the files it loads, aren't checked.
 - A Chrome that dies is started again for the next browser request; one
-  that can't start isn't tried again. A page Chrome answers with a server
-  error is retried there like any other, except a blocked request's one
-  go in Chrome.
+  that can't start is tried again a minute later, not for every request
+  meanwhile. A page Chrome answers with a server error, a 429 or a 503
+  with Retry-After is slowed down and retried there like any other, except
+  a blocked request's one go in Chrome.
+- A connected browser running with a `--user-agent` flag of its own
+  reports emptied high-entropy hints; an override would send them as
+  empty headers, so its pages are left as Chrome makes them.
 
 Cookie hand-back only helps if the HTTP client looks like the same browser
 the cookie was issued to, so the new session uses the HTTP profile that

@@ -293,8 +293,9 @@ struct Shared {
     events: Notify,
     /// Chrome, started the first time a request needs it.
     /// A Chrome that dies is started again for the next request that
-    /// needs one; one that can't start isn't tried again.
-    browser: tokio::sync::Mutex<Option<Result<Browser, String>>>,
+    /// needs one. One that can't start is tried again a minute on, not for
+    /// every request meanwhile.
+    browser: tokio::sync::Mutex<Option<Result<Browser, (String, Instant)>>>,
     /// Places for open Chrome pages.
     pages: Arc<Semaphore>,
     runtime: tokio::runtime::Handle,
@@ -1243,6 +1244,30 @@ async fn browser_fetch(shared: Arc<Shared>, mut q: Queued, permit: OwnedSemaphor
             retry(settings, &mut state, q);
             None
         }
+        // Throttled (a 429, or a 503 with Retry-After): slowed down and
+        // tried again, as over HTTP.
+        (Ok((response, page, ..)), Some(Outcome::Throttled { retry_after })) => {
+            state.stats.throttled += 1;
+            slow_down(
+                settings,
+                &mut state,
+                &q.host,
+                retry_after,
+                !settings.throttle,
+            );
+            if q.blocked.is_none() && q.attempts < settings.retries {
+                discard = Some(page);
+                drop(response);
+                retry(settings, &mut state, q);
+                None
+            } else {
+                Some(Event::Fetched {
+                    id: q.request.id,
+                    response,
+                    page: Some(page),
+                })
+            }
+        }
         (Ok((response, page, cookies, _, version)), outcome) => {
             // Chrome follows redirects itself: where it ended up counts as
             // seen, as a redirect the HTTP client followed would.
@@ -1326,12 +1351,16 @@ async fn render(
 ) -> Result<Rendered, FetchError> {
     let browser = {
         let mut slot = shared.browser.lock().await;
-        let dead = matches!(&*slot, Some(Ok(b)) if b.is_closed());
-        if slot.is_none() || dead {
+        let start = match &*slot {
+            None => true,
+            Some(Ok(b)) => b.is_closed(),
+            Some(Err((_, when))) => when.elapsed() > Duration::from_secs(60),
+        };
+        if start {
             let launched = Browser::launch(browser_launch(&shared)).await;
-            *slot = Some(launched.map_err(|e| e.to_string()));
+            *slot = Some(launched.map_err(|e| (e.to_string(), Instant::now())));
         }
-        slot.clone().expect("set above")
+        slot.clone().expect("set above").map_err(|(e, _)| e)
     }
     .map_err(|e| FetchError {
         kind: FetchErrorKind::Other,

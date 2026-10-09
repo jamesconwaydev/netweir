@@ -50,7 +50,7 @@ The options:
 |---|---|---|
 | `executable` | `None` | the Chrome to start, instead of searching |
 | `headless` | `True` | `False` opens a window |
-| `args` | `()` | more Chrome command-line switches |
+| `args` | `()` | more Chrome command-line switches; with your own `--user-agent=`, pages say that and keep Chrome's behaviour under the flag, high-entropy client hints empty |
 | `timeout` | `30.0` | the default limit, in seconds, for navigations and actions |
 | `proxy` | `None` | an `http://`, `https://` or `socks5://` proxy for everything Chrome fetches; for an HTTP(S) proxy, a username and password in it are given when it asks (Chrome can't log in to a SOCKS proxy) |
 | `connect` | `None` | drive a browser that's already running, instead of starting one: a `ws://` DevTools URL, or `http://host:port` |
@@ -69,7 +69,8 @@ address or `localhost`, so for one in Docker, say, use the `ws://` URL.
 Nothing is launched, so `executable`, `args`, `proxy` and `headless`
 don't apply. Closing the browser, or dropping it, closes the pages
 netweir opened and leaves the browser running. A `wss://` URL works too:
-its certificate is checked against the roots Chrome trusts.
+its certificate is checked against Chrome's own root store (not against
+certificates installed on the machine, such as a company's).
 
 ## Pages and contexts
 
@@ -203,8 +204,8 @@ Two settings make Chrome step in on its own:
 - `browser="always"`: every request goes through Chrome.
 
 Chrome is started the first time the crawl needs it, and again if it
-dies. If it can't start at all, browser requests fail, each saying why,
-and it isn't tried again.
+dies. If it can't start, browser requests fail, each saying why, and it's
+tried again a minute later.
 
 Chrome goes through the crawl's `proxy`, login included, so the cookies it
 earns come from the address the HTTP client uses. It doesn't move through

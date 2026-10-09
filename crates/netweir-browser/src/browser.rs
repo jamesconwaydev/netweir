@@ -124,7 +124,7 @@ impl Browser {
             // high-entropy client hints, which each page's override puts
             // back.
             if !options.args.iter().any(|a| a.starts_with("--user-agent=")) {
-                let (agent, metadata) = headless_identity(&executable).await?;
+                let (agent, metadata) = headless_identity(&executable, &options.args).await?;
                 args.push(format!(
                     "--user-agent={}",
                     agent.replace("HeadlessChrome/", "Chrome/")
@@ -246,14 +246,25 @@ impl Browser {
             .as_ref()
             .and_then(|b| b(&major))
             .filter(|header| !parse_brands(header).is_empty());
-        // Headless, the user agent comes from the --user-agent flag, which
-        // leaves the high-entropy client hints empty until a page's
-        // override restores them.
-        if options.headless || user_agent.contains("HeadlessChrome/") || brands.is_some() {
-            let mut metadata = match hints {
+        // A headless Chrome netweir launched has a clean user agent from the
+        // --user-agent flag and the hints it read before the flag emptied
+        // them, which each page's override restores.
+        let mut identity = None;
+        if hints.is_some() || user_agent.contains("HeadlessChrome/") || brands.is_some() {
+            let probed = hints.is_some();
+            let metadata = match hints {
                 Some(hints) => hints,
                 None => browser.own_metadata().await?,
             };
+            // A Chrome running with a --user-agent flag of someone else's
+            // reports emptied hints, and an override would send them as
+            // empty headers; it's left as it is.
+            let emptied = metadata["architecture"] == "" && metadata["platformVersion"] == "";
+            if probed || !emptied {
+                identity = Some(metadata);
+            }
+        }
+        if let Some(mut metadata) = identity {
             if let Some(header) = brands {
                 let list = parse_brands(&header);
                 metadata["brands"] = list
@@ -504,24 +515,35 @@ fn profile_dir() -> std::io::Result<PathBuf> {
 /// its client hints, which only asking it tells exactly, and only before
 /// a --user-agent flag empties the hints. The first time, it's started once
 /// to ask.
-async fn headless_identity(executable: &Path) -> Result<(String, Value)> {
-    static KNOWN: Mutex<Option<HashMap<PathBuf, (String, Value)>>> = Mutex::new(None);
+async fn headless_identity(executable: &Path, extra: &[String]) -> Result<(String, Value)> {
+    // By the file as it is now: a Chrome updated in place is asked again.
+    type Key = (PathBuf, Option<std::time::SystemTime>, u64);
+    static KNOWN: Mutex<Option<HashMap<Key, (String, Value)>>> = Mutex::new(None);
+    let meta = std::fs::metadata(executable).ok();
+    let key: Key = (
+        executable.to_path_buf(),
+        meta.as_ref().and_then(|m| m.modified().ok()),
+        meta.as_ref().map_or(0, |m| m.len()),
+    );
     if let Some(known) = KNOWN
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .get_or_insert_with(HashMap::new)
-        .get(executable)
+        .get(&key)
     {
         return Ok(known.clone());
     }
     let profile =
         profile_dir().map_err(|e| Error::Launch(format!("can't make a profile directory: {e}")))?;
-    let args = [
+    // The caller's switches too: a Chrome that only starts with, say,
+    // --no-sandbox must have it here as well.
+    let mut args = vec![
         format!("--user-data-dir={}", profile.display()),
         "--no-first-run".into(),
         "--headless".into(),
-        "about:blank".into(),
     ];
+    args.extend(extra.iter().cloned());
+    args.push("about:blank".into());
     let started = match launch::start(executable, &args) {
         Ok(started) => started,
         Err(e) => {
@@ -554,14 +576,31 @@ async fn headless_identity(executable: &Path) -> Result<(String, Value)> {
         Ok::<_, Error>((str_of(&version, "userAgent"), metadata))
     }
     .await;
-    probe.close().await?;
+    // What it said counts even if it then wouldn't close cleanly.
+    let _ = probe.close().await;
     let known = asked?;
     KNOWN
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .get_or_insert_with(HashMap::new)
-        .insert(executable.to_path_buf(), known.clone());
+        .insert(key, known.clone());
     Ok(known)
+}
+
+/// `host:port`, `host`, `[::1]:port` or `[::1]`, with 443 by default.
+fn host_and_port(authority: &str) -> std::result::Result<(&str, u16), String> {
+    let port = |p: &str| p.parse::<u16>().map_err(|e| format!("port {p:?}: {e}"));
+    if let Some(rest) = authority.strip_prefix('[') {
+        let (host, after) = rest.split_once(']').ok_or("an unclosed [ in the address")?;
+        return match after.strip_prefix(':') {
+            Some(p) => Ok((host, port(p)?)),
+            None => Ok((host, 443)),
+        };
+    }
+    match authority.rsplit_once(':') {
+        Some((host, p)) => Ok((host, port(p)?)),
+        None => Ok((authority, 443)),
+    }
 }
 
 /// A `wss://` WebSocket over BoringSSL, the TLS library netweir's HTTP
@@ -581,13 +620,7 @@ async fn secure_websocket(
         .split('/')
         .next()
         .unwrap_or_default();
-    let (host, port) = match authority.rsplit_once(':') {
-        Some((host, port)) if !host.ends_with(']') || authority.starts_with('[') => {
-            (host, port.parse::<u16>().map_err(|e| e.to_string())?)
-        }
-        _ => (authority, 443),
-    };
-    let host = host.trim_start_matches('[').trim_end_matches(']');
+    let (host, port) = host_and_port(authority)?;
     let tcp = tokio::net::TcpStream::connect((host, port))
         .await
         .map_err(|e| e.to_string())?;
@@ -867,6 +900,16 @@ mod tests {
             let err = split_proxy(bad).unwrap_err().to_string();
             assert!(!err.contains("hunter2"), "{err}");
         }
+    }
+
+    #[test]
+    fn wss_addresses_come_apart_into_host_and_port() {
+        assert_eq!(host_and_port("example.com"), Ok(("example.com", 443)));
+        assert_eq!(host_and_port("example.com:9222"), Ok(("example.com", 9222)));
+        assert_eq!(host_and_port("[::1]"), Ok(("::1", 443)));
+        assert_eq!(host_and_port("[::1]:9222"), Ok(("::1", 9222)));
+        assert!(host_and_port("[::1").is_err());
+        assert!(host_and_port("host:nope").is_err());
     }
 
     #[test]

@@ -476,3 +476,31 @@ async fn a_redirect_chrome_follows_obeys_the_next_sites_robots_txt() {
     );
     assert_eq!(c.stats().dropped_robots, 1);
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_503_with_retry_after_is_waited_out_and_tried_again_in_chrome() {
+    if !have_chrome() {
+        return;
+    }
+    let site = Site::scripted(vec![(
+        "/busy",
+        vec![
+            Page::status(503, "busy").with_header("retry-after", "0"),
+            Page::html(BUILT_BY_SCRIPT),
+        ],
+    )])
+    .await;
+    let c = crawler(settings(BrowserMode::Off));
+    c.submit(request(1, site.url("/busy"), true));
+    let events = drain_closing(&c).await;
+    let statuses: Vec<u16> = events
+        .iter()
+        .filter_map(|(e, _)| match e {
+            Event::Fetched { response, .. } => Some(response.status),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(statuses, [200], "{events:?}");
+    let stats = c.stats();
+    assert_eq!((stats.retries, stats.throttled), (1, 1));
+}
