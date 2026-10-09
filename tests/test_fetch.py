@@ -232,7 +232,14 @@ def test_asyncio_loop_stays_responsive(base):
 
 
 def test_profiles_by_browser_or_version(base):
-    for profile in ("chrome", "firefox", "chrome-154-macos", "firefox-156-macos"):
+    for profile in (
+        "chrome",
+        "firefox",
+        "safari",
+        "chrome-154-macos",
+        "firefox-156-macos",
+        "safari-27-macos",
+    ):
         assert netweir.get(f"{base}/page", profile=profile).status == 200, profile
     with pytest.raises(ValueError, match="firefox"):
         netweir.get(f"{base}/page", profile="netscape")

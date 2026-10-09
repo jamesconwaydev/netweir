@@ -35,6 +35,64 @@ impl FetchOptions {
     }
 }
 
+/// The jar, with cookies in the order the profile's browser sends them:
+/// longest path first, then oldest first (Chrome, Firefox) or newest first
+/// (Safari).
+struct OrderedJar {
+    jar: Arc<wreq::cookie::Jar>,
+    newest_first: bool,
+}
+
+impl wreq::cookie::CookieStore for OrderedJar {
+    fn set_cookies(&self, cookie_headers: &mut dyn Iterator<Item = &HeaderValue>, uri: &Uri) {
+        self.jar.set_cookies(cookie_headers, uri);
+    }
+
+    fn cookies(&self, uri: &Uri, version: Version) -> wreq::cookie::Cookies {
+        if !self.newest_first {
+            return self.jar.cookies(uri, version);
+        }
+        // The jar knows which cookies apply and the order they were made in;
+        // the rest is sorting.
+        let made: Vec<(String, String, String)> = self.jar.get_all().map(|c| key(&c)).collect();
+        let mut matched: Vec<_> = self.jar.matches(uri.clone()).collect();
+        matched.sort_by_key(|c| {
+            let age = made.iter().position(|k| *k == key(c)).unwrap_or(0);
+            (
+                std::cmp::Reverse(c.path().unwrap_or("/").len()),
+                std::cmp::Reverse(age),
+            )
+        });
+        let pairs: Vec<String> = matched
+            .iter()
+            .map(|c| format!("{}={}", c.name(), c.value()))
+            .collect();
+        if pairs.is_empty() {
+            return wreq::cookie::Cookies::Empty;
+        }
+        if matches!(version, Version::HTTP_2 | Version::HTTP_3) {
+            wreq::cookie::Cookies::Uncompressed(
+                pairs
+                    .iter()
+                    .filter_map(|p| HeaderValue::from_str(p).ok())
+                    .collect(),
+            )
+        } else {
+            HeaderValue::from_str(&pairs.join("; "))
+                .map(wreq::cookie::Cookies::Compressed)
+                .unwrap_or(wreq::cookie::Cookies::Empty)
+        }
+    }
+}
+
+fn key(c: &wreq::cookie::Cookie<'_>) -> (String, String, String) {
+    (
+        c.name().to_string(),
+        c.domain().unwrap_or_default().to_string(),
+        c.path().unwrap_or("/").to_string(),
+    )
+}
+
 /// A connection pool and cookie jar that sends every request as one
 /// browser. Cheap to share: clones use the same pool.
 #[derive(Clone)]
@@ -48,6 +106,8 @@ pub struct Fetcher {
     /// HTTP/2-only headers.
     http1_hosts: Arc<Mutex<HashSet<String>>>,
     jar: Arc<wreq::cookie::Jar>,
+    /// Whether to offer only http/1.1 to origins known to answer with it.
+    remembers_http1: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -180,7 +240,10 @@ impl Fetcher {
         let mut builder = wreq::Client::builder()
             .emulation(emulation)
             .timeout(options.timeout)
-            .cookie_provider(jar.clone())
+            .cookie_provider(Arc::new(OrderedJar {
+                jar: jar.clone(),
+                newest_first: profile.cookies_newest_first,
+            }))
             .gzip(true)
             .brotli(true)
             .zstd(true)
@@ -214,6 +277,7 @@ impl Fetcher {
             redirect_order: Arc::new(profile.header_order(true)),
             http1_hosts: Arc::default(),
             jar,
+            remembers_http1: profile.remembers_http1,
         })
     }
 
@@ -370,6 +434,11 @@ impl Fetcher {
             }
         }
         let mut request = self.client.get(uri.clone()).orig_headers(order);
+        if self.remembers_http1 && uri.scheme_str() == Some("https") && !self.expects_http2(uri) {
+            // As Safari does: an origin that answered over HTTP/1.1 is only
+            // offered http/1.1 from then on.
+            request = request.version(Version::HTTP_11);
+        }
         if self.expects_http2(uri) {
             for (name, value) in self.http2_headers.iter() {
                 if !caller.iter().any(|(_, n, _)| n == name) {

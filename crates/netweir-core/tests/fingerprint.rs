@@ -212,3 +212,72 @@ async fn firefox_156_navigations_over_http1_are_indistinguishable() {
     let actual = run(&fetcher, &mut server, &scenario(port)).await;
     assert_same_in_order(&expected, &actual, "Firefox over HTTP/1.1");
 }
+
+#[tokio::test]
+async fn safari_27_navigations_over_http2_are_indistinguishable() {
+    let expected: Vec<Capture> = serde_json::from_str(include_str!(
+        "../../../profiles/safari-27-macos.capture.json"
+    ))
+    .unwrap();
+    for _ in 0..2 {
+        let mut server = Server::start().await.unwrap();
+        let fetcher = local_fetcher("safari-27-macos");
+        let urls = scenario(server.port);
+        let actual = run(&fetcher, &mut server, &urls).await;
+        assert_same_in_order(&expected, &actual, "Safari over HTTP/2");
+    }
+}
+
+#[tokio::test]
+async fn safari_27_navigations_over_http1_are_indistinguishable() {
+    let expected: Vec<Capture> = serde_json::from_str(include_str!(
+        "../../../profiles/safari-27-macos.http1.capture.json"
+    ))
+    .unwrap();
+    let mut server = Server::start_http1(0).await.unwrap();
+    let port = server.port;
+    let fetcher = local_fetcher("safari");
+    // Safari had met localhost over HTTP/1.1 before this navigation (and so
+    // offered it only http/1.1), but not 127.0.0.1.
+    let warm = [format!("https://localhost:{port}/warm")];
+    run(&fetcher, &mut server, &warm).await;
+    let actual = run(&fetcher, &mut server, &scenario(port)).await;
+    let expected = either_pooled_connection(expected, &actual);
+    assert_same_in_order(&expected, &actual, "Safari over HTTP/1.1");
+}
+
+/// Safari kept two connections to localhost: one opened before it learned
+/// the origin was HTTP/1.1-only, which still carries the h2 offer, and one
+/// opened after. Which of the two a request rides is Safari's pooling, not
+/// something a site can tell apart, so a request Safari sent on a
+/// connection opened before the scenario may carry either connection's
+/// ALPN offer, as long as Safari made that offer to the same host.
+fn either_pooled_connection(mut expected: Vec<Capture>, actual: &[Capture]) -> Vec<Capture> {
+    let opened_here = |c: &Capture| {
+        expected
+            .iter()
+            .any(|o| o.connection == c.connection && o.request == 0)
+    };
+    let pooled: Vec<bool> = expected.iter().map(|e| !opened_here(e)).collect();
+    let offers: Vec<(Option<String>, Vec<String>, String)> = expected
+        .iter()
+        .map(|e| {
+            let hello = &e.client_hello;
+            (hello.server_name.clone(), hello.alpn.clone(), e.ja4.clone())
+        })
+        .collect();
+    for ((e, a), pooled) in expected.iter_mut().zip(actual).zip(pooled) {
+        if !pooled {
+            continue;
+        }
+        let host = &e.client_hello.server_name;
+        if let Some((_, alpn, ja4)) = offers
+            .iter()
+            .find(|(h, alpn, _)| h == host && *alpn == a.client_hello.alpn)
+        {
+            e.client_hello.alpn = alpn.clone();
+            e.ja4 = ja4.clone();
+        }
+    }
+    expected
+}
