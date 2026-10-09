@@ -1,6 +1,6 @@
 //! Making requests that look like the profile's browser made them.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -52,45 +52,53 @@ impl wreq::cookie::CookieStore for OrderedJar {
         if !self.newest_first {
             return self.jar.cookies(uri, version);
         }
-        // The jar knows which cookies apply and the order they were made in;
-        // the rest is sorting.
-        let made: Vec<(String, String, String)> = self.jar.get_all().map(|c| key(&c)).collect();
-        let mut matched: Vec<_> = self.jar.matches(uri.clone()).collect();
-        matched.sort_by_key(|c| {
-            let age = made.iter().position(|k| *k == key(c)).unwrap_or(0);
-            (
-                std::cmp::Reverse(c.path().unwrap_or("/").len()),
-                std::cmp::Reverse(age),
-            )
-        });
-        let pairs: Vec<String> = matched
-            .iter()
-            .map(|c| format!("{}={}", c.name(), c.value()))
-            .collect();
-        if pairs.is_empty() {
+        // The jar sends longest path first, then oldest first, and only it
+        // knows which is older. So take its order and reverse each run of
+        // equal path length. The run boundaries come from the matching
+        // cookies' paths; a cookie with the same name and value under two
+        // paths reads the same either way, so give each the longest unused.
+        let wreq::cookie::Cookies::Uncompressed(oldest_first) =
+            self.jar.cookies(uri, Version::HTTP_2)
+        else {
+            return wreq::cookie::Cookies::Empty;
+        };
+        let mut paths: HashMap<String, Vec<usize>> = HashMap::new();
+        for c in self.jar.matches(uri.clone()) {
+            let pair = format!("{}={}", c.name(), c.value());
+            paths
+                .entry(pair)
+                .or_default()
+                .push(c.path().unwrap_or("/").len());
+        }
+        let mut sent: Vec<(usize, HeaderValue)> = Vec::with_capacity(oldest_first.len());
+        for value in oldest_first {
+            let longest = value.to_str().ok().and_then(|pair| {
+                let lengths = paths.get_mut(pair)?;
+                let i = (0..lengths.len()).max_by_key(|&i| lengths[i])?;
+                Some(lengths.swap_remove(i))
+            });
+            match longest {
+                Some(length) => sent.push((length, value)),
+                // The jar changed between the two reads; this one request
+                // goes out in the jar's own order.
+                None => return self.jar.cookies(uri, version),
+            }
+        }
+        if sent.is_empty() {
             return wreq::cookie::Cookies::Empty;
         }
+        for run in sent.chunk_by_mut(|a, b| a.0 == b.0) {
+            run.reverse();
+        }
         if matches!(version, Version::HTTP_2 | Version::HTTP_3) {
-            wreq::cookie::Cookies::Uncompressed(
-                pairs
-                    .iter()
-                    .filter_map(|p| HeaderValue::from_str(p).ok())
-                    .collect(),
-            )
+            wreq::cookie::Cookies::Uncompressed(sent.into_iter().map(|(_, v)| v).collect())
         } else {
+            let pairs: Vec<&str> = sent.iter().filter_map(|(_, v)| v.to_str().ok()).collect();
             HeaderValue::from_str(&pairs.join("; "))
                 .map(wreq::cookie::Cookies::Compressed)
                 .unwrap_or(wreq::cookie::Cookies::Empty)
         }
     }
-}
-
-fn key(c: &wreq::cookie::Cookie<'_>) -> (String, String, String) {
-    (
-        c.name().to_string(),
-        c.domain().unwrap_or_default().to_string(),
-        c.path().unwrap_or("/").to_string(),
-    )
 }
 
 /// A connection pool and cookie jar that sends every request as one
@@ -507,6 +515,7 @@ async fn into_response(url: String, response: wreq::Response) -> Result<Response
 #[cfg(test)]
 mod tests {
     use super::*;
+    use wreq::cookie::CookieStore;
 
     fn fetcher() -> Fetcher {
         Fetcher::new(FetchOptions::new(Profile::named("chrome").unwrap())).unwrap()
@@ -540,6 +549,48 @@ mod tests {
                 FetchErrorKind::Invalid,
                 "{bad:?}"
             );
+        }
+    }
+
+    fn safari_cookies(jar: &OrderedJar, url: &str, version: Version) -> Vec<String> {
+        match jar.cookies(&url.parse().unwrap(), version) {
+            wreq::cookie::Cookies::Uncompressed(v) => {
+                v.iter().map(|h| h.to_str().unwrap().to_owned()).collect()
+            }
+            wreq::cookie::Cookies::Compressed(h) => vec![h.to_str().unwrap().to_owned()],
+            _ => Vec::new(),
+        }
+    }
+
+    #[test]
+    fn safari_sends_newest_first_whatever_other_sites_set() {
+        let jar = OrderedJar {
+            jar: Arc::new(wreq::cookie::Jar::default()),
+            newest_first: true,
+        };
+        let set = |url: &str, cookie: &str| {
+            let value = HeaderValue::from_str(cookie).unwrap();
+            jar.set_cookies(&mut std::iter::once(&value), &url.parse().unwrap());
+        };
+        // A host-only cookie of the same name, set earlier on another site,
+        // mustn't make this site's sid look older than it is.
+        set("https://a.example/", "sid=a; Path=/");
+        set("https://b.example/", "t=x; Path=/");
+        set("https://b.example/", "sid=b; Path=/");
+        set("https://b.example/deep/", "p=1; Path=/deep");
+        assert_eq!(
+            safari_cookies(&jar, "https://b.example/deep/x", Version::HTTP_2),
+            ["p=1", "sid=b", "t=x"]
+        );
+        assert_eq!(
+            safari_cookies(&jar, "https://b.example/deep/x", Version::HTTP_11),
+            ["p=1; sid=b; t=x"]
+        );
+        for version in [Version::HTTP_11, Version::HTTP_2] {
+            assert!(matches!(
+                jar.cookies(&"https://c.example/".parse().unwrap(), version),
+                wreq::cookie::Cookies::Empty
+            ));
         }
     }
 }
