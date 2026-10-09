@@ -10,6 +10,22 @@ use crate::server::Capture;
 /// that depends on connection history, not on the browser. The `:authority`,
 /// `:path` and `Host` values are ignored because they name the test server
 /// and its port.
+/// For a browser that sends its TLS extensions in a fixed order (Firefox,
+/// Safari), whether the order matches too. `differences` compares them as a
+/// set, since Chrome shuffles them.
+pub fn extension_order_differs(expected: &Capture, actual: &Capture) -> Option<String> {
+    let order = |c: &Capture| -> Vec<u16> {
+        c.client_hello
+            .extensions
+            .iter()
+            .copied()
+            .filter(|&x| !is_grease(x) && x != 0x0029 && x != 0x0000)
+            .collect()
+    };
+    let (e, a) = (order(expected), order(actual));
+    (e != a).then(|| format!("extension order: expected {e:04x?}, got {a:04x?}"))
+}
+
 pub fn differences(expected: &Capture, actual: &Capture) -> Vec<String> {
     let mut out = Vec::new();
     let mut check = |what: &str, a: String, b: String| {
@@ -77,6 +93,11 @@ pub fn differences(expected: &Capture, actual: &Capture) -> Vec<String> {
         "record size limit",
         format!("{:?}", e.record_size_limit),
         format!("{:?}", a.record_size_limit),
+    );
+    check(
+        "delegated credentials",
+        format!("{:04x?}", e.delegated_credentials),
+        format!("{:04x?}", a.delegated_credentials),
     );
     check(
         "trust anchors",

@@ -11,7 +11,7 @@ mod ja4;
 mod server;
 
 pub use client_hello::{ClientHello, is_grease};
-pub use compare::differences;
+pub use compare::{differences, extension_order_differs};
 pub use h2::Http2;
 pub use ja4::ja4;
 pub use server::{Capture, Server};

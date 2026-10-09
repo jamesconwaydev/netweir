@@ -7,7 +7,7 @@
 //! the site. Here netweir does the same four and every request is compared.
 
 use netweir_core::{FetchOptions, Fetcher, Profile};
-use netweir_fingerprint::{Capture, Server, differences};
+use netweir_fingerprint::{Capture, Server, differences, extension_order_differs};
 
 fn local_fetcher(profile: &str) -> Fetcher {
     let mut options = FetchOptions::new(Profile::named(profile).unwrap());
@@ -45,11 +45,22 @@ fn assert_same(expected: &[Capture], actual: &[Capture], what: &str) {
         let diff = differences(e, a);
         assert!(
             diff.is_empty(),
-            "{what}: request {} ({}) differs from Chrome 154:\n{}",
+            "{what}: request {} ({}) differs from the browser:\n{}",
             a.request,
             e.path,
             diff.join("\n")
         );
+    }
+}
+
+/// `assert_same`, plus the extension order, for a browser that doesn't
+/// shuffle it.
+fn assert_same_in_order(expected: &[Capture], actual: &[Capture], what: &str) {
+    assert_same(expected, actual, what);
+    for (e, a) in expected.iter().zip(actual) {
+        if let Some(diff) = extension_order_differs(e, a) {
+            panic!("{what}: request {} ({}): {diff}", a.request, e.path);
+        }
     }
 }
 
@@ -167,4 +178,37 @@ async fn too_many_redirects_is_an_error_not_a_loop() {
         netweir_core::FetchErrorKind::TooManyRedirects,
         "{err}"
     );
+}
+
+#[tokio::test]
+async fn firefox_156_navigations_over_http2_are_indistinguishable() {
+    let expected: Vec<Capture> = serde_json::from_str(include_str!(
+        "../../../profiles/firefox-156-macos.capture.json"
+    ))
+    .unwrap();
+    for _ in 0..2 {
+        let mut server = Server::start().await.unwrap();
+        let fetcher = local_fetcher("firefox-156-macos");
+        let urls = scenario(server.port);
+        let actual = run(&fetcher, &mut server, &urls).await;
+        assert_same_in_order(&expected, &actual, "Firefox over HTTP/2");
+    }
+}
+
+#[tokio::test]
+async fn firefox_156_navigations_over_http1_are_indistinguishable() {
+    let expected: Vec<Capture> = serde_json::from_str(include_str!(
+        "../../../profiles/firefox-156-macos.http1.capture.json"
+    ))
+    .unwrap();
+    let mut server = Server::start_http1(0).await.unwrap();
+    let port = server.port;
+    let fetcher = local_fetcher("firefox");
+    let warm = [
+        format!("https://localhost:{port}/warm"),
+        format!("https://127.0.0.1:{port}/warm"),
+    ];
+    run(&fetcher, &mut server, &warm).await;
+    let actual = run(&fetcher, &mut server, &scenario(port)).await;
+    assert_same_in_order(&expected, &actual, "Firefox over HTTP/1.1");
 }

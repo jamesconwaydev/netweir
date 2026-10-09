@@ -10,17 +10,26 @@ use wreq::http2::{
     Http2Options, PseudoId, PseudoOrder, SettingId, SettingsOrder, StreamDependency, StreamId,
 };
 use wreq::tls::compress::{CertificateCompressionAlgorithm, CertificateCompressor, Codec};
-use wreq::tls::{AlpnProtocol, AlpsProtocol, KeyShare, TlsOptions, TlsVersion};
+use wreq::tls::{AlpnProtocol, AlpsProtocol, ExtensionType, KeyShare, TlsOptions, TlsVersion};
 use wreq::{Emulation, Group};
 
 /// Profiles shipped with netweir, by name.
-const BUILT_IN: &[(&str, &str)] = &[(
-    "chrome-154-macos",
-    include_str!("../../../profiles/chrome-154-macos.toml"),
-)];
+const BUILT_IN: &[(&str, &str)] = &[
+    (
+        "chrome-154-macos",
+        include_str!("../../../profiles/chrome-154-macos.toml"),
+    ),
+    (
+        "firefox-156-macos",
+        include_str!("../../../profiles/firefox-156-macos.toml"),
+    ),
+];
 
 /// What `profile="chrome"` means today.
 pub const DEFAULT: &str = "chrome-154-macos";
+
+/// The newest profile of each browser, by its short name.
+const LATEST: &[(&str, &str)] = &[("chrome", DEFAULT), ("firefox", "firefox-156-macos")];
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -61,6 +70,20 @@ pub struct Tls {
     pub session_ticket: bool,
     pub pre_shared_key: bool,
     pub trust_anchors: Option<String>,
+    /// The exact order of the ClientHello's extensions, by number, for a
+    /// browser that doesn't shuffle them. Empty: BoringSSL's order.
+    #[serde(default)]
+    pub extension_order: Vec<u16>,
+    #[serde(default)]
+    pub record_size_limit: Option<u16>,
+    /// Signature schemes offered for delegated credentials; empty sends no
+    /// delegated_credentials extension.
+    #[serde(default)]
+    pub delegated_credentials: Vec<String>,
+    /// Send the TLS 1.3 ciphers in the order listed, rather than the order
+    /// BoringSSL prefers.
+    #[serde(default)]
+    pub preserve_tls13_cipher_order: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -106,13 +129,21 @@ impl Profile {
             .collect()
     }
 
-    /// A built-in profile by name. `"chrome"` is the newest Chrome.
+    /// A built-in profile by name. `"chrome"` and `"firefox"` are the
+    /// newest of each.
     pub fn named(name: &str) -> Result<Profile, ProfileError> {
-        let name = if name == "chrome" { DEFAULT } else { name };
+        let name = LATEST
+            .iter()
+            .find(|(short, _)| *short == name)
+            .map_or(name, |(_, full)| full);
         let (_, src) = BUILT_IN.iter().find(|(n, _)| *n == name).ok_or_else(|| {
-            let known: Vec<&str> = BUILT_IN.iter().map(|(n, _)| *n).collect();
+            let known: Vec<&str> = LATEST
+                .iter()
+                .map(|(n, _)| *n)
+                .chain(BUILT_IN.iter().map(|(n, _)| *n))
+                .collect();
             ProfileError(format!(
-                "unknown profile {name:?}; known: chrome, {}",
+                "unknown profile {name:?}; known: {}",
                 known.join(", ")
             ))
         })?;
@@ -137,6 +168,7 @@ impl Profile {
                 "X25519" => Ok(KeyShare::X25519),
                 "P-256" => Ok(KeyShare::P256),
                 "P-384" => Ok(KeyShare::P384),
+                "P-521" => Ok(KeyShare::P521),
                 _ => Err(bad("key share", k)),
             })
             .collect::<Result<Vec<_>, _>>()?;
@@ -163,6 +195,8 @@ impl Profile {
             .iter()
             .map(|c| match c.as_str() {
                 "brotli" => Ok(&BROTLI as &'static dyn CertificateCompressor),
+                "zlib" => Ok(&ZLIB as &'static dyn CertificateCompressor),
+                "zstd" => Ok(&ZSTD as &'static dyn CertificateCompressor),
                 _ => Err(bad("certificate compression", c)),
             })
             .collect::<Result<Vec<_>, _>>()?;
@@ -186,6 +220,19 @@ impl Profile {
             .enable_signed_cert_timestamps(t.signed_certificate_timestamps)
             .session_ticket(t.session_ticket)
             .pre_shared_key(t.pre_shared_key);
+        if !t.extension_order.is_empty() {
+            let order: Vec<ExtensionType> = t.extension_order.iter().map(|&e| e.into()).collect();
+            tls = tls.extension_permutation(order);
+        }
+        if let Some(limit) = t.record_size_limit {
+            tls = tls.record_size_limit(limit);
+        }
+        if !t.delegated_credentials.is_empty() {
+            tls = tls.delegated_credentials(t.delegated_credentials.join(":"));
+        }
+        if t.preserve_tls13_cipher_order {
+            tls = tls.preserve_tls13_cipher_list(true);
+        }
         if let Some(hex) = &t.trust_anchors {
             tls = tls.trust_anchors(decode_hex(hex).ok_or_else(|| bad("trust anchor hex", hex))?);
         }
@@ -282,6 +329,56 @@ fn decode_hex(s: &str) -> Option<Vec<u8>> {
         .step_by(2)
         .map(|i| u8::from_str_radix(s.get(i..i + 2)?, 16).ok())
         .collect()
+}
+
+/// Zlib certificate decompression (RFC 8879), which Firefox offers.
+#[derive(Debug)]
+struct Zlib;
+
+static ZLIB: Zlib = Zlib;
+
+impl CertificateCompressor for Zlib {
+    fn compress(&self) -> Codec {
+        Codec::Pointer(|input, out| {
+            let mut w = flate2::write::ZlibEncoder::new(out, flate2::Compression::default());
+            w.write_all(input)?;
+            w.finish().map(|_| ())
+        })
+    }
+
+    fn decompress(&self) -> Codec {
+        Codec::Pointer(|input, out| {
+            let mut r = flate2::read::ZlibDecoder::new(input);
+            std::io::copy(&mut r, out).map(|_| ())
+        })
+    }
+
+    fn algorithm(&self) -> CertificateCompressionAlgorithm {
+        CertificateCompressionAlgorithm::ZLIB
+    }
+}
+
+/// Zstandard certificate decompression (RFC 8879), which Firefox offers.
+#[derive(Debug)]
+struct Zstd;
+
+static ZSTD: Zstd = Zstd;
+
+impl CertificateCompressor for Zstd {
+    fn compress(&self) -> Codec {
+        Codec::Pointer(|input, out| {
+            let data = zstd::stream::encode_all(input, 0)?;
+            out.write_all(&data)
+        })
+    }
+
+    fn decompress(&self) -> Codec {
+        Codec::Pointer(|input, out| zstd::stream::copy_decode(input, out))
+    }
+
+    fn algorithm(&self) -> CertificateCompressionAlgorithm {
+        CertificateCompressionAlgorithm::ZSTD
+    }
 }
 
 /// Brotli certificate decompression (RFC 8879), which Chrome offers and

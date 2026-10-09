@@ -28,6 +28,10 @@ pub struct ClientHello {
     pub psk_modes: Vec<u8>,
     pub ec_point_formats: Vec<u8>,
     pub record_size_limit: Option<u16>,
+    /// Signature schemes offered for delegated credentials (0x0022), which
+    /// Firefox sends and Chrome doesn't.
+    #[serde(default)]
+    pub delegated_credentials: Option<Vec<u16>>,
     /// Raw body of the trust_anchors extension (0xca34), hex-encoded.
     pub trust_anchors: Option<String>,
 }
@@ -111,6 +115,7 @@ impl ClientHello {
             psk_modes: Vec::new(),
             ec_point_formats: Vec::new(),
             record_size_limit: None,
+            delegated_credentials: None,
             trust_anchors: None,
         };
         let mut exts = Reader(r.vec16().unwrap_or(&[]));
@@ -136,6 +141,7 @@ impl ClientHello {
                 }
                 0x001b => hello.cert_compression = Reader::u16s(d.vec8()?),
                 0x001c => hello.record_size_limit = d.u16(),
+                0x0022 => hello.delegated_credentials = Some(Reader::u16s(d.vec16()?)),
                 0x002b => hello.supported_versions = Reader::u16s(d.vec8()?),
                 0x002d => hello.psk_modes = d.vec8()?.to_vec(),
                 0x0033 => {

@@ -141,6 +141,7 @@ mod tests {
             psk_modes: vec![],
             ec_point_formats: vec![],
             record_size_limit: None,
+            delegated_credentials: None,
             trust_anchors: None,
         };
         let first = ja4(&hello);

@@ -22,8 +22,8 @@ of those words will mean when it is:
 
 Working today:
 
-- Fetching that is indistinguishable from Chrome 154 on the wire, over
-  HTTP/2 and HTTP/1.1, with cookies and redirects. Below: how that's
+- Fetching that is indistinguishable from Chrome 154 or Firefox 156 on the
+  wire, over HTTP/2 and HTTP/1.1, with cookies and redirects. Below: how that's
   proved, and the one known exception.
 - A parser that beats selectolax, the one to beat in Python, on the same
   pages.
@@ -38,8 +38,7 @@ Working today:
   resume after a crash, and selectors that find their element again after
   a redesign.
 
-Coming next, in order: Firefox and Safari profiles, a crawl benchmark
-against Scrapy, wheels for every platform and the 0.1 release; then a
+Coming next, in order: a Safari profile and the 0.1 release; then a
 browser driver. The design is in [docs/design/v0.1.md](docs/design/v0.1.md).
 
 ## Quick look
@@ -248,6 +247,11 @@ a redirect to another site and one within the site. `cargo test -p
 netweir-core` has netweir do the same four and fails if any request differs
 from Chrome's. The public checker at tls.peet.ws reports the same JA4
 fingerprint for both: `t13d1517h2_8daaf6152771_cb7bf5808d99`.
+
+Firefox 156 is there too: `netweir.get(url, profile="firefox")`, or
+`profile="firefox"` in a spider's settings. Firefox sends its TLS extensions
+in a fixed order, with no GREASE, and the same test checks that order
+against a recording of the real browser, as well as everything above.
 
 One known difference: Chrome sends a `priority` header only over HTTP/2,
 and netweir can't tell a server lacks HTTP/2 until it has answered once. So

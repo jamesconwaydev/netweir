@@ -1143,6 +1143,7 @@ dependencies = [
  "bytes",
  "chardetng",
  "encoding_rs",
+ "flate2",
  "netweir-fingerprint",
  "rusqlite",
  "serde",
@@ -1152,6 +1153,7 @@ dependencies = [
  "toml",
  "url",
  "wreq",
+ "zstd",
 ]
 
 [[package]]
