@@ -66,8 +66,15 @@ shares between processes. A tracked selector that breaks asks the main
 process for a repair through the results, with the page's HTML. Log
 records from workers are sent to the main process's `netweir` logger, so
 warnings appear once per crawl as before. An exception in a callback
-comes back as its traceback, counted in `callback_errors` and logged in
-the main process; with `fail_fast`, the crawl stops there.
+comes back with its traceback, counted in `callback_errors` and logged in
+the main process. Anything sent back is checked in the worker to rebuild
+from its pickle, so one that wouldn't can't break the pool. With
+`fail_fast`, the first error to come back from any of a batch's jobs
+stops the crawl, and the workers are terminated rather than waited for.
+A worker that dies breaks the pool, and the crawl ends with an error
+naming the page; workers watch the main process and exit with it, so a
+crawl killed outright leaves none behind. Workers send a page's HTML for
+a repair only when the spider has a repairer, once per site and name.
 
 ## Testing
 

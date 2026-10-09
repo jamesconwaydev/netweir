@@ -57,11 +57,16 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(data)
 
 
-@pytest.fixture(scope="module")
+#: The module's server, for tests that don't take the fixture.
+BASE_URL: list[str] = []
+
+
+@pytest.fixture(scope="module", autouse=True)
 def base():
     server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
     threading.Thread(target=server.serve_forever, daemon=True).start()
-    yield f"http://127.0.0.1:{server.server_port}"
+    BASE_URL[:] = [f"http://127.0.0.1:{server.server_port}"]
+    yield BASE_URL[0]
     server.shutdown()
 
 
@@ -215,3 +220,119 @@ def _running(pid: int) -> bool:
     # A zombie still answers; it has exited, which is what matters.
     state = subprocess.run(["ps", "-o", "stat=", "-p", str(pid)], capture_output=True, text=True)
     return bool(state.stdout.strip()) and not state.stdout.strip().startswith("Z")
+
+
+def test_an_exception_that_wont_rebuild_doesnt_break_the_pool(base, caplog):
+    with caplog.at_level(logging.ERROR, logger="netweir"):
+        items, stats = crawl(worker_spiders.Unpicklable, base + "/", workers=2)
+    names = sorted(i.get("name") or i.get("kept") for i in items)
+    # Item 0 raised; item 1's lambda can't travel, but what came before it
+    # does; the rest are whole.
+    assert names == sorted(["1"] + [str(i) for i in range(2, ITEMS)]), items
+    assert stats["callback_errors"] == 2
+    assert "odd one" in caplog.text
+
+
+def test_abandoning_a_crawl_stops_callbacks_the_workers_are_running():
+    import asyncio
+    import time
+
+    from netweir import _workers
+    from netweir._native import _response
+
+    async def go():
+        spider = worker_spiders.SlowAfterFirst()
+        pool = _workers.Pool(spider, settings(workers=2), _track_path())
+        slow = pool.submit(
+            "item",
+            _response(BASE_URL[0] + "/item/5", 200, "HTTP/1.1", [], b"<h1>5</h1>"),
+            netweir.Request(BASE_URL[0] + "/item/5"),
+        )
+        await asyncio.sleep(1.5)  # started, and four seconds from done
+        started = time.monotonic()
+        pool.close(abandon=True)
+        assert time.monotonic() - started < 2, "it waited for the callback"
+        slow.cancel()
+
+    asyncio.run(go())
+
+
+def _track_path():
+    import tempfile
+
+    return os.path.join(tempfile.mkdtemp(), "tracks.db")
+
+
+def test_fail_fast_raises_the_workers_own_exception():
+    with pytest.raises(ValueError, match="stop here"):
+        crawl(
+            worker_spiders.SlowAfterFirst,
+            BASE_URL[0] + "/",
+            workers=2,
+            fail_fast=True,
+            per_domain=1,
+        )
+
+
+def test_a_worker_that_dies_ends_the_crawl_saying_so(base):
+    with pytest.raises(RuntimeError, match="worker process"):
+        crawl(worker_spiders.Dies, base + "/", workers=2)
+
+
+def test_a_spider_workers_cant_build_is_refused_up_front(base):
+    spider = worker_spiders.NeedsArguments("x")
+    spider.start_urls = [base + "/"]
+    spider.settings = settings(workers=2)
+    with pytest.raises(TypeError, match="no arguments"):
+        spider.run()
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="uses pgrep")
+def test_workers_go_when_start_fails(base):
+    import time
+
+    with pytest.raises(RuntimeError, match="start broke"):
+        crawl(worker_spiders.StartFails, base + "/", workers=2)
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline:
+        found = subprocess.run(
+            ["pgrep", "-f", "multiprocessing.spawn"], capture_output=True, text=True
+        ).stdout.split()
+        mine = [p for p in found if _parent(int(p)) == os.getpid()]
+        if not mine:
+            break
+        time.sleep(0.2)
+    assert not mine, mine
+
+
+def _parent(pid: int) -> int:
+    out = subprocess.run(["ps", "-o", "ppid=", "-p", str(pid)], capture_output=True, text=True)
+    return int(out.stdout.strip() or 0)
+
+
+def test_workers_send_page_html_for_a_repair_only_when_asked_once(monkeypatch, tmp_path):
+    from netweir import _track, _workers
+    from netweir._native import TrackStore, _response
+
+    class Spider:
+        def parse(self, page):
+            yield {"price": page.css(".price::text", track="price").get()}
+
+    monkeypatch.setattr(_workers, "_spider", Spider())
+    token = _track._crawl.set((TrackStore(str(tmp_path / "t.db")), 0.75))
+    try:
+        request = netweir.Request("http://a.test/")
+        before = _response("http://a.test/", 200, "HTTP/1.1", [], b'<p class="price">7</p>')
+        after = _response("http://a.test/", 200, "HTTP/1.1", [], b'<p class="cost">7</p>')
+        assert _workers.run("parse", before, request)[0] == [{"price": "7"}]
+        # The selector breaks; a repair is asked for only if the crawl
+        # repairs, and with the page only once.
+        monkeypatch.setattr(_workers, "_repairing", False)
+        assert _workers.run("parse", after, request)[2] == []
+        monkeypatch.setattr(_workers, "_repairing", True)
+        monkeypatch.setattr(_workers, "_asked", set())
+        first = _workers.run("parse", after, request)[2]
+        again = _workers.run("parse", after, request)[2]
+        assert len(first) == 1 and "cost" in first[0][4] and again == []
+    finally:
+        _track._crawl.reset(token)

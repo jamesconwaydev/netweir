@@ -110,14 +110,27 @@ What changes:
   does.
 - Attributes a callback sets on the spider stay in that worker. To count
   or collect across pages, yield items and do it in a pipeline.
-- Callbacks are passed between processes by name, so they must be
-  methods of the spider (the same rule as a checkpoint).
+- Callbacks are passed between processes by name, so a request's callback
+  should be a method of the spider (the same rule as a checkpoint). One
+  that isn't runs in the main process instead; a request yielded in a
+  worker must name a method.
+- What travels between processes must pickle: items, `meta`, and the
+  exception a callback raises. An item that can't go back ends that
+  page's results there, counted as an error, as an exception would.
+- An async callback runs on an event loop of its own in the worker, one
+  per page.
+- A spider defined in a notebook or the interactive prompt can't be
+  rebuilt by a worker; put it in a file.
 - Callbacks of browser requests run in the main process, where their live
   `page.browser` is.
 
 Errors, warnings and tracked selectors work as they do in one process: a
-callback's exception is logged and counted (or stops the crawl, with
-`fail_fast`), and a relocated selector is reported once per crawl.
+callback's exception is logged and counted, and a relocated selector is
+reported once per crawl. With `fail_fast`, the crawl stops as soon as the
+error comes back from its worker, and callbacks still running are
+stopped, not waited for. A worker that dies (out of memory, say) ends the
+crawl with an error naming the page it was on; with a checkpoint, run it
+again to carry on.
 
 ## Being polite
 

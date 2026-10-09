@@ -17,6 +17,7 @@ import logging
 import os
 import time
 from collections.abc import AsyncIterator, Callable, Iterable
+from concurrent.futures.process import BrokenProcessPool
 from typing import Any
 
 from netweir import _track
@@ -246,6 +247,19 @@ class Spider:
             run.finish()
 
 
+def _warn_if_priced(page: Page) -> None:
+    if page.outcome == "payment_required":
+        price = page._classified()[4]
+        log.warning("%s: payment required%s; not retried", page.url, f" ({price})" if price else "")
+
+
+def _worker_died(name: str, url: str) -> RuntimeError:
+    return RuntimeError(
+        f"a worker process died while running {name} for {url}, or couldn't start;"
+        " with a checkpoint, the crawl resumes where it stopped"
+    )
+
+
 class _Run:
     def __init__(self, spider: Spider, pipelines: list[Callable[[Any], Any]]):
         self.spider = spider
@@ -439,19 +453,22 @@ class _Run:
         started = time.monotonic()
         if not self.settings.obey_robots:
             log.warning("obey_robots is off: robots.txt is not being checked")
-        if self.settings.workers > 1:
-            from netweir import _workers
-
-            state = self.settings._checkpoint_file()
-            self.pool = _workers.Pool(self.spider, self.settings, state or _track.default_path())
-        start = self.spider.start()
-        if inspect.isasyncgen(start):
-            async for request in start:
-                self.submit(request)
-        else:
-            for request in start:
-                self.submit(request)
+        abandoned = True
         try:
+            if self.settings.workers > 1:
+                from netweir import _workers
+
+                state = self.settings._checkpoint_file()
+                self.pool = _workers.Pool(
+                    self.spider, self.settings, state or _track.default_path()
+                )
+            start = self.spider.start()
+            if inspect.isasyncgen(start):
+                async for request in start:
+                    self.submit(request)
+            else:
+                for request in start:
+                    self.submit(request)
             while True:
                 events = await self.engine.next(256)
                 if not events:
@@ -459,12 +476,14 @@ class _Run:
                 # With workers, the batch's callbacks all start now; their
                 # results are dealt with below, in the batch's order.
                 jobs = [self.send(event) for event in events]
-                for event, job in zip(events, jobs, strict=True):
-                    await self.dispatch(event, job)
+                await self.dispatch_batch(events, jobs)
                 self.settle()
+            abandoned = False
         finally:
             if self.pool is not None:
-                self.pool.close()
+                # Stopping early (fail_fast, an interrupt) doesn't wait for
+                # callbacks the workers are still running.
+                self.pool.close(abandon=abandoned)
                 self.pool = None
         await self.run_repairs()
         stats = {**self.engine.stats(), **self.counts}
@@ -551,6 +570,39 @@ class _Run:
             if isinstance(stage, export.parquet):
                 stage.publish()
 
+    async def dispatch_batch(self, events: list[tuple], jobs: list[Any]) -> None:
+        """Deals with a batch's events in order. With fail_fast, a worker's
+        error stops the crawl when it happens, not when its page's turn
+        comes behind slower callbacks."""
+        dispatching = asyncio.ensure_future(self._dispatch_all(events, jobs))
+        pending = [job for job in jobs if job is not None]
+        if not (self.settings.fail_fast and pending):
+            await dispatching
+            return
+        failed: asyncio.Future = asyncio.get_running_loop().create_future()
+
+        def check(job: asyncio.Future) -> None:
+            if failed.done() or job.cancelled() or job.exception() is not None:
+                return
+            error = job.result()[3]
+            if error is not None:
+                failed.set_result(error[0])
+
+        for job in pending:
+            job.add_done_callback(check)
+        await asyncio.wait({dispatching, failed}, return_when=asyncio.FIRST_COMPLETED)
+        if dispatching.done():
+            failed.cancel()
+            dispatching.result()
+            return
+        dispatching.cancel()
+        self.counts["callback_errors"] += 1
+        raise failed.result()
+
+    async def _dispatch_all(self, events: list[tuple], jobs: list[Any]) -> None:
+        for event, job in zip(events, jobs, strict=True):
+            await self.dispatch(event, job)
+
     def send(self, event: tuple) -> Any:
         """Starts the event's callback in a worker, if there are workers
         and it's a page's callback that can run in one. The pending result,
@@ -578,7 +630,10 @@ class _Run:
             return None  # run here, where the error is reported as usual
         if name is None:
             return None
-        return self.pool.submit(name, response, sent)
+        try:
+            return self.pool.submit(name, response, sent)
+        except BrokenProcessPool:
+            raise _worker_died(name, request.url) from None
 
     async def dispatch(self, event: tuple, job: Any = None) -> None:
         kind = event[0]
@@ -639,17 +694,12 @@ class _Run:
             _, rid, detail, *rest = event
             request = self.waiting.pop(rid)
             if kind == "fetched" and job is not None:
+                _warn_if_priced(Page(detail, request))
                 await self.collect(job, request.callback or "parse", request, detail.url)
             elif kind == "fetched":
                 page = Page(detail, request, rest[0])
                 page.browser = rest[1]
-                if page.outcome == "payment_required":
-                    price = page._classified()[4]
-                    log.warning(
-                        "%s: payment required%s; not retried",
-                        page.url,
-                        f" ({price})" if price else "",
-                    )
+                _warn_if_priced(page)
                 try:
                     await self.run_callback(request.callback, "parse", (page,), request.url)
                 finally:
@@ -701,8 +751,10 @@ class _Run:
         self.position = 0
         try:
             outputs, reports, repairs, error = await job
-        except Exception as e:  # noqa: BLE001 - a worker that died
-            outputs, reports, repairs, error = [], [], [], (e, "")
+        except BrokenProcessPool:
+            # One page's callback killed its worker (os._exit, out of
+            # memory): the pool is broken, and the crawl with it.
+            raise _worker_died(name, request.url) from None
         for report in reports:
             _track.report(*report)
         for repair in repairs:

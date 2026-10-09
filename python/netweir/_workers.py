@@ -30,12 +30,23 @@ from netweir._request import Request
 
 #: The spider this worker runs callbacks for.
 _spider: Any = None
+#: Whether the crawl asks for repairs, and the (site, name) pairs this
+#: worker has already sent a page for.
+_repairing = False
+_asked: set[tuple[str, str]] = set()
 
 
 def spec_of(spider: Any) -> tuple[str, ...]:
     """Where a worker finds the spider's class: a module, or the file
     `netweir crawl` loaded it from."""
     cls = type(spider)
+    try:
+        inspect.signature(cls).bind()
+    except TypeError:
+        raise TypeError(
+            f"with workers, each worker builds its own {cls.__name__} with no arguments,"
+            " which it can't be"
+        ) from None
     if "<locals>" in cls.__qualname__:
         raise TypeError(
             f"with workers, the spider class {cls.__name__} must be defined at module level,"
@@ -78,6 +89,7 @@ def _start(
     level: int,
     track_path: str,
     threshold: float,
+    repairing: bool,
 ) -> None:
     """Sets a worker up: its logging goes to the main process, and it has
     its own spider and the crawl's track store."""
@@ -89,7 +101,8 @@ def _start(
     root = logging.getLogger()
     root.handlers[:] = [logging.handlers.QueueHandler(logs)]
     root.setLevel(level)
-    global _spider
+    global _spider, _repairing
+    _repairing = repairing
     _spider = _load(spec)()
     _spider.settings = settings
     _track._crawl.set((TrackStore(track_path), threshold))
@@ -112,10 +125,15 @@ def run(name: str, response: Any, request: Request) -> tuple:
     repairs: list[tuple] = []
 
     def ask(site, field, kind, query, html, url):
+        # The page goes to the main process once per (site, name) from
+        # each worker, and only if the crawl asks for repairs.
+        if (site, field) in _asked:
+            return
+        _asked.add((site, field))
         repairs.append((site, field, kind, query, html() if callable(html) else html, url))
 
     told = _track._report_sink.set(reports.append)
-    asking = _track._repairs.set(ask)
+    asking = _track._repairs.set(ask if _repairing else None)
     error = None
     try:
         result = getattr(_spider, name)(Page(response, request))
@@ -135,21 +153,27 @@ def run(name: str, response: Any, request: Request) -> tuple:
     finally:
         _track._repairs.reset(asking)
         _track._report_sink.reset(told)
-    try:
-        outputs = [_portable(out) for out in outputs]
-        pickle.dumps(outputs)
-    except Exception as e:  # noqa: BLE001
-        outputs = []
-        error = (
-            TypeError(f"what {name} yielded can't go back to the main process: {e}"),
-            traceback.format_exc(),
-        )
+    # Everything sent back must come apart again in the main process: what
+    # pickles but can't be rebuilt would break the pool, not one page. What
+    # can't travel ends the page's outputs there, as an exception would.
+    sendable = []
+    for out in outputs:
+        try:
+            out = _portable(out)
+            pickle.loads(pickle.dumps(out))
+        except Exception as e:  # noqa: BLE001
+            error = error or (
+                TypeError(f"{name} yielded something that can't go back to the main process: {e}"),
+                traceback.format_exc(),
+            )
+            break
+        sendable.append(out)
     if error is not None:
         try:
-            pickle.dumps(error[0])
-        except Exception:  # noqa: BLE001 - not every exception pickles
-            error = (RuntimeError(repr(error[0])), error[1])
-    return outputs, reports, repairs, error
+            pickle.loads(pickle.dumps(error[0]))
+        except Exception:  # noqa: BLE001 - not every exception travels
+            error = (RuntimeError(f"{type(error[0]).__name__}: {error[0]}"), error[1])
+    return sendable, reports, repairs, error
 
 
 async def _drain(results: Any, into: list[Any]) -> None:
@@ -186,23 +210,46 @@ class Pool:
 
     def __init__(self, spider: Any, settings: Any, track_path: str):
         spec = spec_of(spider)
+        repairing = getattr(spider, "repair", None) is not None
         context = multiprocessing.get_context("spawn")
         self._logs = context.Queue()
         self._listener = logging.handlers.QueueListener(self._logs, _Forward())
         self._listener.start()
-        level = logging.getLogger("netweir").getEffectiveLevel()
+        # Records below every level the main process shows aren't worth
+        # sending; its own loggers then decide as usual.
+        level = min(
+            logging.getLogger().getEffectiveLevel(),
+            logging.getLogger("netweir").getEffectiveLevel(),
+        )
         self._executor = ProcessPoolExecutor(
             max_workers=settings.workers,
             mp_context=context,
             initializer=_start,
-            initargs=(spec, settings, self._logs, level, track_path, settings.track_threshold),
+            initargs=(
+                spec,
+                settings,
+                self._logs,
+                level,
+                track_path,
+                settings.track_threshold,
+                repairing,
+            ),
         )
 
     def submit(self, name: str, response: Any, request: Request) -> asyncio.Future:
         return asyncio.wrap_future(self._executor.submit(run, name, response, request))
 
-    def close(self) -> None:
-        self._executor.shutdown(wait=True, cancel_futures=True)
+    def close(self, abandon: bool = False) -> None:
+        """Waits for the workers to finish, or, abandoning the crawl (an
+        error with fail_fast, an interrupt), stops them where they are."""
+        if abandon:
+            # ponytail: the executor has no public way to stop running
+            # work; its processes are terminated directly.
+            for process in list(getattr(self._executor, "_processes", {}).values()):
+                process.terminate()
+            self._executor.shutdown(wait=False, cancel_futures=True)
+        else:
+            self._executor.shutdown(wait=True, cancel_futures=True)
         self._listener.stop()
 
 
