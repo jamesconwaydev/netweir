@@ -630,6 +630,33 @@ async fn traps_are_refused_at_the_door() {
 }
 
 #[tokio::test]
+async fn dropping_the_crawler_closes_its_checkpoint() {
+    let dir = std::env::temp_dir().join(format!("netweir-crawl-close-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let path = dir.join("crawl.sqlite3");
+    let c = crawler(CrawlSettings {
+        obey_robots: false,
+        obey_tdmrep: false,
+        checkpoint: Some(path.clone()),
+        ..settings()
+    });
+    for i in 0..2000 {
+        c.submit(request(i, format!("http://127.0.0.1:9/{i}")));
+    }
+    // No flush: dropping the crawler has to commit everything and let go
+    // of the file before it returns, or the directory can't be removed on
+    // Windows.
+    drop(c);
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    let n: i64 = conn
+        .query_row("SELECT count(*) FROM requests", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(n, 2000);
+    drop(conn);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[tokio::test]
 async fn a_checkpoint_remembers_what_was_left() {
     let site = Site::start(vec![
         ("/a", Page::html("a")),

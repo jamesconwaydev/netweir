@@ -493,11 +493,17 @@ class _Run:
         short leaves its last batch to be fetched again."""
         from netweir import export
 
-        if self.saving:
-            self.record()
-        if self.completed:
-            self.engine.ack()
-        self.engine.flush()
+        try:
+            if self.saving:
+                self.record()
+            if self.completed:
+                self.engine.ack()
+        finally:
+            # Not left to the garbage collector: a traceback can keep this
+            # run alive, and Windows won't delete an open file.
+            self.engine.close()
+            if self.settings._checkpoint_file():
+                self.tracks[0].close()
         # Only now, with their items on record, do Parquet parts get their
         # real names.
         for stage in self.pipelines:

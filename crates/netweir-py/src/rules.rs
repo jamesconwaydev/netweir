@@ -69,6 +69,11 @@ impl TrackStore {
         self.inner.get(site, name)
     }
 
+    /// Closes the file.
+    fn close(&self) {
+        self.inner.close();
+    }
+
     #[new]
     fn new(path: std::path::PathBuf) -> PyResult<TrackStore> {
         Ok(TrackStore {

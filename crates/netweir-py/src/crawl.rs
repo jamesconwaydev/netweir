@@ -946,11 +946,11 @@ impl Crawler {
         self.engine.core.save_counters(json);
     }
 
-    /// Waits until every checkpoint write so far is on disk. Raises OSError
-    /// if one of them failed.
-    fn flush(&self, py: Python<'_>) -> PyResult<()> {
+    /// Commits the checkpoint and closes its file. Raises OSError if a
+    /// write failed.
+    fn close(&self, py: Python<'_>) -> PyResult<()> {
         let engine = self.engine.clone();
-        py.detach(move || engine.core.flush())
+        py.detach(move || engine.core.close())
             .map_err(pyo3::exceptions::PyOSError::new_err)
     }
 

@@ -386,6 +386,16 @@ impl Crawler {
         }
     }
 
+    /// Commits the checkpoint and closes its file, for when the crawl is
+    /// over. Checkpoint writes after this are dropped.
+    pub fn close(&self) -> Result<(), String> {
+        let flushed = self.flush();
+        if let Some(cp) = &self.shared.checkpoint {
+            cp.close();
+        }
+        flushed
+    }
+
     fn admit(&self, request: CrawlRequest, persist: Persist<'_>) -> Submitted {
         let Some(fp) = fingerprint("GET", &request.url) else {
             return Submitted::Invalid;
@@ -503,6 +513,11 @@ impl Drop for Crawler {
     fn drop(&mut self) {
         self.shared.lock().closed = true;
         self.shared.schedule.notify_one();
+        // The scheduler keeps the shared state alive a while longer; the
+        // checkpoint file shouldn't stay open with it.
+        if let Some(cp) = &self.shared.checkpoint {
+            cp.close();
+        }
     }
 }
 

@@ -62,8 +62,8 @@ enum Op {
 /// The open checkpoint. Writes are queued and committed by its thread;
 /// dropping it commits what's left.
 pub struct Checkpoint {
-    ops: Option<Sender<Op>>,
-    writer: Option<JoinHandle<()>>,
+    ops: Mutex<Option<Sender<Op>>>,
+    writer: Mutex<Option<JoinHandle<()>>>,
     /// The first write that failed since the last flush.
     failed: Arc<Mutex<Option<String>>>,
 }
@@ -154,8 +154,8 @@ impl Checkpoint {
             .map_err(|e| CheckpointError(format!("can't start the checkpoint writer: {e}")))?;
         Ok((
             Checkpoint {
-                ops: Some(ops),
-                writer: Some(writer),
+                ops: Mutex::new(Some(ops)),
+                writer: Mutex::new(Some(writer)),
                 failed,
             },
             saved,
@@ -163,7 +163,7 @@ impl Checkpoint {
     }
 
     fn send(&self, op: Op) {
-        if let Some(ops) = &self.ops {
+        if let Some(ops) = &*self.ops.lock().unwrap_or_else(|e| e.into_inner()) {
             // The writer only stops when we drop the sender.
             let _ = ops.send(op);
         }
@@ -196,6 +196,16 @@ impl Checkpoint {
         self.send(Op::Settle(items, counters));
     }
 
+    /// Commits what's queued and closes the file. Writes after this are
+    /// dropped.
+    pub fn close(&self) {
+        drop(self.ops.lock().unwrap_or_else(|e| e.into_inner()).take());
+        let writer = self.writer.lock().unwrap_or_else(|e| e.into_inner()).take();
+        if let Some(writer) = writer {
+            let _ = writer.join();
+        }
+    }
+
     /// Waits until everything queued so far is committed. An error if a
     /// write since the last flush failed; that batch is not in the file,
     /// so a resume would do its work again.
@@ -212,10 +222,7 @@ impl Checkpoint {
 
 impl Drop for Checkpoint {
     fn drop(&mut self) {
-        drop(self.ops.take());
-        if let Some(writer) = self.writer.take() {
-            let _ = writer.join();
-        }
+        self.close();
     }
 }
 

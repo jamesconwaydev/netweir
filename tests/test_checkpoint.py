@@ -1,7 +1,9 @@
 """Checkpoints: a crawl stopped at any point picks up where it was."""
 
 import json
+import os
 import random
+import shutil
 import subprocess
 import sys
 import textwrap
@@ -105,6 +107,41 @@ def test_an_interrupted_crawl_resumes_without_losing_or_repeating(base, tmp_path
     assert len({r["_id"] for r in rows}) == len(rows), "no item twice"
     assert all(r["from"].endswith(f"/page/{r['name'].split('-')[0]}") for r in rows)
     assert stats["fetched"] < PAGES + PAGES * PER_PAGE, "finished pages aren't fetched again"
+
+
+def holds_open(path) -> bool:
+    """Whether this process still has a file under ``path`` open."""
+    if os.name == "nt":
+        # Windows won't rename a directory with an open file in it.
+        moved = path.with_name(path.name + "-moved")
+        try:
+            path.rename(moved)
+        except PermissionError:
+            return True
+        moved.rename(path)
+        return False
+    if not shutil.which("lsof"):
+        pytest.skip("needs lsof")
+    out = subprocess.run(
+        ["lsof", "-Fn", "-p", str(os.getpid())], capture_output=True, text=True
+    ).stdout
+    return str(path.resolve()) in out
+
+
+def test_the_checkpoint_is_closed_when_a_crawl_dies(base, tmp_path):
+    class Dies(netweir.Spider):
+        start_urls = [f"{base}/page/1"]
+
+        def parse(self, page):
+            raise Stop
+
+    spider = Dies()
+    spider.settings = settings(tmp_path, fail_fast=True)
+    # The traceback keeps the crawl's frames alive while it's held.
+    with pytest.raises(Stop) as held:
+        spider.run()
+    assert not holds_open(tmp_path / "state")
+    del held
 
 
 def test_with_a_checkpoint_callbacks_must_be_methods(base, tmp_path):

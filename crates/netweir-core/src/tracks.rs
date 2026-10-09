@@ -11,7 +11,8 @@ use rusqlite::{Connection, OptionalExtension, params};
 use crate::checkpoint::CheckpointError;
 
 pub struct TrackStore {
-    conn: Mutex<Connection>,
+    /// None once closed.
+    conn: Mutex<Option<Connection>>,
     /// What's in the table, as read or written by this process, so a
     /// fingerprint that hasn't changed isn't written again on every page.
     cache: Mutex<HashMap<(String, String), String>>,
@@ -39,7 +40,7 @@ impl TrackStore {
         )
         .map_err(err)?;
         Ok(TrackStore {
-            conn: Mutex::new(conn),
+            conn: Mutex::new(Some(conn)),
             cache: Mutex::new(HashMap::new()),
         })
     }
@@ -56,6 +57,7 @@ impl TrackStore {
         }
         let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         let fp: Option<String> = conn
+            .as_ref()?
             .query_row(
                 "SELECT fingerprint FROM tracks WHERE site = ?1 AND name = ?2",
                 params![site, name],
@@ -84,6 +86,9 @@ impl TrackStore {
             }
         }
         let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(conn) = conn.as_ref() else {
+            return;
+        };
         let written = conn.execute(
             "INSERT INTO tracks (site, name, fingerprint) VALUES (?1, ?2, ?3)
              ON CONFLICT (site, name) DO UPDATE SET fingerprint = excluded.fingerprint",
@@ -95,6 +100,12 @@ impl TrackStore {
                 .unwrap_or_else(|e| e.into_inner())
                 .insert(key, fingerprint.to_string());
         }
+    }
+
+    /// Closes the file. Fingerprints already read stay available; nothing
+    /// more is read or saved.
+    pub fn close(&self) {
+        self.conn.lock().unwrap_or_else(|e| e.into_inner()).take();
     }
 }
 
@@ -118,7 +129,10 @@ mod tests {
         assert_eq!(store.get("e.com", "price").as_deref(), Some("{\"a\":1}"));
         assert_eq!(store.get("f.com", "price").as_deref(), Some("{\"b\":2}"));
         assert_eq!(store.get("e.com", "title"), None);
-        drop(store);
+        store.close();
+        assert_eq!(store.get("e.com", "price").as_deref(), Some("{\"a\":1}"));
+        assert_eq!(store.get("g.com", "price"), None);
+        store.put("g.com", "price", "{}");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }
