@@ -43,8 +43,9 @@ Working today:
   cookies it earns back to the fast HTTP client. `netweir install chrome`
   fetches the Chrome it's tuned for.
 
-Coming next, in order: a Safari profile and the 0.1 release, then Firefox
-in the driver. The designs are in [docs/design/](docs/design/).
+Coming next: a Safari profile and the 0.1 release. Firefox in the driver
+waits for a Firefox that doesn't announce it's automated. The designs are
+in [docs/design/](docs/design/).
 
 ## Quick look
 
