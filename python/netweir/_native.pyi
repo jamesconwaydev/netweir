@@ -332,6 +332,7 @@ class Crawler:
             list[tuple[str, str, str]],
             str,
             list[tuple[str, str, float | None]],
+            str | None,
         ]
         | tuple[Literal["ruled"], int, str, Response, Node | None, int]
         | tuple[Literal["rule_failed"], int, str, FetchError]
@@ -371,6 +372,9 @@ class ItemSpec:
 
 class TrackStore:
     def __init__(self, path: str) -> None: ...
+    def get(self, site: str, name: str) -> str | None: ...
+
+def similarity(node: Node, kind: str, query: str, fingerprint: str) -> float | None: ...
 
 class JsonlWriter:
     def __init__(self, path: str, append: bool = False) -> None: ...

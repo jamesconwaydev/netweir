@@ -324,6 +324,14 @@ impl Tracker {
         &self.name
     }
 
+    /// The first element the query's element part finds below `scope`.
+    pub fn first_element<'a>(&self, scope: Node<'a>) -> Result<Option<Node<'a>>, String> {
+        Ok(self.element.hits(scope)?.into_iter().find_map(|h| match h {
+            Hit::Node(n) if n.kind() == NodeKind::Element => Some(n),
+            _ => None,
+        }))
+    }
+
     /// The query's results below `scope`. When the element is there, its
     /// fingerprint is saved; when it isn't, it's looked for by similarity.
     pub fn run<'a>(
@@ -331,11 +339,7 @@ impl Tracker {
         scope: Node<'a>,
         ctx: &TrackContext<'_>,
     ) -> Result<(Vec<Hit<'a>>, Tracking), String> {
-        let first = self.element.hits(scope)?.into_iter().find_map(|h| match h {
-            Hit::Node(n) if n.kind() == NodeKind::Element => Some(n),
-            _ => None,
-        });
-        if let Some(element) = first {
+        if let Some(element) = self.first_element(scope)? {
             ctx.tracks
                 .put(ctx.site, &self.name, &Fingerprint::of(element).to_json());
             return Ok((self.full.hits(scope)?, Tracking::Matched));

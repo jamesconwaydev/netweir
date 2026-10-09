@@ -1,6 +1,6 @@
 """Fast web scraping with a Rust engine."""
 
-from netweir import export
+from netweir import export, repair
 from netweir._crawl import Settings, Spider
 from netweir._errors import Blocked, FetchError
 from netweir._fetch import Client, Page, get
@@ -27,5 +27,6 @@ __all__ = [
     "css",
     "get",
     "parse",
+    "repair",
     "xpath",
 ]

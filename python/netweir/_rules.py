@@ -103,6 +103,7 @@ class Item:
     """
 
     _spec: ItemSpec
+    _fields: dict[str, Field]
     _python_into: dict[str, Callable[[Any], Any]]
 
     def __init_subclass__(cls, **kwargs):
@@ -116,6 +117,7 @@ class Item:
                     fields[name] = value
         # Warnings name the field in full, so two classes called Book don't
         # silence each other.
+        cls._fields = fields
         qualified = f"{cls.__module__}.{cls.__qualname__}"
         cls._spec = ItemSpec(qualified, [f._spec(name) for name, f in fields.items()])
         cls._python_into = {

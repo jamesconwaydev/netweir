@@ -105,7 +105,9 @@ class Page:
         """A CSS query. ``track`` names the element so it's found again
         after a redesign breaks the query (see ``Selection.relocated``)."""
         if track is not None:
-            return _track.tracked(self.root, "css", query, track, _track.site_of(self.url))
+            return _track.tracked(
+                self.root, "css", query, track, _track.site_of(self.url), self.url
+            )
         return self.root.css(query)
 
     def xpath(
@@ -116,7 +118,9 @@ class Page:
         if track is not None:
             if variables:
                 raise TypeError("track= can't be combined with $variables")
-            return _track.tracked(self.root, "xpath", query, track, _track.site_of(self.url))
+            return _track.tracked(
+                self.root, "xpath", query, track, _track.site_of(self.url), self.url
+            )
         return self.root.xpath(query, **variables)
 
     @property

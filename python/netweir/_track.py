@@ -28,6 +28,9 @@ _default: TrackStore | None = None
 _crawl: contextvars.ContextVar[tuple[TrackStore, float] | None] = contextvars.ContextVar(
     "netweir_tracks", default=None
 )
+#: The running crawl's way to ask for a repair: (site, name, kind, query,
+#: html, url) -> None.
+_repairs: contextvars.ContextVar[Any] = contextvars.ContextVar("netweir_repairs", default=None)
 
 
 def default_path() -> str:
@@ -58,14 +61,18 @@ def site_of(url: str | None) -> str:
     return (urlsplit(url).hostname or "") if url else ""
 
 
-def tracked(node: Any, kind: str, query: str, name: str, site: str) -> Any:
+def tracked(node: Any, kind: str, query: str, name: str, site: str, url: str = "") -> Any:
     """``node.css(query, track=name)`` or the XPath equivalent, on ``site``."""
     store, threshold = context()
     found = node.tracked(kind, query, name, store, site, threshold)
+    broken = found.relocated or (found.score is not None and found.score < 1.0)
     if found.relocated:
         report(name, site, "relocated", found.score, query)
-    elif found.score is not None and found.score < 1.0:
+    elif broken:
         report(name, site, "lost", found.score, query)
+    ask = _repairs.get()
+    if broken and ask is not None:
+        ask(site, name, kind, query, node.html, url)
     return found
 
 

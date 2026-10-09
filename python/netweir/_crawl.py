@@ -154,6 +154,10 @@ class Spider:
     #: Callables applied to every item in order, sync or async. Each returns
     #: the item (changed or not), or None to drop it.
     pipelines: list[Callable[[Any], Any]] = []
+    #: Asks for replacement selectors when tracked ones break (see
+    #: netweir.repair). Proposals end up in ``repairs`` after a run.
+    repair: Any = None
+    repairs: list[Any] = []
 
     async def start(self) -> AsyncIterator[Request]:
         """The first requests. An async generator by default; a plain
@@ -253,6 +257,10 @@ class _Run:
         store = TrackStore(state) if state else _track.context()[0]
         self.tracks = (store, self.settings.track_threshold)
         self.engine.set_tracks(store, self.settings.track_threshold)
+        spider.repairs = []
+        #: Repairs to ask for once the crawl is done, one per site and name.
+        self.repair_jobs: list[Any] = []
+        self.repair_asked: set[tuple[str, str]] = set()
         self.counts = {
             "items": 0,
             "items_dropped": 0,
@@ -262,6 +270,7 @@ class _Run:
             "items_already_written": 0,
             "relocated": 0,
             "lost": 0,
+            "repair_proposals": 0,
         }
 
     def resume(self) -> dict[str, int] | None:
@@ -354,10 +363,33 @@ class _Run:
     async def go(self) -> dict[str, int]:
         # page.css(track=...) in callbacks uses this crawl's store.
         token = _track._crawl.set(self.tracks)
+        asking = _track._repairs.set(self.ask_repair if self.spider.repair else None)
         try:
             return await self.crawl()
         finally:
+            _track._repairs.reset(asking)
             _track._crawl.reset(token)
+
+    def ask_repair(self, site: str, name: str, kind: str, query: str, html: str, url: str):
+        if self.spider.repair is None or (site, name) in self.repair_asked:
+            return
+        from netweir.repair import Job
+
+        self.repair_asked.add((site, name))
+        fingerprint = self.tracks[0].get(site, name)
+        self.repair_jobs.append(Job(site, name, kind, query, fingerprint, html, url))
+
+    async def run_repairs(self) -> None:
+        """Asks for the repairs the crawl ran into, off the event loop."""
+        for job in self.repair_jobs:
+            try:
+                proposal = await asyncio.to_thread(self.spider.repair.propose, job)
+            except Exception:  # noqa: BLE001 - a failed repair never fails the crawl
+                log.exception("asking for a repair of %s on %s failed", job.name, job.site)
+                continue
+            if proposal is not None:
+                self.spider.repairs.append(proposal)
+                self.counts["repair_proposals"] += 1
 
     async def crawl(self) -> dict[str, int]:
         started = time.monotonic()
@@ -377,6 +409,7 @@ class _Run:
             for event in events:
                 await self.dispatch(event)
             self.settle()
+        await self.run_repairs()
         stats = {**self.engine.stats(), **self.counts}
         stats.pop("queued", None)
         stats.pop("in_flight", None)
@@ -424,12 +457,15 @@ class _Run:
     async def dispatch(self, event: tuple) -> None:
         kind = event[0]
         if kind == "item":
-            _, rule, item, invalid, url, notes = event
+            _, rule, item, invalid, url, notes, html = event
             item_class = self.rules[rule].extract
             _warn_invalid(invalid, self.warned)
+            site = _track.site_of(url)
             for field, what, score in notes:
                 self.counts["relocated" if what == "relocated" else "lost"] += 1
-                _track.report(field, _track.site_of(url), what, score)
+                _track.report(field, site, what, score)
+                spec = item_class._fields[field.rsplit(".", 1)[1]]
+                self.ask_repair(site, spec.track, spec.kind, spec.query, html or "", url)
             self.source, self.position = url, 0
             await self.handle(item_class._finish(item, self.warned))
         elif kind == "ruled":

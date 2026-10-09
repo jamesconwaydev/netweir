@@ -64,6 +64,11 @@ impl TrackStore {
 
 #[pymethods]
 impl TrackStore {
+    /// The saved fingerprint (JSON) for `name` on `site`, if any.
+    fn get(&self, site: &str, name: &str) -> Option<String> {
+        self.inner.get(site, name)
+    }
+
     #[new]
     fn new(path: std::path::PathBuf) -> PyResult<TrackStore> {
         Ok(TrackStore {
@@ -278,7 +283,26 @@ pub(crate) struct Rule {
     pub priority: i32,
 }
 
+/// How much the element `query` finds below `node` looks like the one in
+/// `fingerprint` (JSON), 0 to 1; None if it finds no element.
+#[pyfunction]
+pub fn similarity(
+    node: &Node,
+    kind: &str,
+    query: &str,
+    fingerprint: &str,
+) -> PyResult<Option<f64>> {
+    let fp = netweir_dom::track::Fingerprint::from_json(fingerprint)
+        .ok_or_else(|| PyValueError::new_err("not a fingerprint"))?;
+    let tracker = Tracker::new("similarity", kind, query).map_err(PyValueError::new_err)?;
+    Ok(tracker
+        .first_element(node.get())
+        .map_err(PyValueError::new_err)?
+        .map(|el| fp.score(el)))
+}
+
 pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    m.add_function(wrap_pyfunction!(similarity, m)?)?;
     m.add_class::<ItemSpec>()?;
     m.add_class::<TrackStore>()
 }

@@ -82,6 +82,8 @@ struct Processed {
     item: Option<Vec<Value>>,
     /// What tracking did to the item's tracked fields.
     notes: Notes,
+    /// The page, when tracking failed on it, for repairs.
+    html: Option<String>,
     error: Option<String>,
     /// Why the rules left the page alone: an error status, or not HTML.
     ignored: Option<String>,
@@ -111,6 +113,7 @@ enum Out {
         url: String,
         values: Vec<Value>,
         notes: Notes,
+        html: Option<String>,
     },
     Ruled {
         rule: usize,
@@ -221,11 +224,13 @@ impl Engine {
             links: Vec::new(),
             item: None,
             notes: Vec::new(),
+            html: None,
             error: None,
             ignored: not_a_page(&response),
         };
         if done.ignored.is_none() {
-            match Document::parse_within(&response.text(), PARSE_BUDGET) {
+            let text = response.text();
+            match Document::parse_within(&text, PARSE_BUDGET) {
                 Ok(doc) => {
                     let root = doc.root();
                     if done.tag.apply_rules {
@@ -253,6 +258,9 @@ impl Engine {
                                 };
                                 let (values, notes) = item.extract_tracked(root, &ctx);
                                 done.item = Some(values);
+                                if !notes.is_empty() {
+                                    done.html = Some(text.clone());
+                                }
                                 done.notes = notes;
                             }
                             None => done.item = Some(item.extract(root)),
@@ -436,6 +444,7 @@ impl Engine {
                         url: done.tag.url.clone(),
                         values,
                         notes: done.notes,
+                        html: done.html,
                     });
                 }
                 match (done.tag.rule, done.response) {
@@ -519,6 +528,7 @@ fn out_py<'py>(py: Python<'py>, engine: &Engine, event: Out) -> PyResult<Bound<'
             url,
             values,
             notes,
+            html,
         } => {
             let rules = engine
                 .rules
@@ -539,6 +549,7 @@ fn out_py<'py>(py: Python<'py>, engine: &Engine, event: Out) -> PyResult<Bound<'
                     invalid.into_pyobject(py)?.into_any(),
                     s(&url)?,
                     notes.into_pyobject(py)?.into_any(),
+                    html.into_pyobject(py)?.into_any(),
                 ],
             )
         }
@@ -811,7 +822,8 @@ impl Crawler {
     /// - ("handled", id): dealt with by the rules in Rust
     /// - ("blocked", id, rule or None, url, vendor, kind, Response)
     /// - ("item", rule, dict, [(field, text, kind)] problems, url,
-    ///   [(field, "relocated" | "lost", score)] tracking notes)
+    ///   [(field, "relocated" | "lost", score)] tracking notes, the page's
+    ///   HTML when there are notes, else None)
     /// - ("ruled", rule, url, Response, root Node, depth)
     /// - ("rule_failed", rule, url, FetchError)
     /// - ("rule_dropped", rule, url, reason)
