@@ -28,11 +28,17 @@ pub struct Profile {
     pub name: String,
     pub tls: Tls,
     pub http2: Http2,
-    /// Every request, in order; the capitalisation is HTTP/1.1's.
+    /// Every request, in order; the capitalisation is HTTP/1.1's. An empty
+    /// value only reserves a position, for headers filled in per request
+    /// (`Cookie`, from the jar).
     pub headers: Vec<(String, String)>,
     /// Sent after `headers`, over HTTP/2 only.
     #[serde(default)]
     pub http2_headers: Vec<(String, String)>,
+    /// Header names in the order used after a redirect, when the browser
+    /// orders them differently; empty means the same as `headers`.
+    #[serde(default)]
+    pub redirect_header_order: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -86,6 +92,20 @@ impl std::fmt::Display for ProfileError {
 impl std::error::Error for ProfileError {}
 
 impl Profile {
+    /// Every header name a request can carry, in the order the browser
+    /// sends them: the profile's headers (or their after-redirect order),
+    /// then the HTTP/2-only ones.
+    pub fn header_order(&self, redirected: bool) -> Vec<String> {
+        let base: Vec<String> = if redirected && !self.redirect_header_order.is_empty() {
+            self.redirect_header_order.clone()
+        } else {
+            self.headers.iter().map(|(k, _)| k.clone()).collect()
+        };
+        base.into_iter()
+            .chain(self.http2_headers.iter().map(|(k, _)| k.clone()))
+            .collect()
+    }
+
     /// A built-in profile by name. `"chrome"` is the newest Chrome.
     pub fn named(name: &str) -> Result<Profile, ProfileError> {
         let name = if name == "chrome" { DEFAULT } else { name };
@@ -231,7 +251,8 @@ impl Profile {
         let mut header_order = OrigHeaderMap::new();
         for (k, v) in &self.headers {
             header_order.insert(k.clone());
-            if k.eq_ignore_ascii_case("host") {
+            // Host comes from the URL; an empty value only holds a position.
+            if k.eq_ignore_ascii_case("host") || v.is_empty() {
                 continue;
             }
             let name = HeaderName::from_bytes(k.to_ascii_lowercase().as_bytes())
@@ -302,6 +323,18 @@ mod tests {
             p.emulation().unwrap();
         }
         assert_eq!(Profile::named("chrome").unwrap().name, DEFAULT);
+    }
+
+    #[test]
+    fn redirect_order_holds_the_same_headers_as_the_first_request() {
+        for (name, _) in BUILT_IN {
+            let p = Profile::named(name).unwrap();
+            let mut first = p.header_order(false);
+            let mut after = p.header_order(true);
+            first.sort();
+            after.sort();
+            assert_eq!(first, after, "{name}");
+        }
     }
 
     #[test]

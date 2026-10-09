@@ -6,8 +6,9 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use bytes::Bytes;
-use wreq::header::{HeaderName, HeaderValue};
-use wreq::{Proxy, Version, redirect};
+use url::Url;
+use wreq::header::{HeaderName, HeaderValue, LOCATION, OrigHeaderMap};
+use wreq::{Proxy, Uri, Version, redirect};
 
 use crate::decode::decode;
 use crate::profile::Profile;
@@ -40,7 +41,11 @@ impl FetchOptions {
 pub struct Fetcher {
     client: wreq::Client,
     http2_headers: Arc<Vec<(HeaderName, HeaderValue)>>,
-    /// Hosts that answered over HTTP/1.1, so get no HTTP/2-only headers.
+    /// Header order for a navigation's first request, and after a redirect.
+    navigation_order: Arc<Vec<String>>,
+    redirect_order: Arc<Vec<String>>,
+    /// https origins (`host:port`) that answered over HTTP/1.1, so get no
+    /// HTTP/2-only headers.
     http1_hosts: Arc<Mutex<HashSet<String>>>,
 }
 
@@ -152,10 +157,13 @@ fn caused_by_tls(e: &wreq::Error) -> bool {
     false
 }
 
+/// Chrome follows at most 20 redirects.
+const MAX_REDIRECTS: usize = 20;
+
 impl Fetcher {
     pub fn new(options: FetchOptions) -> Result<Fetcher, FetchError> {
-        let emulation = options
-            .profile
+        let profile = &options.profile;
+        let emulation = profile
             .emulation()
             .map_err(|e| FetchError::invalid(e.to_string()))?;
         let mut builder = wreq::Client::builder()
@@ -166,8 +174,9 @@ impl Fetcher {
             .brotli(true)
             .zstd(true)
             .deflate(true)
-            // Chrome follows up to 20 redirects.
-            .redirect(redirect::Policy::limited(20))
+            // Redirects are followed in `get`, one request per hop, so each
+            // hop gets its own cookies, header order and HTTP/2-only headers.
+            .redirect(redirect::Policy::none())
             .tls_cert_verification(options.verify_certificates);
         if let Some(proxy) = &options.proxy {
             builder = builder
@@ -176,8 +185,7 @@ impl Fetcher {
         let client = builder
             .build()
             .map_err(|e| FetchError::invalid(FetchError::from(e).message))?;
-        let http2_headers = options
-            .profile
+        let http2_headers = profile
             .http2_headers
             .iter()
             .map(|(k, v)| {
@@ -191,90 +199,218 @@ impl Fetcher {
         Ok(Fetcher {
             client,
             http2_headers: Arc::new(http2_headers),
+            navigation_order: Arc::new(profile.header_order(false)),
+            redirect_order: Arc::new(profile.header_order(true)),
             http1_hosts: Arc::default(),
         })
     }
 
     /// Whether a request to `url` will go over HTTP/2: never for http://,
-    /// and not for hosts that have answered over HTTP/1.1 before.
-    // ponytail: the first request to an https host without HTTP/2 still
+    /// and not for https origins that have answered over HTTP/1.1 before.
+    // ponytail: the first request to an https origin without HTTP/2 still
     // carries the HTTP/2-only headers. Knowing for sure needs the ALPN result
-    // before the request is written, which wreq does not expose.
-    fn expects_http2(&self, url: &wreq::Uri) -> bool {
+    // before the request is written, which wreq does not expose; the fix
+    // belongs in wreq (drop marked headers when the connection is HTTP/1).
+    fn expects_http2(&self, url: &Uri) -> bool {
         url.scheme_str() == Some("https")
-            && !url.host().is_some_and(|h| {
+            && !https_origin(url).is_some_and(|o| {
                 self.http1_hosts
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
-                    .contains(h)
+                    .contains(&o)
             })
     }
 
-    /// GETs `url`. `headers` replace the profile's header of the same name
-    /// in its usual position, and new names go after the profile's own.
+    /// Remembers that an https origin answered over HTTP/1.1.
+    fn note_version(&self, url: &Uri, version: Version) {
+        if version < Version::HTTP_2
+            && let Some(origin) = https_origin(url)
+        {
+            self.http1_hosts
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(origin);
+        }
+    }
+
+    /// GETs `url`, following redirects like a browser's navigation does.
+    /// `headers` replace the profile's header of the same name in its usual
+    /// position; new names go after the profile's own, keeping the caller's
+    /// capitalisation on HTTP/1.1.
     pub async fn get(
         &self,
         url: &str,
         headers: &[(String, String)],
     ) -> Result<Response, FetchError> {
-        let uri: wreq::Uri = url
-            .parse()
-            .map_err(|_| FetchError::invalid(format!("bad URL {url:?}")))?;
-        let mut request = self.client.get(uri.clone());
-        let mut extra = Vec::new();
+        let mut caller = Vec::with_capacity(headers.len());
         for (k, v) in headers {
             let name = HeaderName::from_bytes(k.as_bytes())
                 .map_err(|_| FetchError::invalid(format!("bad header name {k:?}")))?;
             let value = HeaderValue::from_str(v)
                 .map_err(|_| FetchError::invalid(format!("bad value for header {k}")))?;
-            extra.push((name, value));
+            caller.push((k.as_str(), name, value));
         }
-        if self.expects_http2(&uri) {
+        let mut current = parse_url(url)?;
+        for hop in 0..=MAX_REDIRECTS {
+            let uri: Uri = current
+                .as_str()
+                .parse()
+                .map_err(|_| FetchError::invalid(format!("bad URL {url:?}")))?;
+            let response = self.send(&uri, &caller, hop > 0).await?;
+            self.note_version(&uri, response.version());
+            let location = response
+                .status()
+                .is_redirection()
+                .then(|| response.headers().get(LOCATION))
+                .flatten()
+                .and_then(|l| l.to_str().ok());
+            if let Some(location) = location {
+                if hop == MAX_REDIRECTS {
+                    return Err(FetchError {
+                        kind: FetchErrorKind::TooManyRedirects,
+                        message: format!(
+                            "more than {MAX_REDIRECTS} redirects, starting from {url}"
+                        ),
+                    });
+                }
+                let next = current.join(location).map_err(|_| {
+                    FetchError::invalid(format!("redirect to a bad URL {location:?}"))
+                })?;
+                if !matches!(next.scheme(), "http" | "https") {
+                    return Err(FetchError::invalid(format!(
+                        "redirect to an unsupported URL {next}"
+                    )));
+                }
+                current = next;
+                continue;
+            }
+            return into_response(current.to_string(), response).await;
+        }
+        unreachable!("the loop returns on its last hop")
+    }
+
+    async fn send(
+        &self,
+        uri: &Uri,
+        caller: &[(&str, HeaderName, HeaderValue)],
+        redirected: bool,
+    ) -> Result<wreq::Response, FetchError> {
+        let base = if redirected {
+            &self.redirect_order
+        } else {
+            &self.navigation_order
+        };
+        let mut order = OrigHeaderMap::new();
+        for name in base.iter() {
+            order.insert(name.clone());
+        }
+        for (raw, name, _) in caller {
+            if !base.iter().any(|b| b.eq_ignore_ascii_case(name.as_str())) {
+                order.insert(raw.to_string());
+            }
+        }
+        let mut request = self.client.get(uri.clone()).orig_headers(order);
+        if self.expects_http2(uri) {
             for (name, value) in self.http2_headers.iter() {
-                if !extra.iter().any(|(n, _)| n == name) {
+                if !caller.iter().any(|(_, n, _)| n == name) {
                     request = request.header(name.clone(), value.clone());
                 }
             }
         }
-        for (name, value) in extra {
-            request = request.header(name, value);
+        for (_, name, value) in caller {
+            request = request.header(name.clone(), value.clone());
         }
-        let response = request.send().await?;
-        if response.version() < Version::HTTP_2
-            && let Some(host) = response.uri().host().or(uri.host())
-        {
-            self.http1_hosts
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .insert(host.to_string());
-        }
-        let url = response.uri().to_string();
-        let status = response.status().as_u16();
-        let version = match response.version() {
-            Version::HTTP_09 => "HTTP/0.9",
-            Version::HTTP_10 => "HTTP/1.0",
-            Version::HTTP_11 => "HTTP/1.1",
-            Version::HTTP_2 => "HTTP/2",
-            Version::HTTP_3 => "HTTP/3",
-            _ => "unknown",
-        };
-        let headers = response
-            .headers()
-            .iter()
-            .map(|(k, v)| {
-                (
-                    k.as_str().to_string(),
-                    String::from_utf8_lossy(v.as_bytes()).into_owned(),
-                )
-            })
-            .collect();
-        let body = response.bytes().await?;
-        Ok(Response {
-            url,
-            status,
-            version,
-            headers,
-            body,
+        Ok(request.send().await?)
+    }
+}
+
+fn parse_url(url: &str) -> Result<Url, FetchError> {
+    let parsed = Url::parse(url).map_err(|_| FetchError::invalid(format!("bad URL {url:?}")))?;
+    if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none() {
+        return Err(FetchError::invalid(format!(
+            "only http and https URLs can be fetched, not {url:?}"
+        )));
+    }
+    Ok(parsed)
+}
+
+/// `host:port` of an https URL, the unit HTTP/2 support is known by.
+fn https_origin(url: &Uri) -> Option<String> {
+    (url.scheme_str() == Some("https")).then(|| {
+        format!(
+            "{}:{}",
+            url.host().unwrap_or(""),
+            url.port_u16().unwrap_or(443)
+        )
+    })
+}
+
+async fn into_response(url: String, response: wreq::Response) -> Result<Response, FetchError> {
+    let status = response.status().as_u16();
+    let version = match response.version() {
+        Version::HTTP_09 => "HTTP/0.9",
+        Version::HTTP_10 => "HTTP/1.0",
+        Version::HTTP_11 => "HTTP/1.1",
+        Version::HTTP_2 => "HTTP/2",
+        Version::HTTP_3 => "HTTP/3",
+        _ => "unknown",
+    };
+    let headers = response
+        .headers()
+        .iter()
+        .map(|(k, v)| {
+            (
+                k.as_str().to_string(),
+                String::from_utf8_lossy(v.as_bytes()).into_owned(),
+            )
         })
+        .collect();
+    let body = response.bytes().await?;
+    Ok(Response {
+        url,
+        status,
+        version,
+        headers,
+        body,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn fetcher() -> Fetcher {
+        Fetcher::new(FetchOptions::new(Profile::named("chrome").unwrap())).unwrap()
+    }
+
+    #[test]
+    fn plain_http_answers_say_nothing_about_https() {
+        let f = fetcher();
+        let https: Uri = "https://example.com/".parse().unwrap();
+        f.note_version(&"http://example.com/".parse().unwrap(), Version::HTTP_11);
+        assert!(f.expects_http2(&https));
+        f.note_version(&https, Version::HTTP_11);
+        assert!(!f.expects_http2(&https));
+        // Another port on the same host is another server.
+        assert!(f.expects_http2(&"https://example.com:8443/".parse().unwrap()));
+        assert!(!f.expects_http2(&"http://example.com/".parse().unwrap()));
+    }
+
+    #[test]
+    fn only_http_and_https_urls_are_fetched() {
+        assert!(parse_url("https://example.com/a?b").is_ok());
+        for bad in [
+            "ftp://example.com/",
+            "file:///etc/passwd",
+            "example.com",
+            "",
+            "https://",
+        ] {
+            assert_eq!(
+                parse_url(bad).unwrap_err().kind,
+                FetchErrorKind::Invalid,
+                "{bad:?}"
+            );
+        }
     }
 }

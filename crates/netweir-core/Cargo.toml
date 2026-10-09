@@ -16,6 +16,7 @@ chardetng = "1"
 encoding_rs = "0.8"
 serde = { version = "1", features = ["derive"] }
 toml = "1"
+url = "2"
 wreq = { version = "0.16.1", default-features = false, features = ["chromium-roots", "tokio-rt", "gzip", "brotli", "zstd", "deflate", "cookies"] }
 
 [dev-dependencies]

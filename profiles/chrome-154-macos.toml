@@ -2,14 +2,17 @@
 #
 # Written from profiles/chrome-154-macos.capture.json and
 # chrome-154-macos.http1.capture.json, which the capture tool recorded from
-# Chrome 154.0.8037.98 over HTTP/2 and HTTP/1.1. netweir-core's fingerprint
-# test fails if a request made with this profile looks any different.
+# Chrome 154.0.8037.98 over HTTP/2 and HTTP/1.1: a page that sets a cookie,
+# a revisit, a cross-site redirect and a same-site redirect. netweir-core's
+# fingerprint test replays them and fails if any request differs.
 
 name = "chrome-154-macos"
 
 # Sent on every request, in this order and with this capitalisation, unless
 # the caller overrides one. HTTP/2 lowercases the names and drops Host and
-# Connection; this list is what Chrome sends over HTTP/1.1.
+# Connection; this list is what Chrome sends over HTTP/1.1. An empty value
+# only holds a position: Cookie comes from the cookie jar, and over HTTP/2
+# each cookie goes out as its own field there.
 headers = [
     ["Host", ""],
     ["Connection", "keep-alive"],
@@ -25,6 +28,27 @@ headers = [
     ["Sec-Fetch-Dest", "document"],
     ["Accept-Encoding", "gzip, deflate, br, zstd"],
     ["Accept-Language", "en-US,en;q=0.9"],
+    ["Cookie", ""],
+]
+
+# After a redirect Chrome sends the same headers but moves the client hints
+# (sec-ch-ua*) to after Sec-Fetch-Dest.
+redirect_header_order = [
+    "Host",
+    "Connection",
+    "Upgrade-Insecure-Requests",
+    "User-Agent",
+    "Accept",
+    "Sec-Fetch-Site",
+    "Sec-Fetch-Mode",
+    "Sec-Fetch-User",
+    "Sec-Fetch-Dest",
+    "sec-ch-ua",
+    "sec-ch-ua-mobile",
+    "sec-ch-ua-platform",
+    "Accept-Encoding",
+    "Accept-Language",
+    "Cookie",
 ]
 
 # Chrome sends these only over HTTP/2, after the others.
