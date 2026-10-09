@@ -22,14 +22,14 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           submodules: true
-      - uses: dtolnay/rust-toolchain@f0d5300ba8908d942c808f4d31c08471d7798ba3 # nightly
+      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # nightly
       - run: cargo install cargo-fuzz --locked
       - name: Fuzz for five minutes
         working-directory: crates/netweir-dom
         run: cargo fuzz run ${{ matrix.target }} -- -max_total_time=300 -max_len=4096
       - name: Keep what it found
         if: failure()
-        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5.0.0
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: fuzz-${{ matrix.target }}
           path: crates/netweir-dom/fuzz/artifacts
