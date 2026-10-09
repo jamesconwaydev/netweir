@@ -9,7 +9,7 @@ rust-version.workspace = true
 publish = false
 
 [dependencies]
-brotli = "8"
+brotli = "9"
 netweir-browser = { path = "../netweir-browser" }
 btls = "0.5.6"
 bytes = "1"
