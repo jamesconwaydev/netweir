@@ -218,3 +218,30 @@ async fn wss_checks_the_certificate() {
     .unwrap();
     assert!(err.to_string().contains("certificate"), "{err}");
 }
+
+#[tokio::test]
+async fn a_websocket_that_isnt_devtools_says_so() {
+    use futures_util::{SinkExt, StreamExt};
+    // Echoes whatever it's sent, as no browser would.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        while let Ok((stream, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                let Ok(mut ws) = tokio_tungstenite::accept_async(stream).await else {
+                    return;
+                };
+                while let Some(Ok(message)) = ws.next().await {
+                    if message.is_text() && ws.send(message).await.is_err() {
+                        return;
+                    }
+                }
+            });
+        }
+    });
+    let err = Browser::connect(&format!("ws://127.0.0.1:{port}/"), LaunchOptions::default())
+        .await
+        .err()
+        .expect("an echo isn't a browser");
+    assert!(err.to_string().contains("DevTools"), "{err}");
+}

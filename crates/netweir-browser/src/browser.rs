@@ -215,6 +215,13 @@ impl Browser {
             Err(_) => return Err(Error::Launch(format!("{what} didn't answer in 30 seconds"))),
         };
         inner.version = str_of(&version, "product");
+        // Anything that answers in JSON could get this far; a browser says
+        // what it is.
+        if inner.version.is_empty() {
+            return Err(Error::Launch(format!(
+                "{what} isn't a browser's DevTools: it didn't say what it is"
+            )));
+        }
         let user_agent = str_of(&version, "userAgent");
         let mut browser = Browser {
             inner: Arc::new(inner),
