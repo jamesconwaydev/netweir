@@ -265,6 +265,13 @@ class Crawler:
         target_concurrency: float = 1.0,
         max_depth: int | None = None,
         max_pages_per_domain: int | None = None,
+        retries: int = 3,
+        backoff_base: float = 1.0,
+        backoff_max: float = 60.0,
+        proxies: list[str] | None = None,
+        breaker_window: int = 50,
+        breaker_ratio: float = 0.3,
+        breaker_pause: float = 300.0,
     ) -> None: ...
     def add_rule(
         self,
@@ -299,6 +306,8 @@ class Crawler:
         | tuple[Literal["rule_dropped"], int, str, Literal["robots", "tdm"]]
         | tuple[Literal["page_error"], str, str]
         | tuple[Literal["ignored"], str, str]
+        | tuple[Literal["blocked"], int, int | None, str, str, str, Response]
+        | tuple[Literal["paused"], str, float]
     ]: ...
     def stats(self) -> dict[str, int]: ...
 

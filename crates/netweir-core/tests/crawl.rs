@@ -14,6 +14,8 @@ fn settings() -> CrawlSettings {
         // Fast by default here; throttling has its own tests.
         throttle: false,
         start_delay: Duration::ZERO,
+        backoff_base: Duration::from_millis(10),
+        backoff_max: Duration::from_millis(20),
         ..CrawlSettings::default()
     }
 }

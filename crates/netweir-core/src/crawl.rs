@@ -11,6 +11,7 @@ use tokio::sync::Notify;
 use url::Url;
 
 use crate::canonical::{Fingerprint, fingerprint};
+use crate::classify::{BlockKind, Outcome, classify};
 use crate::fetch::{FetchError, FetchErrorKind, FetchOptions, Fetcher, Hop, Response};
 use crate::robots::Robots;
 use crate::tdmrep::{self, Reservation, TdmFile};
@@ -38,6 +39,22 @@ pub struct CrawlSettings {
     pub max_depth: Option<u32>,
     /// Requests accepted for one host beyond which more are refused.
     pub max_pages_per_domain: Option<u64>,
+    /// Further tries after a server error, a network error, throttling or
+    /// a block.
+    pub retries: u32,
+    /// Retry n waits a random time up to backoff_base * 2^n, capped at
+    /// backoff_max ("full jitter").
+    pub backoff_base: Duration,
+    pub backoff_max: Duration,
+    /// Proxies a host moves through when it blocks a session. Empty: the
+    /// fetch options' proxy, with a fresh cookie jar each time.
+    pub proxies: Vec<String>,
+    /// The circuit breaker looks at a host's last `breaker_window`
+    /// responses; if more than `breaker_ratio` of them were blocks, the
+    /// host pauses for `breaker_pause`.
+    pub breaker_window: usize,
+    pub breaker_ratio: f64,
+    pub breaker_pause: Duration,
 }
 
 impl Default for CrawlSettings {
@@ -55,6 +72,13 @@ impl Default for CrawlSettings {
             target_concurrency: 1.0,
             max_depth: None,
             max_pages_per_domain: None,
+            retries: 3,
+            backoff_base: Duration::from_secs(1),
+            backoff_max: Duration::from_secs(60),
+            proxies: Vec::new(),
+            breaker_window: 50,
+            breaker_ratio: 0.3,
+            breaker_pause: Duration::from_secs(300),
         }
     }
 }
@@ -98,9 +122,30 @@ pub enum DropReason {
 
 #[derive(Debug, Clone)]
 pub enum Event {
-    Fetched { id: u64, response: Response },
-    Failed { id: u64, error: FetchError },
-    Dropped { id: u64, reason: DropReason },
+    Fetched {
+        id: u64,
+        response: Response,
+    },
+    Failed {
+        id: u64,
+        error: FetchError,
+    },
+    Dropped {
+        id: u64,
+        reason: DropReason,
+    },
+    /// Still blocked after every retry and a new session for each.
+    Blocked {
+        id: u64,
+        vendor: String,
+        kind: BlockKind,
+        response: Response,
+    },
+    /// The circuit breaker paused a host that kept blocking.
+    Paused {
+        host: String,
+        pause: Duration,
+    },
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -117,6 +162,13 @@ pub struct Stats {
     pub skipped_depth: u64,
     pub skipped_traps: u64,
     pub skipped_domain_full: u64,
+    pub retries: u64,
+    /// Responses that were blocks, retried or not.
+    pub blocked: u64,
+    /// 429s, and 503s with Retry-After.
+    pub throttled: u64,
+    pub sessions_replaced: u64,
+    pub breaker_trips: u64,
 }
 
 /// A crawl in progress. Dropping it stops the scheduler; fetches already
@@ -127,6 +179,10 @@ pub struct Crawler {
 
 struct Shared {
     fetcher: Fetcher,
+    /// What new sessions are made from.
+    options: FetchOptions,
+    /// The next entry of `settings.proxies` a new session takes.
+    proxy_turn: std::sync::atomic::AtomicUsize,
     settings: CrawlSettings,
     state: Mutex<State>,
     /// Woken when there may be something to schedule.
@@ -166,6 +222,10 @@ struct Host {
     timer: Option<Instant>,
     /// Requests submitted for this host, for `max_pages_per_domain`.
     accepted: u64,
+    /// This host's own session after a block; until then, the crawl's.
+    session: Option<Fetcher>,
+    /// Whether each of the last responses was a block, newest last.
+    recent: VecDeque<bool>,
 }
 
 #[derive(Default)]
@@ -193,6 +253,8 @@ struct Queued {
     path: String,
     /// Redirects followed so far to get to `request.url`.
     hops: usize,
+    /// Tries already made.
+    attempts: u32,
 }
 
 impl PartialEq for Queued {
@@ -219,7 +281,9 @@ impl Crawler {
     /// Starts the scheduler on the current tokio runtime.
     pub fn new(fetch: FetchOptions, settings: CrawlSettings) -> Result<Crawler, FetchError> {
         let shared = Arc::new(Shared {
-            fetcher: Fetcher::new(fetch)?,
+            fetcher: Fetcher::new(fetch.clone())?,
+            options: fetch,
+            proxy_turn: std::sync::atomic::AtomicUsize::new(0),
             settings,
             state: Mutex::new(State::default()),
             schedule: Notify::new(),
@@ -344,6 +408,7 @@ impl Shared {
                 reason: DropReason::TdmReserved,
                 ..
             } => state.stats.dropped_tdm += 1,
+            Event::Blocked { .. } | Event::Paused { .. } => {}
         }
         state.events.push_back(event);
         self.events.notify_waiters();
@@ -352,7 +417,7 @@ impl Shared {
 
 /// What the scheduler decided to do with a host's next request.
 enum Action {
-    Fetch(Queued),
+    Fetch(Queued, Fetcher),
     CheckRobots(String),
     CheckTdm(String),
     /// Another host's check of the same origin is under way.
@@ -374,8 +439,8 @@ async fn schedule_loop(s: Arc<Shared>) {
         };
         for action in actions {
             match action {
-                Action::Fetch(q) => {
-                    tokio::spawn(fetch(s.clone(), q));
+                Action::Fetch(q, session) => {
+                    tokio::spawn(fetch(s.clone(), q, session));
                 }
                 Action::CheckRobots(origin) => {
                     tokio::spawn(check_robots(s.clone(), origin));
@@ -433,6 +498,7 @@ fn enqueue(
         origin,
         path,
         hops,
+        attempts: 0,
     };
     state
         .hosts
@@ -450,6 +516,8 @@ fn enqueue(
             listed: false,
             timer: None,
             accepted: 0,
+            session: None,
+            recent: VecDeque::new(),
         })
         .queue
         .push(queued);
@@ -602,7 +670,11 @@ fn plan(
             host.next_at = now + host.delay.max(host.floor);
             state.stats.queued -= 1;
             state.stats.in_flight += 1;
-            actions.push(Action::Fetch(q));
+            let session = host
+                .session
+                .clone()
+                .unwrap_or_else(|| shared.fetcher.clone());
+            actions.push(Action::Fetch(q, session));
         }
     }
     let sleep_until = state.timers.peek().map(|Reverse((at, _))| *at);
@@ -622,16 +694,11 @@ async fn guarded<T: Send + 'static>(
     }
 }
 
-async fn fetch(shared: Arc<Shared>, q: Queued) {
+async fn fetch(shared: Arc<Shared>, mut q: Queued, session: Fetcher) {
     let started = Instant::now();
-    let (fetcher, url, headers, hops) = (
-        shared.clone(),
-        q.request.url.clone(),
-        q.request.headers.clone(),
-        q.hops,
-    );
+    let (url, headers, hops) = (q.request.url.clone(), q.request.headers.clone(), q.hops);
     let result = guarded(
-        async move { fetcher.fetcher.hop(&url, &headers, hops).await },
+        async move { session.hop(&url, &headers, hops).await },
         |why| {
             Err(FetchError {
                 kind: FetchErrorKind::Other,
@@ -642,6 +709,10 @@ async fn fetch(shared: Arc<Shared>, q: Queued) {
     .await;
     let latency = started.elapsed();
     let settings = &shared.settings;
+    let outcome = match &result {
+        Ok(Hop::Done(r)) => Some(classify(r)),
+        _ => None,
+    };
     let mut state = shared.lock();
     state.stats.in_flight -= 1;
     if let Some(host) = state.hosts.get_mut(&q.host) {
@@ -652,11 +723,60 @@ async fn fetch(shared: Arc<Shared>, q: Queued) {
                 _ => None,
             };
             host.delay = adjust_delay(settings, host.delay, latency, status);
+        } else if matches!(outcome, Some(Outcome::Ok)) {
+            // No throttle to bring a delay a block added back down: each
+            // good response halves it.
+            host.delay = (host.delay / 2).max(settings.min_delay);
         }
     }
+    if let Some(outcome) = &outcome {
+        breaker(
+            &shared,
+            &mut state,
+            &q.host,
+            matches!(outcome, Outcome::Blocked { .. }),
+        );
+    }
     state.make_ready(&q.host);
-    let event = match result {
-        Ok(Hop::Done(response)) => {
+    let can_retry = q.attempts < settings.retries;
+    let event = match (result, outcome) {
+        (Ok(Hop::Done(response)), Some(Outcome::Blocked { vendor, kind })) => {
+            state.stats.blocked += 1;
+            new_session(&shared, &mut state, &q.host);
+            slow_down(settings, &mut state, &q.host, None);
+            if can_retry {
+                retry(settings, &mut state, q);
+                None
+            } else {
+                Some(Event::Blocked {
+                    id: q.request.id,
+                    vendor,
+                    kind,
+                    response,
+                })
+            }
+        }
+        (Ok(Hop::Done(response)), Some(Outcome::Throttled { retry_after })) => {
+            state.stats.throttled += 1;
+            slow_down(settings, &mut state, &q.host, retry_after);
+            if can_retry {
+                retry(settings, &mut state, q);
+                None
+            } else {
+                Some(Event::Fetched {
+                    id: q.request.id,
+                    response,
+                })
+            }
+        }
+        (Ok(Hop::Done(response)), Some(Outcome::HttpError(status)))
+            if can_retry && RETRY_STATUSES.contains(&status) =>
+        {
+            drop(response);
+            retry(settings, &mut state, q);
+            None
+        }
+        (Ok(Hop::Done(response)), _) => {
             if settings.obey_tdmrep && page_reserved(&state, &q, &response) {
                 Some(Event::Dropped {
                     id: q.request.id,
@@ -673,11 +793,12 @@ async fn fetch(shared: Arc<Shared>, q: Queued) {
         // goes through that host's robots.txt, TDMRep and limits. Its URL
         // counts as seen, but is fetched even if seen: this request has to
         // end somewhere.
-        Ok(Hop::Redirect(next)) => {
+        (Ok(Hop::Redirect(next)), _) => {
             if let Some(fp) = fingerprint("GET", &next) {
                 state.seen.insert(fp);
             }
             let id = q.request.id;
+            q.attempts = 0;
             if enqueue(settings, &mut state, q.request, &next, q.hops + 1) {
                 None
             } else {
@@ -689,7 +810,11 @@ async fn fetch(shared: Arc<Shared>, q: Queued) {
                 })
             }
         }
-        Err(error) => Some(Event::Failed {
+        (Err(error), _) if can_retry && transient(&error) => {
+            retry(settings, &mut state, q);
+            None
+        }
+        (Err(error), _) => Some(Event::Failed {
             id: q.request.id,
             error,
         }),
@@ -699,6 +824,116 @@ async fn fetch(shared: Arc<Shared>, q: Queued) {
     }
     drop(state);
     shared.schedule.notify_one();
+}
+
+/// Server errors worth another try: timeouts and overloaded or unreachable
+/// upstreams (522 and 524 are Cloudflare's).
+const RETRY_STATUSES: [u16; 7] = [408, 500, 502, 503, 504, 522, 524];
+
+/// Network failures that may pass on another try.
+fn transient(error: &FetchError) -> bool {
+    matches!(
+        error.kind,
+        FetchErrorKind::Timeout
+            | FetchErrorKind::Connect
+            | FetchErrorKind::Body
+            | FetchErrorKind::Other
+    )
+}
+
+/// Puts `q` back on its host's queue, after a backoff.
+fn retry(settings: &CrawlSettings, state: &mut State, mut q: Queued) {
+    q.attempts += 1;
+    state.stats.retries += 1;
+    let cap = settings
+        .backoff_base
+        .saturating_mul(1u32 << q.attempts.min(20))
+        .min(settings.backoff_max);
+    let wait = cap.mul_f64(random_fraction(q.seq));
+    let host = q.host.clone();
+    state.seq += 1;
+    q.seq = state.seq;
+    if let Some(h) = state.hosts.get_mut(&host) {
+        h.next_at = h.next_at.max(Instant::now() + wait);
+        h.queue.push(q);
+        state.stats.queued += 1;
+    }
+    state.make_ready(&host);
+}
+
+/// A number in [0, 1) that differs per call; for jitter, not secrets.
+fn random_fraction(salt: u64) -> f64 {
+    use std::hash::{BuildHasher, Hasher};
+    let mut h = std::collections::hash_map::RandomState::new().build_hasher();
+    h.write_u64(salt);
+    (h.finish() >> 11) as f64 / (1u64 << 53) as f64
+}
+
+/// Blocks and throttling count against a host's pace: its delay doubles
+/// (to at least half a second), and a Retry-After pushes its next request
+/// back.
+fn slow_down(settings: &CrawlSettings, state: &mut State, host: &str, wait: Option<Duration>) {
+    let Some(h) = state.hosts.get_mut(host) else {
+        return;
+    };
+    h.delay = h
+        .delay
+        .saturating_mul(2)
+        .max(Duration::from_millis(500))
+        .min(settings.max_delay);
+    // From now, not from the host's next turn, which was set before.
+    let wait = wait
+        .unwrap_or_default()
+        .min(settings.max_delay)
+        .max(h.delay);
+    h.next_at = h.next_at.max(Instant::now() + wait);
+}
+
+/// Replaces the host's session: a fresh cookie jar, and the next proxy if
+/// there are several.
+fn new_session(shared: &Shared, state: &mut State, host: &str) {
+    let mut options = shared.options.clone();
+    let proxies = &shared.settings.proxies;
+    if !proxies.is_empty() {
+        let turn = shared
+            .proxy_turn
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        options.proxy = Some(proxies[turn % proxies.len()].clone());
+    }
+    if let (Ok(fetcher), Some(h)) = (Fetcher::new(options), state.hosts.get_mut(host)) {
+        h.session = Some(fetcher);
+        state.stats.sessions_replaced += 1;
+    }
+}
+
+/// Records whether the host's latest response was a block, and pauses the
+/// host when too many of its recent ones were.
+fn breaker(shared: &Shared, state: &mut State, host: &str, blocked: bool) {
+    let settings = &shared.settings;
+    let Some(h) = state.hosts.get_mut(host) else {
+        return;
+    };
+    h.recent.push_back(blocked);
+    while h.recent.len() > settings.breaker_window {
+        h.recent.pop_front();
+    }
+    let blocks = h.recent.iter().filter(|b| **b).count();
+    if settings.breaker_window == 0
+        || h.recent.len() < settings.breaker_window
+        || blocks as f64 <= settings.breaker_ratio * settings.breaker_window as f64
+    {
+        return;
+    }
+    h.recent.clear();
+    h.next_at = h.next_at.max(Instant::now() + settings.breaker_pause);
+    state.stats.breaker_trips += 1;
+    shared.push_event(
+        state,
+        Event::Paused {
+            host: host.to_string(),
+            pause: settings.breaker_pause,
+        },
+    );
 }
 
 /// The file's word for this path, overridden by the response's headers and
@@ -859,6 +1094,7 @@ mod tests {
             origin: String::new(),
             path: String::new(),
             hops: 0,
+            attempts: 0,
         };
         let mut heap: BinaryHeap<Queued> =
             [q(0, 1), q(5, 2), q(0, 3), q(5, 4)].into_iter().collect();

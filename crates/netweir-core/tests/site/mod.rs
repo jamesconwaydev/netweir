@@ -1,6 +1,9 @@
 //! A scripted local website for crawl tests: plain HTTP/1.1, a fixed set
 //! of pages, and a log of every request with the time it arrived.
 
+// Each test crate that includes this uses only some of it.
+#![allow(dead_code)]
+
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -46,19 +49,32 @@ impl Page {
     }
 }
 
+/// A request's path and headers.
+pub type Request = (String, Vec<(String, String)>);
+
 pub struct Site {
     pub port: u16,
     pub hits: Arc<Mutex<Vec<(String, Instant)>>>,
+    /// Each request's headers, in arrival order, lowercase names.
+    pub requests: Arc<Mutex<Vec<Request>>>,
 }
 
 impl Site {
     pub async fn start(pages: Vec<(&str, Page)>) -> Site {
-        let pages: Arc<HashMap<String, Page>> = Arc::new(
+        Site::scripted(pages.into_iter().map(|(p, page)| (p, vec![page])).collect()).await
+    }
+
+    /// Each path answers with its pages in turn, the last one for good.
+    pub async fn scripted(pages: Vec<(&str, Vec<Page>)>) -> Site {
+        let pages: Arc<HashMap<String, Vec<Page>>> = Arc::new(
             pages
                 .into_iter()
                 .map(|(p, page)| (p.to_string(), page))
                 .collect(),
         );
+        let served: Arc<Mutex<HashMap<String, usize>>> = Arc::default();
+        let requests: Arc<Mutex<Vec<Request>>> = Arc::default();
+        let seen = requests.clone();
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         let hits = Arc::new(Mutex::new(Vec::new()));
@@ -67,6 +83,8 @@ impl Site {
             while let Ok((mut stream, _)) = listener.accept().await {
                 let pages = pages.clone();
                 let log = log.clone();
+                let served = served.clone();
+                let seen = seen.clone();
                 tokio::spawn(async move {
                     loop {
                         let mut head = Vec::new();
@@ -80,10 +98,23 @@ impl Site {
                         let text = String::from_utf8_lossy(&head).to_string();
                         let path = text.split(' ').nth(1).unwrap_or("/").to_string();
                         log.lock().unwrap().push((path.clone(), Instant::now()));
-                        let page = pages
-                            .get(&path)
-                            .cloned()
-                            .unwrap_or_else(|| Page::status(404, "not found"));
+                        let headers = text
+                            .lines()
+                            .skip(1)
+                            .filter_map(|l| l.split_once(':'))
+                            .map(|(k, v)| (k.trim().to_ascii_lowercase(), v.trim().to_string()))
+                            .collect();
+                        seen.lock().unwrap().push((path.clone(), headers));
+                        let page = match pages.get(&path) {
+                            Some(script) => {
+                                let mut served = served.lock().unwrap();
+                                let n = served.entry(path.clone()).or_insert(0);
+                                let page = script[(*n).min(script.len() - 1)].clone();
+                                *n += 1;
+                                page
+                            }
+                            None => Page::status(404, "not found"),
+                        };
                         tokio::time::sleep(page.delay).await;
                         let mut out = format!(
                             "HTTP/1.1 {} X\r\ncontent-length: {}\r\n",
@@ -102,7 +133,11 @@ impl Site {
                 });
             }
         });
-        Site { port, hits }
+        Site {
+            port,
+            hits,
+            requests,
+        }
     }
 
     pub fn url(&self, path: &str) -> String {

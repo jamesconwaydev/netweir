@@ -134,6 +134,20 @@ enum Out {
         url: String,
         reason: String,
     },
+    /// Still blocked after every retry. `rule` is set when a rule made
+    /// the request; otherwise `id` is Python's.
+    Blocked {
+        id: u64,
+        rule: Option<usize>,
+        url: String,
+        vendor: String,
+        kind: &'static str,
+        response: netweir_core::Response,
+    },
+    Paused {
+        host: String,
+        seconds: f64,
+    },
 }
 
 struct Engine {
@@ -325,6 +339,26 @@ impl Engine {
                             _ => out.push(Out::Dropped { id, why }),
                         }
                     }
+                    Event::Blocked {
+                        id,
+                        vendor,
+                        kind,
+                        response,
+                    } => {
+                        let tag = self.tags().remove(&id);
+                        out.push(Out::Blocked {
+                            id,
+                            rule: tag.as_ref().and_then(|t| t.rule),
+                            url: tag.map_or_else(|| response.url.clone(), |t| t.url),
+                            vendor,
+                            kind: kind.as_str(),
+                            response,
+                        });
+                    }
+                    Event::Paused { host, pause } => out.push(Out::Paused {
+                        host,
+                        seconds: pause.as_secs_f64(),
+                    }),
                 }
             }
             for (id, tag, job) in work {
@@ -478,6 +512,39 @@ fn out_py<'py>(py: Python<'py>, engine: &Engine, event: Out) -> PyResult<Bound<'
             vec![s("rule_dropped")?, n(rule as u64)?, s(&url)?, s(why)?],
         ),
         Out::Ignored { url, reason } => tuple(py, vec![s("ignored")?, s(&url)?, s(&reason)?]),
+        Out::Blocked {
+            id,
+            rule,
+            url,
+            vendor,
+            kind,
+            response: r,
+        } => {
+            let rule = match rule {
+                Some(r) => n(r as u64)?,
+                None => py.None().into_bound(py),
+            };
+            tuple(
+                py,
+                vec![
+                    s("blocked")?,
+                    n(id)?,
+                    rule,
+                    s(&url)?,
+                    s(&vendor)?,
+                    s(kind)?,
+                    response(r)?,
+                ],
+            )
+        }
+        Out::Paused { host, seconds } => tuple(
+            py,
+            vec![
+                s("paused")?,
+                s(&host)?,
+                seconds.into_pyobject(py)?.into_any(),
+            ],
+        ),
         Out::PageError { url, message } => {
             tuple(py, vec![s("page_error")?, s(&url)?, s(&message)?])
         }
@@ -492,6 +559,8 @@ impl Crawler {
         concurrency=64, per_domain=8, obey_robots=true, robots_agent="netweir", obey_tdmrep=true,
         throttle=true, start_delay=1.0, min_delay=0.0, max_delay=60.0, target_concurrency=1.0,
         max_depth=None, max_pages_per_domain=None,
+        retries=3, backoff_base=1.0, backoff_max=60.0, proxies=None,
+        breaker_window=50, breaker_ratio=0.3, breaker_pause=300.0,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -511,7 +580,19 @@ impl Crawler {
         target_concurrency: f64,
         max_depth: Option<u32>,
         max_pages_per_domain: Option<u64>,
+        retries: u32,
+        backoff_base: f64,
+        backoff_max: f64,
+        proxies: Option<Vec<String>>,
+        breaker_window: usize,
+        breaker_ratio: f64,
+        breaker_pause: f64,
     ) -> PyResult<Crawler> {
+        if !(0.0..=1.0).contains(&breaker_ratio) {
+            return Err(PyValueError::new_err(
+                "breaker_ratio must be between 0 and 1",
+            ));
+        }
         if concurrency == 0 || per_domain == 0 {
             return Err(PyValueError::new_err(
                 "concurrency and per_domain must be at least 1",
@@ -542,6 +623,13 @@ impl Crawler {
             target_concurrency,
             max_depth,
             max_pages_per_domain,
+            retries,
+            backoff_base: seconds("backoff_base", backoff_base)?,
+            backoff_max: seconds("backoff_max", backoff_max)?,
+            proxies: proxies.unwrap_or_default(),
+            breaker_window,
+            breaker_ratio,
+            breaker_pause: seconds("breaker_pause", breaker_pause)?,
         };
         let options = fetch_options(profile, proxy, timeout, verify)?;
         // The scheduler runs on the shared runtime.
@@ -645,13 +733,21 @@ impl Crawler {
         })
     }
 
-    /// Awaits up to `max` events, as tuples: ("fetched", id, Response,
-    /// root Node or None), ("failed", id, FetchError), ("dropped", id,
-    /// "robots" | "tdm"), ("handled", id), ("item", rule, dict, [(field,
-    /// text)] that would not convert), ("ruled", rule, url, Response, root
-    /// Node, depth), ("rule_failed", rule, url, FetchError), ("rule_dropped", rule,
-    /// url, reason) or ("page_error", url, message). An empty list means the
-    /// crawl is finished.
+    /// Awaits up to `max` events, as tuples:
+    ///
+    /// - ("fetched", id, Response, root Node or None)
+    /// - ("failed", id, FetchError)
+    /// - ("dropped", id, "robots" | "tdm")
+    /// - ("handled", id): dealt with by the rules in Rust
+    /// - ("blocked", id, rule or None, url, vendor, kind, Response)
+    /// - ("item", rule, dict, [(field, text)] that would not convert)
+    /// - ("ruled", rule, url, Response, root Node, depth)
+    /// - ("rule_failed", rule, url, FetchError)
+    /// - ("rule_dropped", rule, url, reason)
+    /// - ("page_error", url, message)
+    /// - ("paused", host, seconds)
+    ///
+    /// An empty list means the crawl is finished.
     #[pyo3(signature = (max=256))]
     fn next<'py>(&self, py: Python<'py>, max: usize) -> PyResult<Bound<'py, PyAny>> {
         let engine = self.engine.clone();
@@ -682,6 +778,11 @@ impl Crawler {
         d.set_item("skipped_depth", s.skipped_depth)?;
         d.set_item("skipped_traps", s.skipped_traps)?;
         d.set_item("skipped_domain_full", s.skipped_domain_full)?;
+        d.set_item("retries", s.retries)?;
+        d.set_item("blocked", s.blocked)?;
+        d.set_item("throttled", s.throttled)?;
+        d.set_item("sessions_replaced", s.sessions_replaced)?;
+        d.set_item("breaker_trips", s.breaker_trips)?;
         Ok(d)
     }
 }

@@ -87,3 +87,71 @@ async def test_client_raises_too_and_get_many_can_collect(base):
         )
     assert pages[0].outcome == "ok"
     assert isinstance(pages[1], netweir.Blocked) and pages[1].vendor == "akamai"
+
+
+FAST = netweir.Settings(
+    throttle=False,
+    start_delay=0,
+    obey_robots=False,
+    obey_tdmrep=False,
+    retries=1,
+    backoff_base=0.01,
+    backoff_max=0.02,
+    max_delay=0.05,
+)
+
+
+def test_a_spider_hears_about_blocks_it_could_not_get_past(base):
+    seen = []
+
+    class Guarded(netweir.Spider):
+        settings = FAST
+        start_urls = [f"{base}/datadome-captcha.http", f"{base}/ok-behind-cloudflare.http"]
+
+        def parse(self, page):
+            yield {"url": page.url}
+
+        def on_block(self, request, page):
+            seen.append((request.url, page.blocked, page.status))
+            yield {"blocked": request.url}
+
+    stats = Guarded().run()
+    assert seen == [(f"{base}/datadome-captcha.http", "datadome", 403)]
+    assert stats["items"] == 2, "on_block can yield items too"
+    assert stats["blocked"] == 2 and stats["retries"] == 1
+    assert stats["sessions_replaced"] == 2
+
+
+def test_blocks_are_logged_by_default(base, caplog):
+    class Quiet(netweir.Spider):
+        settings = FAST
+        start_urls = [f"{base}/akamai-block.http"]
+
+    with caplog.at_level("WARNING", logger="netweir"):
+        Quiet().run()
+    assert "blocked by akamai" in caplog.text
+
+
+def test_payment_required_is_reported_with_the_price(base, caplog):
+    class Paying(netweir.Spider):
+        settings = FAST
+        start_urls = [f"{base}/payment.http"]
+
+        def parse(self, page):
+            return None
+
+    with caplog.at_level("WARNING", logger="netweir"):
+        stats = Paying().run()
+    assert "USD 0.01" in caplog.text
+    assert stats["retries"] == 0
+
+
+def test_settings_check_the_ladder():
+    with pytest.raises(ValueError):
+        netweir.Settings(breaker_ratio=1.5)
+    with pytest.raises(ValueError):
+        netweir.Settings(retries=-1)
+    assert netweir.Settings(proxies=["http://a:1", "http://b:2"]).proxies == (
+        "http://a:1",
+        "http://b:2",
+    )

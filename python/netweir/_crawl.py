@@ -50,6 +50,20 @@ class Settings:
     max_depth: int | None = None
     #: Requests accepted for one host beyond which more are dropped.
     max_pages_per_domain: int | None = None
+    #: Further tries after a server error, a network error, throttling or
+    #: a block. Retry n waits a random time up to backoff_base * 2**n
+    #: seconds, capped at backoff_max.
+    retries: int = 3
+    backoff_base: float = 1.0
+    backoff_max: float = 60.0
+    #: Proxies a host moves through each time it blocks a session; every
+    #: new session also starts with an empty cookie jar.
+    proxies: tuple[str, ...] = ()
+    #: If more than breaker_ratio of a host's last breaker_window responses
+    #: were blocks, it pauses for breaker_pause seconds.
+    breaker_window: int = 50
+    breaker_ratio: float = 0.3
+    breaker_pause: float = 300.0
     #: Stop the crawl at the first exception in a callback or pipeline.
     fail_fast: bool = False
 
@@ -66,6 +80,14 @@ class Settings:
             raise ValueError("max_depth must be 0 or more")
         if self.max_pages_per_domain is not None and self.max_pages_per_domain < 1:
             raise ValueError("max_pages_per_domain must be at least 1")
+        if self.retries < 0 or self.breaker_window < 0:
+            raise ValueError("retries and breaker_window must be 0 or more")
+        if not 0 < self.backoff_base <= self.backoff_max or self.breaker_pause < 0:
+            raise ValueError("backoffs must be positive, with backoff_base <= backoff_max")
+        if not 0 <= self.breaker_ratio <= 1:
+            raise ValueError("breaker_ratio must be between 0 and 1")
+        # A list is fine to pass; stored as a tuple, as Settings is frozen.
+        object.__setattr__(self, "proxies", tuple(self.proxies))
 
     def _engine(self) -> Crawler:
         return Crawler(
@@ -84,6 +106,13 @@ class Settings:
             target_concurrency=self.target_concurrency,
             max_depth=self.max_depth,
             max_pages_per_domain=self.max_pages_per_domain,
+            retries=self.retries,
+            backoff_base=self.backoff_base,
+            backoff_max=self.backoff_max,
+            proxies=list(self.proxies),
+            breaker_window=self.breaker_window,
+            breaker_ratio=self.breaker_ratio,
+            breaker_pause=self.breaker_pause,
         )
 
 
@@ -114,6 +143,14 @@ class Spider:
 
     def parse(self, page: Page) -> Any:
         raise NotImplementedError(f"{type(self).__name__} needs a parse(self, page) method")
+
+    def on_block(self, request: Request, page: Page) -> Any:
+        """Called when bot protection still blocked ``request`` after every
+        retry, each with a new session. ``page.blocked`` names the vendor.
+        Like a callback, it may yield items and Requests. By default it
+        logs a warning."""
+        kind = page._classified()[2]
+        log.warning("%s: blocked by %s (%s); giving up", request.url, page.blocked, kind)
 
     def run(self, output: Any = None) -> dict[str, int]:
         """Crawls to the end and returns the stats. ``output`` writes every
@@ -251,11 +288,31 @@ class _Run:
             log.warning("%s: %s", url, message)
         elif kind == "handled":
             self.waiting.pop(event[1])
+        elif kind == "blocked":
+            _, rid, rule, url, _vendor, _kind, response = event
+            if rule is None:
+                request = self.waiting.pop(rid)
+            else:
+                request = Request(url, callback=self.rules[rule].callback)
+            page = Page(response, request)
+            await self.run_callback(self.spider.on_block, None, (request, page), url)
+        elif kind == "paused":
+            _, host, seconds = event
+            log.warning(
+                "%s keeps blocking: pausing it for %.0f s (the circuit breaker)", host, seconds
+            )
         else:
             _, rid, detail, *rest = event
             request = self.waiting.pop(rid)
             if kind == "fetched":
                 page = Page(detail, request, rest[0])
+                if page.outcome == "payment_required":
+                    price = page._classified()[4]
+                    log.warning(
+                        "%s: payment required%s; not retried",
+                        page.url,
+                        f" ({price})" if price else "",
+                    )
                 await self.run_callback(request.callback, "parse", (page,), request.url)
             elif kind == "failed":
                 if request.errback is None:

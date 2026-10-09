@@ -66,7 +66,7 @@ def base():
     server.shutdown()
 
 
-FAST = netweir.Settings(throttle=False, start_delay=0)
+FAST = netweir.Settings(throttle=False, start_delay=0, backoff_base=0.01, backoff_max=0.02)
 
 
 class Books(netweir.Spider):
@@ -203,7 +203,12 @@ def test_failures_reach_the_errback(base):
 
     class Failing(netweir.Spider):
         settings = netweir.Settings(
-            throttle=False, start_delay=0, obey_robots=False, obey_tdmrep=False
+            throttle=False,
+            start_delay=0,
+            obey_robots=False,
+            obey_tdmrep=False,
+            backoff_base=0.01,
+            backoff_max=0.02,
         )
 
         async def start(self):
