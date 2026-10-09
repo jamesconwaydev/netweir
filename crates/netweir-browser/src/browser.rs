@@ -115,6 +115,7 @@ impl Browser {
             // Leaves navigator.webdriver false.
             "--disable-blink-features=AutomationControlled".into(),
         ];
+        args.extend(KEYRING.iter().map(|a| a.to_string()));
         // Chrome's client hints, when they had to be read before launch.
         let mut hints = None;
         if options.headless {
@@ -496,6 +497,17 @@ fn remove_profile(dir: &Path) -> Result<()> {
     }
 }
 
+/// Keeps Chrome away from the system keyring, where a fresh profile goes
+/// for the key it encrypts cookies with. A headless Chrome can't show the
+/// prompt that asks for access, so it waits on one nobody can answer.
+/// Nothing a page can see changes.
+#[cfg(target_os = "macos")]
+const KEYRING: &[&str] = &["--use-mock-keychain"];
+#[cfg(all(unix, not(target_os = "macos")))]
+const KEYRING: &[&str] = &["--password-store=basic"];
+#[cfg(not(unix))]
+const KEYRING: &[&str] = &[];
+
 fn profile_dir() -> std::io::Result<PathBuf> {
     static COUNT: AtomicU64 = AtomicU64::new(0);
     let nanos = std::time::SystemTime::now()
@@ -545,6 +557,7 @@ async fn headless_identity(executable: &Path, extra: &[String]) -> Result<(Strin
         "--no-first-run".into(),
         "--headless".into(),
     ];
+    args.extend(KEYRING.iter().map(|a| a.to_string()));
     args.extend(extra.iter().cloned());
     args.push("about:blank".into());
     let started = match launch::start(executable, &args) {
