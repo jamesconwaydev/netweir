@@ -251,7 +251,9 @@ async fn safari_27_navigations_over_http1_are_indistinguishable() {
 /// opened after. Which of the two a request rides is Safari's pooling, not
 /// something a site can tell apart, so a request Safari sent on a
 /// connection opened before the scenario may carry either connection's
-/// ALPN offer, as long as Safari made that offer to the same host.
+/// ALPN offer, as long as Safari made that offer to the same host and
+/// netweir sent it on a connection it had already used. A new connection
+/// is held to Safari's offer exactly.
 fn either_pooled_connection(mut expected: Vec<Capture>, actual: &[Capture]) -> Vec<Capture> {
     let opened_here = |c: &Capture| {
         expected
@@ -267,7 +269,7 @@ fn either_pooled_connection(mut expected: Vec<Capture>, actual: &[Capture]) -> V
         })
         .collect();
     for ((e, a), pooled) in expected.iter_mut().zip(actual).zip(pooled) {
-        if !pooled {
+        if !pooled || a.request == 0 {
             continue;
         }
         let host = &e.client_hello.server_name;
