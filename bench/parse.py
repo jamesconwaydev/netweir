@@ -78,19 +78,22 @@ RUNNERS = {
 }
 
 
-def best_ms(fn, html, runs, budget=3.0):
-    """Best of `runs` timings, stopping early once `budget` seconds are spent."""
-    best = float("inf")
-    spent = 0.0
+def best_ms(runners, html, runs, budget=3.0):
+    """Best of `runs` timings for each runner, in rounds, so a runner that
+    slows down partway affects every library alike. A library stops once it
+    has used `budget` seconds."""
+    best = dict.fromkeys(runners, float("inf"))
+    spent = dict.fromkeys(runners, 0.0)
     for _ in range(runs):
-        start = time.perf_counter()
-        fn(html)
-        took = time.perf_counter() - start
-        best = min(best, took)
-        spent += took
-        if spent > budget:
-            break
-    return best * 1000
+        for name, fn in runners.items():
+            if spent[name] > budget:
+                continue
+            start = time.perf_counter()
+            fn(html)
+            took = time.perf_counter() - start
+            best[name] = min(best[name], took)
+            spent[name] += took
+    return {name: t * 1000 for name, t in best.items()}
 
 
 def main():
@@ -111,11 +114,10 @@ def main():
         html = page(size)
         expected = run_netweir(html)
         print(f"\n{label} page, {len(expected[0])} products", flush=True)
-        times = {}
         for name, fn in RUNNERS.items():
             if fn(html) != expected:
                 sys.exit(f"{name} extracted different data from netweir on the {label} page")
-            times[name] = best_ms(fn, html, args.runs)
+        times = best_ms(RUNNERS, html, args.runs)
         for name, ms in sorted(times.items(), key=lambda kv: kv[1]):
             print(f"  {name:14} {ms:9.2f} ms  {ms / times['netweir']:5.2f}x")
         if times["netweir"] > times["selectolax"] * (1 + args.tolerance):
