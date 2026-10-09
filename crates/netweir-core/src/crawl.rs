@@ -1102,7 +1102,7 @@ async fn fetch(shared: Arc<Shared>, mut q: Queued, session: Fetcher) {
             None
         }
         (Ok(Hop::Done(response)), _) => {
-            if settings.obey_tdmrep && page_reserved(&state, &q, &response) {
+            if settings.obey_tdmrep && page_reserved(&state, &q.origin, &q.path, &response) {
                 Some(Event::Dropped {
                     id: q.request.id,
                     reason: DropReason::TdmReserved,
@@ -1170,8 +1170,9 @@ async fn browser_fetch(shared: Arc<Shared>, mut q: Queued, permit: OwnedSemaphor
     // A Chrome that stops answering mid-page mustn't hold the request, and
     // its place in the crawl, for good.
     let limit = timeout.saturating_mul(2) + CHALLENGE_WAIT;
-    // Set if robots.txt stopped a redirect Chrome was following.
-    let refused = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    // Set if robots.txt or TDMRep stopped a document Chrome was about to
+    // fetch: a redirect hop, or a navigation the page's script started.
+    let refused: Refusal = Arc::default();
     let work = render(
         shared.clone(),
         q.request.url.clone(),
@@ -1206,6 +1207,10 @@ async fn browser_fetch(shared: Arc<Shared>, mut q: Queued, permit: OwnedSemaphor
             && let Ok((r, _, _, latency, _)) = &rendered
         {
             host.delay = adjust_delay(settings, host.delay, *latency, Some(r.status));
+        } else if !settings.throttle && matches!(outcome, Some(Outcome::Ok)) {
+            // As over HTTP: a good response halves a delay a block or a 429
+            // added, with no throttle to bring it back down.
+            host.delay = (host.delay / 2).max(settings.min_delay);
         }
     }
     if let Some(outcome) = &outcome {
@@ -1218,6 +1223,7 @@ async fn browser_fetch(shared: Arc<Shared>, mut q: Queued, permit: OwnedSemaphor
         );
     }
     state.make_ready(&q.host);
+    let refusal = *refused.lock().unwrap_or_else(|e| e.into_inner());
     // Pages to close once the lock is released.
     let mut discard = None;
     let event = match (rendered, outcome) {
@@ -1283,7 +1289,11 @@ async fn browser_fetch(shared: Arc<Shared>, mut q: Queued, permit: OwnedSemaphor
                     shared.push_event(&mut state, Event::Warning { message });
                 }
             }
-            if settings.obey_tdmrep && page_reserved(&state, &q, &response) {
+            // Chrome may have landed elsewhere: its page is judged by the
+            // site it came from.
+            let landed =
+                origin_and_path(&response.url).unwrap_or((q.origin.clone(), q.path.clone()));
+            if settings.obey_tdmrep && page_reserved(&state, &landed.0, &landed.1, &response) {
                 discard = Some(page);
                 Some(Event::Dropped {
                     id: q.request.id,
@@ -1297,9 +1307,9 @@ async fn browser_fetch(shared: Arc<Shared>, mut q: Queued, permit: OwnedSemaphor
                 })
             }
         }
-        (Err(_), _) if refused.load(std::sync::atomic::Ordering::Relaxed) => Some(Event::Dropped {
+        (Err(_), _) if refusal.is_some() => Some(Event::Dropped {
             id: q.request.id,
-            reason: DropReason::Robots,
+            reason: refusal.expect("checked"),
         }),
         (Err(error), _) if q.attempts < settings.retries && transient(&error) => {
             retry(settings, &mut state, q);
@@ -1347,7 +1357,7 @@ async fn render(
     url: String,
     cookies: bool,
     permit: OwnedSemaphorePermit,
-    refused: Arc<std::sync::atomic::AtomicBool>,
+    refused: Refusal,
 ) -> Result<Rendered, FetchError> {
     let browser = {
         let mut slot = shared.browser.lock().await;
@@ -1366,19 +1376,22 @@ async fn render(
         kind: FetchErrorKind::Other,
         message: format!("can't start Chrome: {e}"),
     })?;
-    let page = if shared.settings.obey_robots {
-        // Chrome follows redirects itself; each hop is checked against its
-        // site's robots.txt before Chrome asks for it, as the HTTP client
-        // checks each hop it follows.
+    let guarded = shared.settings.obey_robots || shared.settings.obey_tdmrep;
+    let page = if guarded {
+        // Chrome follows redirects, and the page's scripts navigate, by
+        // itself; each document is checked against its site's robots.txt
+        // and TDMRep before Chrome asks for it, as the HTTP client checks
+        // each hop it follows.
         let guarding = shared.clone();
+        let refusing = refused.clone();
         let guard: netweir_browser::Guard = Arc::new(move |url: String| {
-            let (shared, refused) = (guarding.clone(), refused.clone());
+            let (shared, refused) = (guarding.clone(), refusing.clone());
             Box::pin(async move {
-                let allowed = robots_allow(&shared, &url).await;
-                if !allowed {
-                    refused.store(true, std::sync::atomic::Ordering::Relaxed);
+                let refusal = refusal_of(&shared, &url).await;
+                if refusal.is_some() {
+                    *refused.lock().unwrap_or_else(|e| e.into_inner()) = refusal;
                 }
-                allowed
+                refusal.is_none()
             })
         });
         browser.new_guarded_page(guard).await
@@ -1396,8 +1409,15 @@ async fn render(
     };
     let timeout = shared.options.timeout;
     let started = Instant::now();
+    // A guard may have to fetch a site's robots.txt or tdmrep.json, each
+    // with the request timeout, before the page itself can load.
+    let load_limit = if guarded {
+        timeout.saturating_mul(3)
+    } else {
+        timeout
+    };
     let mut document = page
-        .goto(&url, WaitUntil::Load, Some(timeout))
+        .goto(&url, WaitUntil::Load, Some(load_limit))
         .await
         .map_err(browser_error)?;
     let latency = started.elapsed();
@@ -1416,7 +1436,7 @@ async fn render(
                 Err(e) => return Err(browser_error(e)),
             }
         }
-        let response = rendered(&document, page.content().await.map_err(browser_error)?);
+        let response = rendered(&document, content(&page).await?);
         let challenged = matches!(
             classify(&response),
             Outcome::Blocked {
@@ -1436,14 +1456,21 @@ async fn render(
             // Out of time. One last look, for a challenge that swaps the
             // page's content without navigating.
             Err(netweir_browser::Error::Timeout(_)) => {
-                break rendered(
-                    &page.response(),
-                    page.content().await.map_err(browser_error)?,
-                );
+                break rendered(&page.response(), content(&page).await?);
             }
             Err(e) => return Err(browser_error(e)),
         }
     };
+    // A navigation that was refused leaves Chrome's error page showing,
+    // which isn't the page.
+    if refused.lock().unwrap_or_else(|e| e.into_inner()).is_some()
+        && (response.status == 0 || response.url.starts_with("chrome-error://"))
+    {
+        return Err(FetchError {
+            kind: FetchErrorKind::Other,
+            message: "Chrome was refused the page it was going to".into(),
+        });
+    }
     let cookies = if cookies {
         page.cookies().await.map_err(browser_error)?
     } else {
@@ -1458,41 +1485,95 @@ async fn render(
     ))
 }
 
-/// Whether robots.txt lets the crawl fetch `url`, fetching the site's
-/// robots.txt first, as the scheduler would, if it isn't known yet.
-async fn robots_allow(shared: &Arc<Shared>, url: &str) -> bool {
-    let settings = &shared.settings;
-    let Ok(parsed) = Url::parse(url) else {
-        return true;
-    };
+/// Why a document Chrome is about to fetch may not be: robots.txt or
+/// TDMRep, if the crawl obeys them.
+type Refusal = Arc<Mutex<Option<DropReason>>>;
+
+/// A URL's origin and path (with its query), as the scheduler keys them.
+fn origin_and_path(url: &str) -> Option<(String, String)> {
+    let parsed = Url::parse(url).ok()?;
     if !matches!(parsed.scheme(), "http" | "https") {
-        return true;
+        return None;
     }
-    let origin = parsed.origin().ascii_serialization();
     let path = match parsed.query() {
         Some(q) => format!("{}?{q}", parsed.path()),
         None => parsed.path().to_string(),
     };
-    loop {
-        let fetch = {
-            let mut state = shared.lock();
-            let o = state.origins.entry(origin.clone()).or_default();
-            match &o.robots {
-                Gate::Ready(r) => return r.allowed(&settings.robots_agent, &path),
-                Gate::Fetching => false,
-                Gate::Unknown => {
-                    o.robots = Gate::Fetching;
-                    state.gate_fetches += 1;
-                    true
+    Some((parsed.origin().ascii_serialization(), path))
+}
+
+/// Why the crawl may not fetch `url`, if it may not: its site's robots.txt
+/// or TDMRep file, each fetched first, as the scheduler would, if it isn't
+/// known yet.
+async fn refusal_of(shared: &Arc<Shared>, url: &str) -> Option<DropReason> {
+    let settings = &shared.settings;
+    let (origin, path) = origin_and_path(url)?;
+    if settings.obey_robots {
+        loop {
+            let fetch = {
+                let mut state = shared.lock();
+                let o = state.origins.entry(origin.clone()).or_default();
+                match &o.robots {
+                    Gate::Ready(r) if r.allowed(&settings.robots_agent, &path) => break,
+                    Gate::Ready(_) => return Some(DropReason::Robots),
+                    Gate::Fetching => false,
+                    Gate::Unknown => {
+                        o.robots = Gate::Fetching;
+                        state.gate_fetches += 1;
+                        true
+                    }
                 }
+            };
+            if fetch {
+                check_robots(shared.clone(), origin.clone()).await;
+            } else {
+                // ponytail: another fetch of it is under way; polled, as
+                // this is one request's wait, not the scheduler's.
+                tokio::time::sleep(Duration::from_millis(50)).await;
             }
-        };
-        if fetch {
-            check_robots(shared.clone(), origin.clone()).await;
-        } else {
-            // ponytail: another fetch of it is under way; polled, as this
-            // is one request's wait, not the scheduler's.
-            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+    if settings.obey_tdmrep {
+        loop {
+            let fetch = {
+                let mut state = shared.lock();
+                let o = state.origins.entry(origin.clone()).or_default();
+                match &o.tdm {
+                    Gate::Ready(Some(f)) if f.reservation(&path).reserved == Some(true) => {
+                        return Some(DropReason::TdmReserved);
+                    }
+                    Gate::Ready(_) => break,
+                    Gate::Fetching => false,
+                    Gate::Unknown => {
+                        o.tdm = Gate::Fetching;
+                        state.gate_fetches += 1;
+                        true
+                    }
+                }
+            };
+            if fetch {
+                check_tdm(shared.clone(), origin.clone()).await;
+            } else {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        }
+    }
+    None
+}
+
+/// The page's HTML, read again if a script moved the page on mid-read
+/// (Chrome says the isolated world's context is gone).
+async fn content(page: &netweir_browser::Page) -> Result<String, FetchError> {
+    let mut tries = 0;
+    loop {
+        match page.content().await {
+            Err(netweir_browser::Error::Protocol { message, .. })
+                if message.contains("context") && tries < 3 =>
+            {
+                tries += 1;
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            other => return other.map_err(browser_error),
         }
     }
 }
@@ -1748,9 +1829,9 @@ fn breaker(shared: &Shared, state: &mut State, host: &str, blocked: bool) {
 
 /// The file's word for this path, overridden by the response's headers and
 /// then its `<meta>`, as TDMRep orders them.
-fn page_reserved(state: &State, q: &Queued, response: &Response) -> bool {
-    let from_file = match state.origins.get(&q.origin).map(|o| &o.tdm) {
-        Some(Gate::Ready(Some(f))) => f.reservation(&q.path),
+fn page_reserved(state: &State, origin: &str, path: &str, response: &Response) -> bool {
+    let from_file = match state.origins.get(origin).map(|o| &o.tdm) {
+        Some(Gate::Ready(Some(f))) => f.reservation(path),
         _ => Reservation::default(),
     };
     let headers = tdmrep::from_headers(

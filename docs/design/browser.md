@@ -231,17 +231,22 @@ they own. Closing the browser closes every page.
   limit (twice the request timeout plus the challenge wait), so a Chrome
   that stops answering can't hold the request forever.
 - Chrome follows redirects itself; the URL it ends on counts as seen.
-  With `obey_robots`, each document the page's main frame is about to
-  fetch (every redirect hop, and navigations its scripts start) is paused
-  through the Fetch domain and checked against its site's robots.txt,
-  fetched first through the scheduler's own gate if it isn't known; one it
-  disallows is failed before it's sent, and the request is dropped for
-  robots. Frames within the page, and the files it loads, aren't checked.
+  With `obey_robots` or `obey_tdmrep`, each document the page's main
+  frame is about to fetch (every redirect hop, and navigations its
+  scripts start) is paused through the Fetch domain and checked against
+  its site's robots.txt and TDMRep file, each fetched first through the
+  scheduler's own gate if it isn't known; one they rule out is failed
+  before it's sent, and the request is dropped for robots or TDM. A
+  refused navigation leaves Chrome's error page showing, which is never
+  taken for the page. The page Chrome lands on is judged for TDMRep by
+  its own site. Frames within the page, and the files it loads, aren't
+  checked; nor are a hop's site's request limits and delay, which apply
+  to the request as it was scheduled.
 - A Chrome that dies is started again for the next browser request; one
   that can't start is tried again a minute later, not for every request
-  meanwhile. A page Chrome answers with a server error, a 429 or a 503
-  with Retry-After is slowed down and retried there like any other, except
-  a blocked request's one go in Chrome.
+  meanwhile. A page Chrome answers with a server error is retried there,
+  and a 429 or a 503 with Retry-After slows the site down and is retried,
+  like any other request, except a blocked request's one go in Chrome.
 - A connected browser running with a `--user-agent` flag of its own
   reports emptied high-entropy hints; an override would send them as
   empty headers, so its pages are left as Chrome makes them.

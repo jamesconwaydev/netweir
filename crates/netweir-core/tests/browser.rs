@@ -504,3 +504,79 @@ async fn a_503_with_retry_after_is_waited_out_and_tried_again_in_chrome() {
     let stats = c.stats();
     assert_eq!((stats.retries, stats.throttled), (1, 1));
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_navigation_a_pages_script_starts_obeys_robots_txt_too() {
+    if !have_chrome() {
+        return;
+    }
+    let other = Site::start(vec![
+        (
+            "/robots.txt",
+            Page::status(200, "User-agent: *\nDisallow: /secret\n"),
+        ),
+        ("/secret", Page::html("secret")),
+    ])
+    .await;
+    let secret = format!("http://localhost:{}/secret", other.port);
+    let site = Site::start(vec![(
+        "/moves",
+        Page::html(&format!("<script>location.replace('{secret}')</script>")),
+    )])
+    .await;
+    let c = crawler(CrawlSettings {
+        obey_robots: true,
+        ..settings(BrowserMode::Off)
+    });
+    c.submit(request(1, site.url("/moves"), true));
+    let events = drain_closing(&c).await;
+    assert!(
+        events.iter().any(|(e, _)| matches!(
+            e,
+            Event::Dropped {
+                id: 1,
+                reason: netweir_core::DropReason::Robots
+            }
+        )),
+        "{events:?}"
+    );
+    assert!(!other.paths().iter().any(|p| p == "/secret"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_redirect_chrome_follows_obeys_the_next_sites_tdmrep() {
+    if !have_chrome() {
+        return;
+    }
+    let tdm = r#"[{"location": "/reserved", "tdm-reservation": 1}]"#;
+    let other = Site::start(vec![
+        ("/.well-known/tdmrep.json", Page::status(200, tdm)),
+        ("/reserved", Page::html("reserved")),
+    ])
+    .await;
+    let site = Site::start(vec![(
+        "/go",
+        Page::status(302, "").with_header(
+            "location",
+            &format!("http://localhost:{}/reserved", other.port),
+        ),
+    )])
+    .await;
+    let c = crawler(CrawlSettings {
+        obey_tdmrep: true,
+        ..settings(BrowserMode::Off)
+    });
+    c.submit(request(1, site.url("/go"), true));
+    let events = drain_closing(&c).await;
+    assert!(
+        events.iter().any(|(e, _)| matches!(
+            e,
+            Event::Dropped {
+                id: 1,
+                reason: netweir_core::DropReason::TdmReserved
+            }
+        )),
+        "{events:?}"
+    );
+    assert!(!other.paths().iter().any(|p| p == "/reserved"));
+}

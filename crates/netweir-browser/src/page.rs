@@ -850,9 +850,17 @@ impl Login {
             && params["frameId"] == self.frame.as_str()
         {
             let url = str_of(&params["request"], "url");
-            if guarded.send((str_of(params, "requestId"), url)).is_ok() {
-                return;
+            let id = str_of(params, "requestId");
+            if guarded.send((id.clone(), url)).is_err() {
+                // The guard has gone (it panicked): nothing it would have
+                // been asked about goes through unasked.
+                self.conn.send(
+                    &self.session,
+                    "Fetch.failRequest",
+                    json!({"requestId": id, "errorReason": "BlockedByClient"}),
+                );
             }
+            return;
         }
         self.conn.send(
             &self.session,

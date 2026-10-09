@@ -516,14 +516,17 @@ fn profile_dir() -> std::io::Result<PathBuf> {
 /// a --user-agent flag empties the hints. The first time, it's started once
 /// to ask.
 async fn headless_identity(executable: &Path, extra: &[String]) -> Result<(String, Value)> {
-    // By the file as it is now: a Chrome updated in place is asked again.
-    type Key = (PathBuf, Option<std::time::SystemTime>, u64);
+    // By the file as it is now, so a Chrome updated in place is asked
+    // again, and by the switches it's started with.
+    type Key = (PathBuf, Option<std::time::SystemTime>, u64, Vec<String>);
     static KNOWN: Mutex<Option<HashMap<Key, (String, Value)>>> = Mutex::new(None);
     let meta = std::fs::metadata(executable).ok();
     let key: Key = (
         executable.to_path_buf(),
         meta.as_ref().and_then(|m| m.modified().ok()),
         meta.as_ref().map_or(0, |m| m.len()),
+        // Switches can change what Chrome says it is.
+        extra.to_vec(),
     );
     if let Some(known) = KNOWN
         .lock()

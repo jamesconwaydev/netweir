@@ -50,7 +50,7 @@ The options:
 |---|---|---|
 | `executable` | `None` | the Chrome to start, instead of searching |
 | `headless` | `True` | `False` opens a window |
-| `args` | `()` | more Chrome command-line switches; with your own `--user-agent=`, pages say that and keep Chrome's behaviour under the flag, high-entropy client hints empty |
+| `args` | `()` | more Chrome command-line switches; with your own `--user-agent=`, pages say that and keep Chrome's behaviour under the flag: high-entropy client hints empty, and Chrome's own brands even where netweir would present Google Chrome's |
 | `timeout` | `30.0` | the default limit, in seconds, for navigations and actions |
 | `proxy` | `None` | an `http://`, `https://` or `socks5://` proxy for everything Chrome fetches; for an HTTP(S) proxy, a username and password in it are given when it asks (Chrome can't log in to a SOCKS proxy) |
 | `connect` | `None` | drive a browser that's already running, instead of starting one: a `ws://` DevTools URL, or `http://host:port` |
@@ -179,8 +179,10 @@ page until the callback returns, then it closes. Browser requests wait their
 turn like any other: robots.txt, each site's limits and its delay all
 apply. Chrome follows redirects, and a page's own scripts, by itself; each
 page it's about to load in the tab is checked against that site's
-robots.txt first, and one it disallows isn't fetched (the request is
-dropped, as over HTTP). `browser_pages` (4 by default) caps how many are
+robots.txt and TDMRep first, and one they rule out isn't fetched (the
+request is dropped, as over HTTP). The check stays on while your callback
+drives `page.browser`: navigating it somewhere ruled out fails with
+Chrome's `ERR_BLOCKED_BY_CLIENT`. `browser_pages` (4 by default) caps how many are
 open at once.
 A declarative spider's rules read the rendered HTML, so callbacks the rules
 call, and a rules spider's own `parse`, get the rendered page but not
