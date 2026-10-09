@@ -1,5 +1,7 @@
 //! Python bindings. Kept thin: anything that could live in netweir-dom does.
 
+mod fetch;
+
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -28,12 +30,17 @@ fn compile(query: &str) -> PyResult<Query> {
 
 /// A node in a parsed document.
 #[pyclass(frozen, module = "netweir")]
-struct Node {
+pub(crate) struct Node {
     doc: Arc<Document>,
     id: NodeId,
 }
 
 impl Node {
+    pub(crate) fn root_of(doc: Arc<Document>) -> Node {
+        let id = doc.root().id();
+        Node { doc, id }
+    }
+
     fn get(&self) -> netweir_dom::Node<'_> {
         // SAFETY: `id` was taken from a node of `doc`, which this Node keeps alive.
         unsafe { self.doc.node(self.id) }
@@ -180,6 +187,19 @@ impl Selection {
     }
 }
 
+/// Seconds from Python to a parse budget; `None` means no limit.
+pub(crate) fn budget(timeout: Option<f64>) -> PyResult<Duration> {
+    match timeout {
+        None => Ok(Duration::MAX),
+        Some(t) if t >= 0.0 && t.is_finite() => {
+            Ok(Duration::try_from_secs_f64(t).unwrap_or(Duration::MAX))
+        }
+        Some(_) => Err(PyValueError::new_err(
+            "timeout must be a non-negative number of seconds",
+        )),
+    }
+}
+
 /// Parses an HTML document and returns its root node.
 ///
 /// With `timeout` (seconds), gives up and raises ParseTimeout on pages that
@@ -187,21 +207,11 @@ impl Selection {
 #[pyfunction]
 #[pyo3(signature = (html, timeout=None))]
 fn parse(py: Python<'_>, html: &str, timeout: Option<f64>) -> PyResult<Node> {
-    let budget = match timeout {
-        Some(t) if !(t >= 0.0 && t.is_finite()) => {
-            return Err(PyValueError::new_err(
-                "timeout must be a non-negative number of seconds",
-            ));
-        }
-        Some(t) => Duration::from_secs_f64(t),
-        None => Duration::MAX,
-    };
+    let budget = budget(timeout)?;
     let doc = py
         .detach(|| Document::parse_within(html, budget))
         .map_err(|e| ParseTimeout::new_err(e.to_string()))?;
-    let doc = Arc::new(doc);
-    let id = doc.root().id();
-    Ok(Node { doc, id })
+    Ok(Node::root_of(Arc::new(doc)))
 }
 
 #[pymodule]
@@ -211,5 +221,6 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<Selection>()?;
     m.add("SelectorError", m.py().get_type::<SelectorError>())?;
     m.add("ParseTimeout", m.py().get_type::<ParseTimeout>())?;
+    fetch::register(m)?;
     Ok(())
 }

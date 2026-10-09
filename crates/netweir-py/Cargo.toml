@@ -10,5 +10,8 @@ name = "_native"
 crate-type = ["cdylib"]
 
 [dependencies]
+netweir-core = { path = "../netweir-core" }
 netweir-dom = { path = "../netweir-dom" }
 pyo3 = { version = "0.29", features = ["abi3-py310", "extension-module"] }
+pyo3-async-runtimes = { version = "0.29", features = ["tokio-runtime"] }
+tokio = { version = "1", features = ["rt-multi-thread"] }
