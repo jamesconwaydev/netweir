@@ -32,12 +32,21 @@ asked for anything.
 
 netweir sends what Chrome 154 sends. Not something close to it: the same
 ClientHello, the same HTTP/2 settings and priorities, the same headers in
-the same order and the same capitalisation over HTTP/1.1. You don't have to
-take that on trust. `cargo test -p netweir-core` connects to a local server
-that records every byte of the handshake, and the test fails if anything
-differs from what real Chrome sent that server. The public checker at
-tls.peet.ws reports the same JA4 fingerprint for both:
-`t13d1517h2_8daaf6152771_cb7bf5808d99`.
+the same order and the same capitalisation over HTTP/1.1. Cookies go where
+Chrome puts them, and redirects are followed hop by hop the way Chrome
+follows them, header order after a redirect included.
+
+You don't have to take that on trust. Chrome was recorded doing four
+navigations against a local server: a page that sets a cookie, a revisit,
+a redirect to another site and one within the site. `cargo test -p
+netweir-core` has netweir do the same four and fails if any request differs
+from Chrome's. The public checker at tls.peet.ws reports the same JA4
+fingerprint for both: `t13d1517h2_8daaf6152771_cb7bf5808d99`.
+
+One known difference: Chrome sends a `priority` header only over HTTP/2,
+and netweir can't tell a server lacks HTTP/2 until it has answered once. So
+the first request to an https server that only speaks HTTP/1.1 carries that
+header; every request after it doesn't.
 
 For many pages at once, use a client. It keeps connections and cookies
 between requests, and the requests run concurrently in Rust:
