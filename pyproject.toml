@@ -1,0 +1,48 @@
+[build-system]
+requires = ["maturin>=1.15,<2"]
+build-backend = "maturin"
+
+[project]
+name = "netweir"
+description = "Fast web scraping with a Rust engine"
+readme = "README.md"
+license = "AGPL-3.0-only"
+license-files = ["LICENSE", "NOTICE"]
+requires-python = ">=3.10"
+authors = [{ name = "James Conway" }]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Rust",
+    "Topic :: Internet :: WWW/HTTP :: Indexing/Search",
+]
+dynamic = ["version"]
+
+[project.urls]
+Repository = "https://github.com/jamesconwaydev/netweir"
+
+[dependency-groups]
+dev = ["pytest>=8", "maturin>=1.15,<2", "ruff>=0.14"]
+bench = ["selectolax>=0.4", "lxml>=6", "cssselect>=1.3", "beautifulsoup4>=4.13", "parsel>=1.10"]
+
+[tool.maturin]
+manifest-path = "crates/netweir-py/Cargo.toml"
+python-source = "python"
+module-name = "netweir._native"
+
+[tool.uv]
+cache-keys = [{ file = "pyproject.toml" }, { file = "Cargo.toml" }, { file = "crates/**/*.rs" }, { file = "crates/**/*.c" }]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+extend-exclude = ["crates/netweir-dom/lexbor"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "SIM"]
+# HTML fixtures run long; the formatter already wraps code.
+ignore = ["E501"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["netweir"]
