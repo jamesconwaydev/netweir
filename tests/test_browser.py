@@ -250,6 +250,8 @@ async def test_a_running_chrome_can_be_driven_and_is_left_running(base, tmp_path
         assert chrome.poll() is None, "Chrome kept running"
         with pytest.raises(ValueError, match="already running"):
             await netweir.browser(connect=ws, proxy="http://127.0.0.1:1")
+        with pytest.raises(ValueError, match="already running"):
+            await netweir.browser(connect=ws, headless=False)
     finally:
         chrome.kill()
         chrome.wait()

@@ -164,3 +164,85 @@ async fn a_platform_with_no_build_says_so_and_installs_nothing() {
     assert!(err.contains("no Chrome for Testing"), "{err}");
     assert!(!home.join("chrome").exists());
 }
+
+#[tokio::test]
+async fn a_version_that_isnt_a_version_isnt_made_a_folder() {
+    let Some(platform) = cft_platform() else {
+        return;
+    };
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let base = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+    let index = serde_json::json!({"milestones": {milestone(): {
+        "version": "../../escaped",
+        "downloads": {"chrome": [{"platform": platform, "url": format!("{base}/chrome.zip")}]},
+    }}})
+    .to_string();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            loop {
+                let mut h = String::new();
+                if reader.read_line(&mut h).unwrap_or(0) == 0 || h.trim().is_empty() {
+                    break;
+                }
+            }
+            let _ = write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{index}",
+                index.len()
+            );
+        }
+    });
+    let home = std::env::temp_dir().join(format!("netweir-install-bad-{}", std::process::id()));
+    let err = install_chrome(&format!("{base}/index.json"), &home, false)
+        .await
+        .unwrap_err();
+    assert!(err.contains("escaped"), "{err}");
+    assert!(!home.exists());
+}
+
+#[tokio::test]
+async fn a_broken_install_is_replaced_and_leftovers_swept() {
+    let Some(platform) = cft_platform() else {
+        return;
+    };
+    let (base, _) = serve(
+        platform,
+        vec![("/chrome.zip", fake_download(platform, false))],
+    );
+    let home = std::env::temp_dir().join(format!("netweir-install-fix-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&home);
+    let version = format!("{}.0.9000.1", milestone());
+    // An earlier install whose executable is gone, and the half-unpacked
+    // folder of one that was killed.
+    let top = cft_executable(platform, false)
+        .components()
+        .next()
+        .unwrap()
+        .as_os_str()
+        .to_owned();
+    std::fs::create_dir_all(home.join("chrome").join(&version).join(&top)).unwrap();
+    let leftover = home.join("chrome").join(format!(".{version}-chrome-1"));
+    std::fs::create_dir_all(&leftover).unwrap();
+    // Windows can't open a folder to date it; the sweep is the same there.
+    #[cfg(unix)]
+    {
+        let hours_ago = std::time::SystemTime::now() - std::time::Duration::from_secs(7200);
+        std::fs::File::open(&leftover)
+            .unwrap()
+            .set_modified(hours_ago)
+            .unwrap();
+    }
+    let running = home.join("chrome").join(format!(".{version}-chrome-2"));
+    std::fs::create_dir_all(&running).unwrap();
+
+    let installed = install_chrome(&format!("{base}/index.json"), &home, false)
+        .await
+        .unwrap();
+    assert!(installed.executable.is_file());
+    #[cfg(unix)]
+    assert!(!leftover.exists());
+    assert!(running.exists(), "an install under way is left alone");
+    std::fs::remove_dir_all(&home).unwrap();
+}

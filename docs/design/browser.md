@@ -241,12 +241,21 @@ warning when there is none.
 
 **Proxies with a login.** Chrome takes no credentials on
 `--proxy-server`. It's given the proxy without them, and each page enables
-the Fetch domain for authentication only, answering `Fetch.authRequired`
-for a proxy challenge with the credentials and leaving a site's own
-challenge to Chrome. Page script can't see the Fetch domain. The answer is
-sent from the reader thread without waiting for a reply, since the request
-is held until it arrives. `netweir.browser(proxy=...)` takes the proxy, and
-a crawl's browser requests use the crawl's `proxy`, credentials and all.
+the Fetch domain, answering `Fetch.authRequired` for a proxy challenge
+with the credentials and leaving a site's own challenge to Chrome. Chrome
+won't raise those challenges unless requests are paused too, so every
+request a page makes is paused and released at once: a round trip each,
+only when the proxy has a login. Page script can't see the Fetch domain.
+Answers are sent from the reader thread without waiting for a reply, since
+the request is held until they arrive. `netweir.browser(proxy=...)` takes
+the proxy, and a crawl's browser requests use the crawl's `proxy`,
+credentials and all.
+
+Only HTTP(S) proxies: Chrome's SOCKS client offers no login, so a SOCKS
+proxy with one is refused with an error. And only pages get the login:
+workers and frames from other sites, which are targets of their own,
+aren't attached to, so behind a proxy that needs a login their requests
+fail.
 
 **Installing Chrome.** `netweir install chrome` downloads the Chrome for
 Testing build whose major version matches netweir's newest Chrome

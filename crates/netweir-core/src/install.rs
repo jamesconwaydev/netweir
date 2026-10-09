@@ -60,6 +60,14 @@ pub async fn install_chrome(
         .as_str()
         .ok_or_else(|| format!("{index} has no Chrome {milestone}"))?
         .to_string();
+    // It becomes a folder name, and find_chrome reads only dotted numbers.
+    if version.is_empty()
+        || !version
+            .split('.')
+            .all(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+    {
+        return Err(format!("{index} lists {version:?} as a version"));
+    }
     let kind = if headless_shell {
         "chrome-headless-shell"
     } else {
@@ -106,11 +114,25 @@ pub async fn install_chrome(
         return Err(format!("{url}: HTTP {}", zip.status));
     }
     // Unpacked beside its final place and moved in whole, so a download
-    // cut short never looks installed.
+    // cut short never looks installed. What an install that was killed
+    // left behind goes first; not one under way now, so only an hour old.
+    let prefix = format!(".{version}-{kind}-");
+    if let Ok(entries) = std::fs::read_dir(home.join("chrome")) {
+        for entry in entries.flatten() {
+            let old = entry
+                .metadata()
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|t| t.elapsed().ok())
+                .is_some_and(|age| age > Duration::from_secs(3600));
+            if old && entry.file_name().to_string_lossy().starts_with(&prefix) {
+                let _ = std::fs::remove_dir_all(entry.path());
+            }
+        }
+    }
     let partial = home
         .join("chrome")
-        .join(format!(".{version}-{kind}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&partial);
+        .join(format!("{prefix}{}", std::process::id()));
     let unpacked = tokio::task::spawn_blocking({
         let partial = partial.clone();
         move || -> Result<(), String> {
@@ -128,9 +150,12 @@ pub async fn install_chrome(
         for entry in std::fs::read_dir(&partial).map_err(|e| e.to_string())? {
             let entry = entry.map_err(|e| e.to_string())?;
             let to = dir.join(entry.file_name());
-            if !to.exists() {
-                std::fs::rename(entry.path(), &to).map_err(|e| e.to_string())?;
+            // Ours is complete; one already there isn't, or the executable
+            // check above would have found it.
+            if to.exists() {
+                std::fs::remove_dir_all(&to).map_err(|e| e.to_string())?;
             }
+            std::fs::rename(entry.path(), &to).map_err(|e| e.to_string())?;
         }
         Ok(())
     });

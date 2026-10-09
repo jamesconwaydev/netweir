@@ -26,8 +26,9 @@ pub struct LaunchOptions {
     /// The default limit for navigations and actions.
     pub timeout: Duration,
     /// An `http://`, `https://` or `socks5://` proxy for everything Chrome
-    /// fetches. A username and password in it are answered when the proxy
-    /// asks for them.
+    /// fetches. For an HTTP(S) proxy, a username and password in it are
+    /// given when it asks; Chrome can't log in to a SOCKS proxy, so one
+    /// with a login is refused.
     pub proxy: Option<String>,
     /// The brands pages present. Chrome for Testing calls itself Chromium
     /// alone, where Google Chrome of the same version lists itself too.
@@ -193,7 +194,13 @@ impl Browser {
             .trim_start_matches("Chrome/")
             .to_string();
         let major = full.split('.').next().unwrap_or_default().to_string();
-        let brands = options.brands.as_ref().and_then(|b| b(&major));
+        // A list that doesn't parse would leave pages with no brands at
+        // all; Chrome's own are better.
+        let brands = options
+            .brands
+            .as_ref()
+            .and_then(|b| b(&major))
+            .filter(|header| !parse_brands(header).is_empty());
         if user_agent.contains("HeadlessChrome/") || brands.is_some() {
             let mut metadata = browser.own_metadata().await?;
             if let Some(header) = brands {
@@ -302,7 +309,12 @@ impl Browser {
         let r = self
             .inner
             .conn
-            .call("", "Target.createBrowserContext", json!({}))
+            // Gone when the connection is, however netweir lets go of it.
+            .call(
+                "",
+                "Target.createBrowserContext",
+                json!({"disposeOnDetach": true}),
+            )
             .await?;
         let id = str_of(&r, "browserContextId");
         self.inner
@@ -328,14 +340,13 @@ impl Browser {
             let contexts =
                 std::mem::take(&mut *inner.contexts.lock().unwrap_or_else(|e| e.into_inner()));
             for id in contexts {
-                let _ = inner
-                    .conn
-                    .call(
-                        "",
-                        "Target.disposeBrowserContext",
-                        json!({"browserContextId": id}),
-                    )
-                    .await;
+                let dispose = inner.conn.call(
+                    "",
+                    "Target.disposeBrowserContext",
+                    json!({"browserContextId": id}),
+                );
+                // A browser that doesn't answer won't hold the close up.
+                let _ = tokio::time::timeout(Duration::from_secs(5), dispose).await;
             }
             inner.conn.shut();
             return Ok(());
@@ -362,6 +373,9 @@ impl Browser {
 impl Inner {
     fn shut_down(&self, grace: Duration) -> Result<()> {
         let Some(mut child) = self.child.lock().unwrap_or_else(|e| e.into_inner()).take() else {
+            // Connected, not launched: let go of the browser. Its contexts
+            // go with the connection (disposeOnDetach).
+            self.conn.shut();
             return Ok(());
         };
         self.conn.shut();
@@ -453,13 +467,24 @@ async fn devtools_url(base: &str) -> Result<String> {
         loop {
             if let Some(at) = reply.windows(4).position(|w| w == b"\r\n\r\n") {
                 let head = String::from_utf8_lossy(&reply[..at]).to_ascii_lowercase();
+                let ok = head
+                    .lines()
+                    .next()
+                    .is_some_and(|status| status.split(' ').nth(1) == Some("200"));
                 let length: usize = head
                     .lines()
                     .find_map(|l| l.strip_prefix("content-length:"))
                     .and_then(|v| v.trim().parse().ok())
                     .ok_or_else(|| failed("no Content-Length in the reply".into()))?;
                 if reply.len() >= at + 4 + length {
-                    return Ok::<_, Error>(reply[at + 4..at + 4 + length].to_vec());
+                    let body = reply[at + 4..at + 4 + length].to_vec();
+                    if !ok {
+                        // Chrome says why, such as a host name it won't
+                        // serve DevTools to.
+                        let why = String::from_utf8_lossy(&body).trim().to_string();
+                        return Err(failed(format!("refused: {why}")));
+                    }
+                    return Ok::<_, Error>(body);
                 }
             }
             let n = stream
@@ -501,7 +526,15 @@ fn parse_brands(header: &str) -> Vec<(String, String)> {
 /// A proxy URL as Chrome takes it (`scheme://host:port`, which has no
 /// room for a login), and the username and password that were in it.
 fn split_proxy(proxy: &str) -> Result<(String, Option<(String, String)>)> {
-    let bad = || Error::Invalid(format!("not a proxy URL: {proxy}"));
+    // Without the login: an error mustn't repeat a password.
+    let shown = match proxy.rsplit_once('@') {
+        Some((before, host)) => match before.split_once("://") {
+            Some((scheme, _)) => format!("{scheme}://…@{host}"),
+            None => format!("…@{host}"),
+        },
+        None => proxy.to_string(),
+    };
+    let bad = || Error::Invalid(format!("not a proxy URL: {shown}"));
     let (scheme, rest) = proxy.split_once("://").ok_or_else(bad)?;
     let rest = rest.trim_end_matches('/');
     let Some((login, host)) = rest.rsplit_once('@') else {
@@ -509,6 +542,12 @@ fn split_proxy(proxy: &str) -> Result<(String, Option<(String, String)>)> {
     };
     if host.is_empty() {
         return Err(bad());
+    }
+    if scheme.starts_with("socks") {
+        return Err(Error::Invalid(format!(
+            "Chrome can't log in to a SOCKS proxy ({shown}); a login works for http:// and \
+             https:// proxies"
+        )));
     }
     let (user, password) = login.split_once(':').unwrap_or((login, ""));
     Ok((
@@ -620,13 +659,36 @@ mod tests {
             ("http://proxy:8080".into(), None)
         );
         assert_eq!(
-            split_proxy("socks5://ann:p%40ss%3Aword@10.0.0.1:1080/").unwrap(),
+            split_proxy("http://ann:p%40ss%3Aword@10.0.0.1:1080/").unwrap(),
             (
-                "socks5://10.0.0.1:1080".into(),
+                "http://10.0.0.1:1080".into(),
                 Some(("ann".into(), "p@ss:word".into()))
             )
         );
+        assert_eq!(
+            split_proxy("socks5://10.0.0.1:1080").unwrap(),
+            ("socks5://10.0.0.1:1080".into(), None)
+        );
         assert!(split_proxy("proxy:8080").is_err());
         assert!(split_proxy("http://ann@").is_err());
+    }
+
+    #[test]
+    fn chrome_cant_log_in_to_a_socks_proxy_so_it_isnt_asked_to() {
+        let err = split_proxy("socks5://ann:secret@10.0.0.1:1080").unwrap_err();
+        assert!(err.to_string().contains("SOCKS"), "{err}");
+    }
+
+    #[test]
+    fn a_bad_proxy_url_doesnt_repeat_its_password() {
+        for bad in ["http://ann:hunter2@", "ann:hunter2@proxy"] {
+            let err = split_proxy(bad).unwrap_err().to_string();
+            assert!(!err.contains("hunter2"), "{err}");
+        }
+    }
+
+    #[test]
+    fn brands_that_dont_parse_leave_chromes_own() {
+        assert!(parse_brands("nonsense").is_empty());
     }
 }

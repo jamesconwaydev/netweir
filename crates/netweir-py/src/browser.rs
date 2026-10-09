@@ -81,10 +81,12 @@ pub(crate) fn launch(
     proxy: Option<String>,
     connect: Option<String>,
 ) -> PyResult<Bound<'_, PyAny>> {
-    if connect.is_some() && (executable.is_some() || proxy.is_some() || !args.is_empty()) {
+    if connect.is_some()
+        && (executable.is_some() || proxy.is_some() || !args.is_empty() || !headless)
+    {
         return Err(PyValueError::new_err(
-            "connect= drives a browser that's already running, so executable, args and proxy \
-             don't apply",
+            "connect= drives a browser that's already running, so executable, args, proxy and \
+             headless don't apply",
         ));
     }
     let timeout = seconds("timeout", Some(timeout))?.expect("checked above");

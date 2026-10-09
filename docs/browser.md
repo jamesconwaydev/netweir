@@ -23,7 +23,10 @@ async with netweir.browser() as browser:
 
 `netweir.browser()` starts the Chrome at `$NETWEIR_CHROME`, or else the
 newest one `netweir install chrome` installed, or else the first of Google
-Chrome, Chrome for Testing and Chromium in their usual places.
+Chrome, Chrome for Testing and Chromium in their usual places. An
+installed one comes first even when the system's Chrome is newer, so
+after updating netweir, run `netweir install chrome` again to move up to
+the version its newest profile is for.
 
 If you don't have Chrome, or want the one netweir is tuned for:
 
@@ -49,21 +52,24 @@ The options:
 | `headless` | `True` | `False` opens a window |
 | `args` | `()` | more Chrome command-line switches |
 | `timeout` | `30.0` | the default limit, in seconds, for navigations and actions |
-| `proxy` | `None` | an `http://`, `https://` or `socks5://` proxy for everything Chrome fetches; a username and password in it are given when the proxy asks |
+| `proxy` | `None` | an `http://`, `https://` or `socks5://` proxy for everything Chrome fetches; for an HTTP(S) proxy, a username and password in it are given when it asks (Chrome can't log in to a SOCKS proxy) |
 | `connect` | `None` | drive a browser that's already running, instead of starting one: a `ws://` DevTools URL, or `http://host:port` |
 
 Use it with `async with`, or `await` it and call `await browser.close()`
-yourself.
+yourself. Each browser netweir starts gets a fresh profile, deleted when it
+closes. A program that exits without closing it still ends Chrome, but
+leaves the profile behind, as a `netweir-chrome-*` folder in the temporary
+directory.
 
 With `connect`, netweir drives a Chrome that's already running, started
 with `--remote-debugging-port`, or anything else that speaks the DevTools
 protocol. Pass the `ws://` URL Chrome prints, or `http://host:port` and
-netweir asks it for the URL. Nothing is launched, so `executable`, `args`
-and `proxy` don't apply; closing the browser closes the pages netweir
-opened and leaves the browser running. Plain `ws://` only for now, not
-`wss://`. Each browser gets a fresh profile, deleted when it closes. A
-program that exits without closing it still ends Chrome, but leaves the
-profile behind, as a `netweir-chrome-*` folder in the temporary directory.
+netweir asks it for the URL; Chrome only answers that when `host` is an IP
+address or `localhost`, so for one in Docker, say, use the `ws://` URL.
+Nothing is launched, so `executable`, `args`, `proxy` and `headless`
+don't apply. Closing the browser, or dropping it, closes the pages
+netweir opened and leaves the browser running. Plain `ws://` only for now,
+not `wss://`.
 
 ## Pages and contexts
 

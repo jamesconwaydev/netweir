@@ -21,11 +21,13 @@ class browser:
         ...
         await b.close()
 
-    Without ``executable``, it uses ``$NETWEIR_CHROME``, then the usual
-    install paths for Chrome, Chrome for Testing and Chromium. ``timeout``
+    Without ``executable``, it uses ``$NETWEIR_CHROME``, then the newest
+    Chrome ``netweir install chrome`` installed, then the usual install
+    paths for Chrome, Chrome for Testing and Chromium. ``timeout``
     (seconds) is the default limit for navigations and actions. ``proxy``
-    (``http://``, ``https://`` or ``socks5://``, with a login if it needs
-    one) carries everything Chrome fetches.
+    (``http://``, ``https://`` or ``socks5://``) carries everything Chrome
+    fetches; an HTTP(S) proxy's URL may hold a login, a SOCKS proxy's
+    can't.
 
     ``connect`` drives a browser that's already running instead of
     starting one: a ``ws://`` DevTools URL, or ``http://host:port``.

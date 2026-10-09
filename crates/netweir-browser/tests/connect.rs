@@ -25,7 +25,10 @@ impl Drop for Running {
 
 fn running() -> Option<Running> {
     let executable = chrome()?;
-    let profile = std::env::temp_dir().join(format!("netweir-running-{}", std::process::id()));
+    static COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    // One each: Chromes sharing a profile hand off to the first.
+    let n = COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let profile = std::env::temp_dir().join(format!("netweir-running-{}-{n}", std::process::id()));
     let mut child = Command::new(executable)
         .args([
             "--headless",
@@ -110,4 +113,73 @@ async fn nothing_listening_is_an_error_that_says_where() {
     .err()
     .unwrap();
     assert!(err.to_string().contains(&port.to_string()), "{err}");
+}
+
+/// The page targets a DevTools HTTP endpoint lists.
+fn page_targets(port: &str) -> usize {
+    use std::io::{Read, Write};
+    let mut stream = std::net::TcpStream::connect(format!("127.0.0.1:{port}")).unwrap();
+    write!(
+        stream,
+        "GET /json/list HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n\r\n"
+    )
+    .unwrap();
+    stream
+        .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+        .unwrap();
+    let mut reply = Vec::new();
+    let _ = stream.read_to_end(&mut reply);
+    String::from_utf8_lossy(&reply)
+        .matches("\"type\": \"page\"")
+        .count()
+}
+
+#[tokio::test]
+async fn a_connected_browser_dropped_without_closing_cleans_up_after_itself() {
+    let Some(chrome) = running() else {
+        return;
+    };
+    let port = chrome
+        .ws
+        .trim_start_matches("ws://127.0.0.1:")
+        .split('/')
+        .next()
+        .unwrap()
+        .to_string();
+    let before = page_targets(&port);
+    let browser = Browser::connect(&chrome.ws, LaunchOptions::default())
+        .await
+        .unwrap();
+    let _page = browser.new_page().await.unwrap();
+    assert_eq!(page_targets(&port), before + 1);
+    drop(_page);
+    drop(browser);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while page_targets(&port) > before && std::time::Instant::now() < deadline {
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    assert_eq!(
+        page_targets(&port),
+        before,
+        "netweir's page was left behind"
+    );
+}
+
+#[tokio::test]
+async fn a_refusal_from_devtools_is_shown_as_it_was_given() {
+    // What Chrome answers when it's asked by a host name other than an IP
+    // address or localhost, as in Docker's http://chrome:9222.
+    let server = common::serve(vec![(
+        "/json/version",
+        common::Reply {
+            status: 500,
+            headers: vec![],
+            body: "Host header is specified and is not an IP address or localhost.".into(),
+        },
+    )]);
+    let err = Browser::connect(&server.url, LaunchOptions::default())
+        .await
+        .err()
+        .unwrap();
+    assert!(err.to_string().contains("Host header"), "{err}");
 }
