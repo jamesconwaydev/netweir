@@ -1,5 +1,6 @@
 //! A running Chrome and its browser contexts.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Child;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -107,8 +108,22 @@ impl Browser {
             // Leaves navigator.webdriver false.
             "--disable-blink-features=AutomationControlled".into(),
         ];
+        // Chrome's client hints, when they had to be read before launch.
+        let mut hints = None;
         if options.headless {
             args.push("--headless".into());
+            // Service workers take their user agent from this flag alone;
+            // page overrides don't reach them. The flag empties the
+            // high-entropy client hints, which each page's override puts
+            // back.
+            if !options.args.iter().any(|a| a.starts_with("--user-agent=")) {
+                let (agent, metadata) = headless_identity(&executable).await?;
+                args.push(format!(
+                    "--user-agent={}",
+                    agent.replace("HeadlessChrome/", "Chrome/")
+                ));
+                hints = Some(metadata);
+            }
         }
         let mut proxy_login = None;
         if let Some(proxy) = &options.proxy {
@@ -136,7 +151,7 @@ impl Browser {
             timeout: options.timeout,
             proxy_login,
         };
-        Browser::finish(inner, &options, &executable.display().to_string()).await
+        Browser::finish(inner, &options, &executable.display().to_string(), hints).await
     }
 
     /// Drives a browser that's already running: a `ws://` DevTools URL, as
@@ -167,12 +182,17 @@ impl Browser {
             timeout: options.timeout,
             proxy_login: None,
         };
-        Browser::finish(inner, &options, &ws).await
+        Browser::finish(inner, &options, &ws, None).await
     }
 
     /// Asks the browser what it is, and works out what its pages should
     /// say they are.
-    async fn finish(mut inner: Inner, options: &LaunchOptions, what: &str) -> Result<Browser> {
+    async fn finish(
+        mut inner: Inner,
+        options: &LaunchOptions,
+        what: &str,
+        hints: Option<Value>,
+    ) -> Result<Browser> {
         let version = match tokio::time::timeout(
             Duration::from_secs(30),
             inner.conn.call("", "Browser.getVersion", json!({})),
@@ -201,8 +221,14 @@ impl Browser {
             .as_ref()
             .and_then(|b| b(&major))
             .filter(|header| !parse_brands(header).is_empty());
-        if user_agent.contains("HeadlessChrome/") || brands.is_some() {
-            let mut metadata = browser.own_metadata().await?;
+        // Headless, the user agent comes from the --user-agent flag, which
+        // leaves the high-entropy client hints empty until a page's
+        // override restores them.
+        if options.headless || user_agent.contains("HeadlessChrome/") || brands.is_some() {
+            let mut metadata = match hints {
+                Some(hints) => hints,
+                None => browser.own_metadata().await?,
+            };
             if let Some(header) = brands {
                 let list = parse_brands(&header);
                 metadata["brands"] = list
@@ -438,6 +464,70 @@ fn profile_dir() -> std::io::Result<PathBuf> {
     ));
     std::fs::create_dir_all(&dir)?;
     Ok(dir)
+}
+
+/// What a headless Chrome at `executable` says it is: its user agent and
+/// its client hints, which only asking it tells exactly, and only before
+/// a --user-agent flag empties the hints. The first time, it's started once
+/// to ask.
+async fn headless_identity(executable: &Path) -> Result<(String, Value)> {
+    static KNOWN: Mutex<Option<HashMap<PathBuf, (String, Value)>>> = Mutex::new(None);
+    if let Some(known) = KNOWN
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get_or_insert_with(HashMap::new)
+        .get(executable)
+    {
+        return Ok(known.clone());
+    }
+    let profile =
+        profile_dir().map_err(|e| Error::Launch(format!("can't make a profile directory: {e}")))?;
+    let args = [
+        format!("--user-data-dir={}", profile.display()),
+        "--no-first-run".into(),
+        "--headless".into(),
+        "about:blank".into(),
+    ];
+    let started = match launch::start(executable, &args) {
+        Ok(started) => started,
+        Err(e) => {
+            let _ = std::fs::remove_dir_all(&profile);
+            return Err(e);
+        }
+    };
+    let probe = Browser {
+        inner: Arc::new(Inner {
+            conn: Connection::new(started.replies, started.commands),
+            child: Mutex::new(Some(started.child)),
+            profile: Some(profile),
+            contexts: Mutex::default(),
+            version: String::new(),
+            identity: None,
+            timeout: Duration::from_secs(30),
+            proxy_login: None,
+        }),
+    };
+    let what = executable.display().to_string();
+    let asked = async {
+        let version = tokio::time::timeout(
+            Duration::from_secs(30),
+            probe.inner.conn.call("", "Browser.getVersion", json!({})),
+        )
+        .await
+        .map_err(|_| Error::Launch(format!("{what} didn't answer in 30 seconds")))?
+        .map_err(|e| Error::Launch(format!("{what} didn't answer: {e}")))?;
+        let metadata = probe.own_metadata().await?;
+        Ok::<_, Error>((str_of(&version, "userAgent"), metadata))
+    }
+    .await;
+    probe.close().await?;
+    let known = asked?;
+    KNOWN
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get_or_insert_with(HashMap::new)
+        .insert(executable.to_path_buf(), known.clone());
+    Ok(known)
 }
 
 /// The WebSocket URL a browser's `http://host:port/json/version` names.

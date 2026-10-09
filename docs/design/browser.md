@@ -105,12 +105,17 @@ These are rules of the driver, not options, and tests enforce them:
 - Headless Chrome puts `HeadlessChrome` in its user agent, though not in
   its client hints. Each page's user agent is overridden with the same
   string reading `Chrome`, together with the client-hint metadata Chrome
-  itself reports (read once per browser from `chrome://version`, the one
-  page that can see it before any override). The override has to carry
-  that metadata: without it, Chrome stops sending the high-entropy hints,
-  and with the `--user-agent` flag instead, it sends them empty. Dedicated
-  workers inherit the override. Service workers don't, and are a known
-  gap.
+  itself reports. The override has to carry that metadata: without it,
+  Chrome stops sending the high-entropy hints. Dedicated workers inherit
+  the override; service workers don't, and take their user agent only
+  from the `--user-agent` flag, which leaves the high-entropy hints empty
+  wherever no override restores them. So headless Chrome is launched with
+  the flag, and each page's override restores the hints. The exact user
+  agent and metadata only come from asking Chrome without the flag, so
+  the first launch of a given Chrome in a process starts it once to ask
+  (reading the metadata from `chrome://version`, the one page that can
+  see it before any override). In a service worker, the high-entropy
+  hints stay empty: no override reaches it.
 
 ### Pages
 
@@ -228,9 +233,10 @@ they own. Closing the browser closes every page.
 - Chrome follows redirects itself; the URL it ends on counts as seen. That
   URL's own robots.txt isn't consulted, unlike a redirect the HTTP client
   follows hop by hop.
-- Chrome isn't restarted if it dies; the rest of the crawl's browser
-  requests fail. A page Chrome answers with a server error isn't retried
-  there.
+- A Chrome that dies is started again for the next browser request; one
+  that can't start isn't tried again. A page Chrome answers with a server
+  error is retried there like any other, except a blocked request's one
+  go in Chrome.
 
 Cookie hand-back only helps if the HTTP client looks like the same browser
 the cookie was issued to, so the new session uses the HTTP profile that

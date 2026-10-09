@@ -181,8 +181,9 @@ A declarative spider's rules read the rendered HTML, so callbacks the rules
 call, and a rules spider's own `parse`, get the rendered page but not
 `page.browser`.
 
-A page Chrome answers with an error status, such as a 503, is handed to the
-callback as it is; only a page that never loaded is tried again.
+A page Chrome answers with a server error (500, 502, 503, 504, 408, 522 or
+524) is tried again in Chrome, up to `retries` times, as the HTTP client
+would; other error statuses go to the callback as they are.
 
 Two settings make Chrome step in on its own:
 
@@ -197,8 +198,9 @@ Two settings make Chrome step in on its own:
   why.
 - `browser="always"`: every request goes through Chrome.
 
-Chrome is started once per crawl, the first time it's needed. If it can't
-start, or dies partway, browser requests fail for the rest of the crawl.
+Chrome is started the first time the crawl needs it, and again if it
+dies. If it can't start at all, browser requests fail, each saying why,
+and it isn't tried again.
 
 Chrome goes through the crawl's `proxy`, login included, so the cookies it
 earns come from the address the HTTP client uses. It doesn't move through
@@ -217,8 +219,8 @@ netweir avoids these giveaways:
 - `navigator.webdriver` is false.
 - Headless Chrome calls itself `HeadlessChrome` in its user agent. netweir
   sends the normal user agent instead, with the client hints Chrome
-  reports for itself, in the request headers, in the page and in
-  dedicated workers.
+  reports for itself, in the request headers, in the page, and in its
+  workers and service workers.
 - It never turns on the DevTools domains whose side effects page scripts
   can notice, and its own scripts run where the page can't see them.
 - Clicks and keys are real input events, not JavaScript calls.
@@ -227,7 +229,7 @@ A test in the repository loads a page that checks the first two from page
 script and the server checks the request headers; the test also fails if
 any of the DevTools domains in the third was turned on.
 
-That isn't everything a site can check. Service workers still see the
-`HeadlessChrome` user agent, and headless Chrome on a Linux server without
-a GPU reports a software renderer to WebGL. Pass `headless=False` where
-that matters.
+That isn't everything a site can check. In a service worker, the
+high-entropy client hints (`getHighEntropyValues`) come back empty, and
+headless Chrome on a Linux server without a GPU reports a software renderer
+to WebGL. Pass `headless=False` where that matters.

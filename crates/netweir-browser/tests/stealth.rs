@@ -13,11 +13,21 @@ window.findings = (async () => {
     const w = new Worker(URL.createObjectURL(new Blob(['postMessage(navigator.userAgent)'])));
     w.onmessage = (m) => resolve(m.data);
   });
+  const serviceWorkerAgent = await (async () => {
+    const reg = await navigator.serviceWorker.register('/sw.js');
+    await navigator.serviceWorker.ready;
+    const sw = reg.active || reg.waiting || reg.installing;
+    return await new Promise((resolve) => {
+      navigator.serviceWorker.onmessage = (m) => resolve(m.data);
+      sw.postMessage('ua?');
+    });
+  })();
   const hints = await navigator.userAgentData.getHighEntropyValues(['architecture', 'fullVersionList', 'platformVersion']);
   return {
     webdriver: navigator.webdriver,
     agent: navigator.userAgent,
     workerAgent,
+    serviceWorkerAgent,
     brands: navigator.userAgentData.brands.map((b) => b.brand),
     architecture: hints.architecture,
     fullVersions: hints.fullVersionList.length,
@@ -35,7 +45,16 @@ async fn a_page_finds_no_sign_of_automation() {
     detect
         .headers
         .push(("Accept-CH", "Sec-CH-UA-Full-Version-List".into()));
-    let server = serve(vec![("/", detect), ("/again", html("<p>again</p>"))]);
+    let worker = common::Reply {
+        status: 200,
+        headers: vec![("Content-Type", "application/javascript".into())],
+        body: "self.onmessage = (e) => e.source.postMessage(navigator.userAgent);".into(),
+    };
+    let server = serve(vec![
+        ("/", detect),
+        ("/again", html("<p>again</p>")),
+        ("/sw.js", worker),
+    ]);
     let page = browser.new_page().await.unwrap();
     page.goto(&format!("{}/", server.url), WaitUntil::Load, None)
         .await
@@ -43,7 +62,11 @@ async fn a_page_finds_no_sign_of_automation() {
     let found = page.evaluate("findings").await.unwrap();
 
     assert_eq!(found["webdriver"], json!(false), "{found}");
-    for agent in [&found["agent"], &found["workerAgent"]] {
+    for agent in [
+        &found["agent"],
+        &found["workerAgent"],
+        &found["serviceWorkerAgent"],
+    ] {
         let agent = agent.as_str().unwrap();
         assert!(
             agent.contains("Chrome/") && !agent.contains("Headless"),
