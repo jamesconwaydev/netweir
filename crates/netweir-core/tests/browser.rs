@@ -278,9 +278,14 @@ async fn a_challenge_that_moves_on_at_once_still_counts_as_passed() {
             "/now",
             challenge_moving_on("document.cookie = 'pass=1; path=/'; location.reload()"),
         ),
+        ("/warm", Page::html("warm")),
     ])
     .await;
     let c = crawler(settings(BrowserMode::OnBlock));
+    // Chrome starts first, so what's timed is the challenges alone: slow
+    // runners take seconds to start it.
+    c.submit(request(0, site.url("/warm"), true));
+    drain_closing(&c).await;
     c.submit(request(1, site.url("/soon"), false));
     c.submit(request(2, site.url("/now"), false));
     let started = std::time::Instant::now();
