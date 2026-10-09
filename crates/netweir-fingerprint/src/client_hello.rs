@@ -15,6 +15,10 @@ pub struct ClientHello {
     pub extensions: Vec<u16>,
     pub server_name: Option<String>,
     pub alpn: Vec<String>,
+    /// The first ALPN protocol's raw bytes, which JA4 hashes. Not kept in
+    /// saved captures; `alpn` covers every protocol a browser sends.
+    #[serde(skip)]
+    pub alpn_first: Vec<u8>,
     pub supported_versions: Vec<u16>,
     pub supported_groups: Vec<u16>,
     pub key_share_groups: Vec<u16>,
@@ -97,6 +101,7 @@ impl ClientHello {
             extensions: Vec::new(),
             server_name: None,
             alpn: Vec::new(),
+            alpn_first: Vec::new(),
             supported_versions: Vec::new(),
             supported_groups: Vec::new(),
             key_share_groups: Vec::new(),
@@ -124,7 +129,11 @@ impl ClientHello {
                 0x000a => hello.supported_groups = Reader::u16s(d.vec16()?),
                 0x000b => hello.ec_point_formats = d.vec8()?.to_vec(),
                 0x000d => hello.signature_algorithms = Reader::u16s(d.vec16()?),
-                0x0010 => hello.alpn = Reader(d.vec16()?).names(),
+                0x0010 => {
+                    let list = d.vec16()?;
+                    hello.alpn_first = Reader(list).vec8().unwrap_or_default().to_vec();
+                    hello.alpn = Reader(list).names();
+                }
                 0x001b => hello.cert_compression = Reader::u16s(d.vec8()?),
                 0x001c => hello.record_size_limit = d.u16(),
                 0x002b => hello.supported_versions = Reader::u16s(d.vec8()?),
@@ -179,23 +188,60 @@ fn handshake_bytes(mut data: &[u8]) -> Option<Vec<u8>> {
     None
 }
 
-/// How many bytes of `data` (from the first record header) are needed to
-/// hold the whole ClientHello, once enough has arrived to tell.
-pub fn bytes_needed(data: &[u8]) -> Option<usize> {
+/// How many bytes of `data` (from the first record header) hold the whole
+/// ClientHello: `Ok(None)` until enough has arrived to tell, `Err` as soon
+/// as the bytes are not a TLS handshake.
+pub fn bytes_needed(data: &[u8]) -> Result<Option<usize>, ()> {
     let mut offset = 0;
     let mut handshake = 0usize;
     let mut want = None;
-    while offset + 5 <= data.len() {
+    while offset < data.len() {
+        // Every record of a ClientHello is a handshake record (0x16).
+        if data[offset] != 0x16 {
+            return Err(());
+        }
+        if offset + 5 > data.len() {
+            break;
+        }
         let len = u16::from_be_bytes([data[offset + 3], data[offset + 4]]) as usize;
         if want.is_none() && offset + 9 <= data.len() {
             let h = &data[offset + 5..];
+            if h[0] != 1 {
+                return Err(()); // not a ClientHello
+            }
             want = Some(4 + ((h[1] as usize) << 16 | (h[2] as usize) << 8 | h[3] as usize));
         }
         offset += 5 + len;
         handshake += len;
         if want.is_some_and(|w| handshake >= w) {
-            return Some(offset);
+            return Ok(Some(offset));
         }
     }
-    None
+    Ok(None)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn plain_http_is_rejected_at_the_first_byte() {
+        assert_eq!(bytes_needed(b"G"), Err(()));
+        assert_eq!(bytes_needed(b"GET / HTTP/1.1\r\n"), Err(()));
+    }
+
+    #[test]
+    fn a_hello_split_over_two_records_is_measured_whole() {
+        // Handshake header says 6 bytes of body: 10 bytes in all, sent as
+        // 7 + 3 across two records.
+        let mut data = vec![0x16, 3, 1, 0, 7, 1, 0, 0, 6, 0xaa, 0xbb, 0xcc];
+        assert_eq!(bytes_needed(&data), Ok(None));
+        data.extend_from_slice(&[0x16, 3, 1, 0, 3, 0xdd, 0xee, 0xff]);
+        assert_eq!(bytes_needed(&data), Ok(Some(data.len())));
+        assert_eq!(
+            bytes_needed(&[0x16, 3, 1, 0, 4, 2, 0, 0, 0]),
+            Err(()),
+            "a ServerHello"
+        );
+    }
 }

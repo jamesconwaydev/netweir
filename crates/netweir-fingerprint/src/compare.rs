@@ -7,8 +7,9 @@ use crate::server::Capture;
 /// GREASE values and extension order are ignored, because browsers
 /// randomise both on every connection. So is whether the TLS session was
 /// resumed (the pre_shared_key extension, which also changes JA4), since
-/// that depends on connection history, not on the browser. The `:authority`
-/// and `Host` values are ignored because they name the test server.
+/// that depends on connection history, not on the browser. The `:authority`,
+/// `:path` and `Host` values are ignored because they name the test server
+/// and its port.
 pub fn differences(expected: &Capture, actual: &Capture) -> Vec<String> {
     let mut out = Vec::new();
     let mut check = |what: &str, a: String, b: String| {
@@ -109,7 +110,7 @@ pub fn differences(expected: &Capture, actual: &Capture) -> Vec<String> {
         format!("{:?}", names(actual)),
     );
     for ((k, ev), (_, av)) in expected.headers.iter().zip(&actual.headers) {
-        if k != ":authority" && !k.eq_ignore_ascii_case("host") {
+        if !matches!(k.as_str(), ":authority" | ":path") && !k.eq_ignore_ascii_case("host") {
             check(&format!("header {k}"), ev.clone(), av.clone());
         }
     }

@@ -48,7 +48,7 @@ impl ServerCertVerifier for AcceptAnything {
     }
 }
 
-async fn request(port: u16) -> String {
+async fn connect(port: u16) -> tokio_rustls::client::TlsStream<TcpStream> {
     let mut config = rustls::ClientConfig::builder_with_provider(Arc::new(
         rustls::crypto::ring::default_provider(),
     ))
@@ -59,16 +59,39 @@ async fn request(port: u16) -> String {
     .with_no_client_auth();
     config.alpn_protocols = vec![b"http/1.1".to_vec()];
     let tcp = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
-    let mut tls = TlsConnector::from(Arc::new(config))
+    TlsConnector::from(Arc::new(config))
         .connect(ServerName::try_from("localhost").unwrap(), tcp)
         .await
+        .unwrap()
+}
+
+/// Sends one HTTP/1.1 request and reads exactly one response (by
+/// Content-Length), leaving the connection open.
+async fn exchange(tls: &mut tokio_rustls::client::TlsStream<TcpStream>, path: &str) -> String {
+    let request =
+        format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nX-Probe: 1\r\nAccept: */*\r\n\r\n");
+    tls.write_all(request.as_bytes()).await.unwrap();
+    let mut head = Vec::new();
+    let mut byte = [0u8; 1];
+    while !head.ends_with(b"\r\n\r\n") {
+        tls.read_exact(&mut byte).await.unwrap();
+        head.push(byte[0]);
+    }
+    let head = String::from_utf8(head).unwrap();
+    let length: usize = head
+        .lines()
+        .find_map(|l| l.strip_prefix("content-length: "))
+        .unwrap()
+        .trim()
+        .parse()
         .unwrap();
-    tls.write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\nX-Probe: 1\r\nAccept: */*\r\n\r\n")
-        .await
-        .unwrap();
-    let mut response = String::new();
-    tls.read_to_string(&mut response).await.unwrap();
-    response
+    let mut body = vec![0u8; length];
+    tls.read_exact(&mut body).await.unwrap();
+    head + &String::from_utf8(body).unwrap()
+}
+
+async fn request(port: u16) -> String {
+    exchange(&mut connect(port).await, "/").await
 }
 
 #[tokio::test]
@@ -105,6 +128,54 @@ async fn records_the_client_hello_and_echoes_it() {
     assert!(
         response.contains(&capture.ja4),
         "the body echoes the capture"
+    );
+    assert_eq!(
+        (capture.connection, capture.request, capture.path.as_str()),
+        (0, 0, "/")
+    );
+}
+
+#[tokio::test]
+async fn records_every_request_on_a_kept_alive_connection() {
+    let mut server = Server::start_http1(0).await.unwrap();
+    let mut tls = connect(server.port).await;
+    exchange(&mut tls, "/one").await;
+    exchange(&mut tls, "/two").await;
+    let (a, b) = (server.next().await.unwrap(), server.next().await.unwrap());
+    assert_eq!((a.connection, a.request, a.path.as_str()), (0, 0, "/one"));
+    assert_eq!((b.connection, b.request, b.path.as_str()), (0, 1, "/two"));
+    assert_eq!(a.ja4, b.ja4);
+}
+
+#[tokio::test]
+async fn sets_cookies_and_redirects_on_request() {
+    let server = Server::start().await.unwrap();
+    let mut tls = connect(server.port).await;
+    let set = exchange(&mut tls, "/page?set=session").await;
+    assert!(set.contains("set-cookie: session=1; Path=/\r\n"), "{set}");
+    let moved = exchange(&mut tls, "/redirect?to=https://127.0.0.1:9/next&set=hop").await;
+    assert!(moved.starts_with("HTTP/1.1 302 Found\r\n"), "{moved}");
+    assert!(
+        moved.contains("location: https://127.0.0.1:9/next\r\n"),
+        "{moved}"
+    );
+    assert!(moved.contains("set-cookie: hop=1; Path=/\r\n"), "{moved}");
+}
+
+#[tokio::test]
+async fn hangs_up_on_anything_that_is_not_tls() {
+    let server = Server::start().await.unwrap();
+    let mut tcp = TcpStream::connect(("127.0.0.1", server.port))
+        .await
+        .unwrap();
+    tcp.write_all(b"GET / HTTP/1.1\r\nHost: x\r\n\r\n")
+        .await
+        .unwrap();
+    let mut buf = [0u8; 16];
+    let read = tokio::time::timeout(std::time::Duration::from_secs(2), tcp.read(&mut buf)).await;
+    assert!(
+        matches!(read, Ok(Ok(0)) | Ok(Err(_))),
+        "server kept a non-TLS connection open: {read:?}"
     );
 }
 

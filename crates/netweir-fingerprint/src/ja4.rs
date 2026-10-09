@@ -42,7 +42,12 @@ pub fn ja4(hello: &ClientHello) -> String {
         .copied()
         .filter(|&e| !is_grease(e))
         .collect();
-    let alpn = alpn_chars(hello.alpn.first().map(String::as_str));
+    let first = if hello.alpn_first.is_empty() {
+        hello.alpn.first().map(|a| a.as_bytes())
+    } else {
+        Some(hello.alpn_first.as_slice())
+    };
+    let alpn = alpn_chars(first);
     let a = format!(
         "t{version}{sni}{:02}{:02}{alpn}",
         ciphers.len().min(99),
@@ -79,11 +84,10 @@ pub fn ja4(hello: &ClientHello) -> String {
     format!("{a}_{b}_{c}")
 }
 
-fn alpn_chars(first: Option<&str>) -> String {
-    let Some(value) = first.filter(|v| !v.is_empty()) else {
+fn alpn_chars(first: Option<&[u8]>) -> String {
+    let Some(bytes) = first.filter(|v| !v.is_empty()) else {
         return "00".to_string();
     };
-    let bytes = value.as_bytes();
     let (f, l) = (bytes[0], bytes[bytes.len() - 1]);
     if f.is_ascii_alphanumeric() && l.is_ascii_alphanumeric() {
         format!("{}{}", f as char, l as char)
@@ -127,6 +131,7 @@ mod tests {
             extensions: vec![0x000d, 0x002b],
             server_name: None,
             alpn: vec![],
+            alpn_first: vec![],
             supported_versions: vec![0x0304],
             supported_groups: vec![],
             key_share_groups: vec![],
@@ -145,9 +150,11 @@ mod tests {
 
     #[test]
     fn alpn_rules() {
-        assert_eq!(alpn_chars(Some("h2")), "h2");
-        assert_eq!(alpn_chars(Some("http/1.1")), "h1");
+        assert_eq!(alpn_chars(Some(b"h2")), "h2");
+        assert_eq!(alpn_chars(Some(b"http/1.1")), "h1");
         assert_eq!(alpn_chars(None), "00");
-        assert_eq!(alpn_chars(Some("\u{ab}")), "cb");
+        // Not alphanumeric: first and last hex digit of the raw bytes.
+        assert_eq!(alpn_chars(Some(&[0xab])), "ab");
+        assert_eq!(alpn_chars(Some(&[0xff, 0x01])), "f1");
     }
 }
