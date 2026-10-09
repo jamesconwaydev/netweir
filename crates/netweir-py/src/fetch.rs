@@ -5,6 +5,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use netweir_core::classify::{Outcome, classify};
 use netweir_core::{
     FetchError as CoreError, FetchErrorKind, FetchOptions, Fetcher as CoreFetcher, Profile,
 };
@@ -145,6 +146,34 @@ impl Response {
     #[getter]
     fn body<'py>(&self, py: Python<'py>) -> Bound<'py, PyBytes> {
         PyBytes::new(py, &self.inner.body)
+    }
+
+    /// What the response means: (outcome, vendor, kind, retry_after,
+    /// price). outcome is "ok", "blocked", "throttled", "payment_required"
+    /// or "http_error"; vendor and kind are set for a block, retry_after
+    /// (seconds) for throttling and price for a 402.
+    #[allow(clippy::type_complexity)]
+    fn classify(
+        &self,
+    ) -> (
+        &'static str,
+        Option<String>,
+        Option<&'static str>,
+        Option<f64>,
+        Option<String>,
+    ) {
+        let outcome = classify(&self.inner);
+        let name = outcome.name();
+        match outcome {
+            Outcome::Blocked { vendor, kind } => {
+                (name, Some(vendor), Some(kind.as_str()), None, None)
+            }
+            Outcome::Throttled { retry_after } => {
+                (name, None, None, retry_after.map(|d| d.as_secs_f64()), None)
+            }
+            Outcome::PaymentRequired { price } => (name, None, None, None, price),
+            Outcome::Ok | Outcome::HttpError(_) => (name, None, None, None, None),
+        }
     }
 
     /// The body decoded the way a browser would pick the encoding.

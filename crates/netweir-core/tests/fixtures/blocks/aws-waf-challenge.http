@@ -1,0 +1,5 @@
+HTTP/1.1 202 Accepted
+x-amzn-waf-action: challenge
+content-type: text/html; charset=UTF-8
+
+<!DOCTYPE html><html><head><script src="https://abc123def.edge.sdk.awswaf.com/abc123def/challenge.js"></script></head><body><script>AwsWafIntegration.checkForceRefresh();</script></body></html>

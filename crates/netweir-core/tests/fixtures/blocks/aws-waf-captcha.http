@@ -1,0 +1,5 @@
+HTTP/1.1 405 Method Not Allowed
+x-amzn-waf-action: captcha
+content-type: text/html; charset=UTF-8
+
+<!DOCTYPE html><html><head><script src="https://abc123def.edge.sdk.awswaf.com/abc123def/captcha.js"></script></head><body><div id="captcha-container"></div></body></html>

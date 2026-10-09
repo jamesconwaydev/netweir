@@ -1,0 +1,7 @@
+HTTP/1.1 403 Forbidden
+server: cloudflare
+cf-mitigated: challenge
+cf-ray: 8c1f2a3b4c5d6e7f-DEN
+content-type: text/html; charset=UTF-8
+
+<!DOCTYPE html><html lang="en-US"><head><title>Just a moment...</title></head><body><noscript>Enable JavaScript and cookies to continue</noscript></body></html>

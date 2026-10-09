@@ -1,0 +1,5 @@
+HTTP/1.1 404 Not Found
+server: nginx
+content-type: text/html
+
+<html><body><h1>404 Not Found</h1></body></html>

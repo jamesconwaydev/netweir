@@ -1,0 +1,6 @@
+HTTP/1.1 429 Too Many Requests
+x-kpsdk-ct: 0123abcd
+x-kpsdk-r: 1-AbCdEf
+content-type: text/html
+
+<html><head></head><body><script>window.KPSDK={};KPSDK.now=typeof performance!=="undefined"?performance.now.bind(performance):Date.now.bind(Date);</script><script src="/149e9513-01fa-4fb0-aad4-566afd725d1b/2d206a39-8ed7-437e-a3be-862e0f06eea3/ips.js"></script></body></html>

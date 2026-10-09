@@ -1,0 +1,7 @@
+HTTP/1.1 200 OK
+x-iinfo: 12-34567890-0 0NNN RT(1728450000000 0) q(0 -1 -1 -1) r(0 -1)
+set-cookie: visid_incap_1234567=AbCdEf0123; expires=Thu, 09 Oct 2027 00:00:00 GMT; path=/; Domain=.example.com
+set-cookie: incap_ses_123_1234567=XyZ012; path=/; Domain=.example.com
+content-type: text/html
+
+<html><head><META NAME="robots" CONTENT="noindex,nofollow"></head><body><iframe id="main-iframe" src="/_Incapsula_Resource?CWUDNSAI=9&xinfo=12-34567890-0" frameborder=0>Request unsuccessful. Incapsula incident ID: 123000456789-012345678901234567</iframe></body></html>

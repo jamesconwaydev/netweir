@@ -4,6 +4,7 @@ import asyncio
 from collections.abc import Iterable, Mapping
 from urllib.parse import urljoin
 
+from netweir._errors import Blocked
 from netweir._native import Fetcher, Node, Response, Selection
 from netweir._request import Request
 
@@ -21,7 +22,7 @@ def _pairs(headers: Headers) -> list[tuple[str, str]]:
 class Page:
     """A fetched page: the response, and the document parsed from it."""
 
-    __slots__ = ("_base", "_response", "_root", "request")
+    __slots__ = ("_base", "_outcome", "_response", "_root", "request")
 
     def __init__(
         self, response: Response, request: Request | None = None, root: Node | None = None
@@ -30,6 +31,7 @@ class Page:
         #: Parsed on first use, unless the crawl engine already parsed it.
         self._root: Node | None = root
         self._base: str | None = None
+        self._outcome: tuple | None = None
         #: In a crawl, the Request this page answers.
         self.request = request
 
@@ -41,6 +43,23 @@ class Page:
     @property
     def status(self) -> int:
         return self._response.status
+
+    def _classified(self) -> tuple:
+        if self._outcome is None:
+            self._outcome = self._response.classify()
+        return self._outcome
+
+    @property
+    def outcome(self) -> str:
+        """What the response means: ``"ok"``, ``"blocked"`` (by bot
+        protection), ``"throttled"`` (429, or 503 with Retry-After),
+        ``"payment_required"`` (402) or ``"http_error"``."""
+        return self._classified()[0]
+
+    @property
+    def blocked(self) -> str | None:
+        """The bot-protection vendor that blocked this request, or None."""
+        return self._classified()[1]
 
     @property
     def version(self) -> str:
@@ -134,8 +153,10 @@ class Client:
     def __init__(self, profile: str = "chrome", proxy: str | None = None, timeout: float = 30.0):
         self._fetcher = Fetcher(profile, proxy, timeout)
 
-    async def get(self, url: str, headers: Headers = None) -> Page:
-        return Page(await self._fetcher.get(url, _pairs(headers)))
+    async def get(self, url: str, headers: Headers = None, raise_on_block: bool = True) -> Page:
+        """Fetches one page. A block page raises Blocked unless
+        ``raise_on_block=False``."""
+        return _checked(Page(await self._fetcher.get(url, _pairs(headers))), raise_on_block)
 
     async def get_many(
         self, urls: Iterable[str], headers: Headers = None, return_exceptions: bool = False
@@ -161,6 +182,18 @@ def get(
     headers: Headers = None,
     proxy: str | None = None,
     timeout: float = 30.0,
+    raise_on_block: bool = True,
 ) -> Page:
-    """Fetches one page and waits for it. For many pages, use Client."""
-    return Page(Fetcher(profile, proxy, timeout).get_blocking(url, _pairs(headers)))
+    """Fetches one page and waits for it. For many pages, use Client.
+
+    A page from bot protection (a Cloudflare challenge, a DataDome captcha
+    and the like) raises Blocked; pass ``raise_on_block=False`` to get it
+    as a page, with ``page.blocked`` naming the vendor."""
+    page = Page(Fetcher(profile, proxy, timeout).get_blocking(url, _pairs(headers)))
+    return _checked(page, raise_on_block)
+
+
+def _checked(page: Page, raise_on_block: bool) -> Page:
+    if raise_on_block and page.blocked is not None:
+        raise Blocked(page.blocked, page._classified()[2], page)
+    return page

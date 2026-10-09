@@ -1,0 +1,7 @@
+HTTP/1.1 403 Forbidden
+x-datadome: protected
+x-dd-b: 1
+set-cookie: datadome=AbCdEf0123456789~; Max-Age=31536000; Path=/; Secure; SameSite=Lax
+content-type: text/html;charset=utf-8
+
+<html><head><title>example.com</title></head><body><script>var dd={"rt":"c","cid":"AHrlqAAAAAMA","hsh":"0123","host":"geo.captcha-delivery.com"}</script><script src="https://ct.captcha-delivery.com/c.js"></script></body></html>

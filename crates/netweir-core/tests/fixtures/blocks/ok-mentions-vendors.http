@@ -1,0 +1,5 @@
+HTTP/1.1 200 OK
+server: nginx
+content-type: text/html
+
+<html><head><title>How bot detection works</title></head><body><p>Pages say "Just a moment..." while Cloudflare checks you; DataDome loads geo.captcha-delivery.com; HUMAN shows a px-captcha "Press &amp; Hold" box; Akamai says Access Denied with a Reference #; Incapsula incident ID pages come from Imperva.</p></body></html>

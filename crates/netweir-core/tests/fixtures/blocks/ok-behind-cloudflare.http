@@ -1,0 +1,7 @@
+HTTP/1.1 200 OK
+server: cloudflare
+cf-ray: 8c1f2a3b4c5d6e7f-DEN
+set-cookie: __cf_bm=abc; path=/
+content-type: text/html
+
+<html><head><title>Shop</title></head><body><h1>All products</h1></body></html>

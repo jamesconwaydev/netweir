@@ -225,6 +225,15 @@ class Response:
     def body(self) -> bytes: ...
     def text(self) -> str: ...
     def parse(self, timeout: float | None = None) -> Node: ...
+    def classify(
+        self,
+    ) -> tuple[
+        Literal["ok", "blocked", "throttled", "payment_required", "http_error"],
+        str | None,
+        Literal["challenge", "captcha", "block", "rate_limit"] | None,
+        float | None,
+        str | None,
+    ]: ...
 
 class Fetcher:
     def __init__(

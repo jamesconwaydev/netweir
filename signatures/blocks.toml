@@ -1,0 +1,103 @@
+# Bot-protection block pages, by vendor.
+#
+# A signature matches when every condition it has holds:
+#   status   the response status is one of these
+#   header   a header has this name and its value contains `contains`
+#            (any value when `contains` is left out)
+#   server   the server header contains this, ignoring case
+#   cookies  a Set-Cookie names a cookie starting with one of these
+#   body     the first 64 KiB of the body contains one of these, ignoring case
+#
+# Signatures are tried most reliable first: those with a header, then a
+# cookie, then a body marker, then status alone. Body markers always come
+# with a status, or a page about bot detection would count as a block.
+#
+# kind is challenge (solvable in a browser), captcha, block or rate_limit.
+# Each vendor has a fixture in crates/netweir-core/tests/fixtures/blocks.
+
+[[signature]]
+vendor = "cloudflare"
+kind = "challenge"
+header = { name = "cf-mitigated", contains = "challenge" }
+
+[[signature]]
+vendor = "cloudflare"
+kind = "challenge"
+status = [403, 503]
+server = "cloudflare"
+body = ["<title>Just a moment...</title>", "/cdn-cgi/challenge-platform/"]
+
+[[signature]]
+vendor = "cloudflare"
+kind = "block"
+status = [403]
+server = "cloudflare"
+body = ["Attention Required! | Cloudflare", "Sorry, you have been blocked"]
+
+[[signature]]
+vendor = "cloudflare"
+kind = "rate_limit"
+status = [429]
+server = "cloudflare"
+body = ["error code: 1015"]
+
+[[signature]]
+vendor = "datadome"
+kind = "captcha"
+status = [403, 405]
+header = { name = "x-datadome" }
+
+[[signature]]
+vendor = "datadome"
+kind = "captcha"
+status = [403, 405]
+cookies = ["datadome"]
+body = ["captcha-delivery.com"]
+
+[[signature]]
+vendor = "aws-waf"
+kind = "challenge"
+header = { name = "x-amzn-waf-action", contains = "challenge" }
+
+[[signature]]
+vendor = "aws-waf"
+kind = "captcha"
+header = { name = "x-amzn-waf-action", contains = "captcha" }
+
+[[signature]]
+vendor = "kasada"
+kind = "challenge"
+status = [429]
+header = { name = "x-kpsdk-ct" }
+
+[[signature]]
+vendor = "imperva"
+kind = "block"
+header = { name = "x-iinfo" }
+body = ["Incapsula incident ID", "_Incapsula_Resource"]
+
+[[signature]]
+vendor = "imperva"
+kind = "block"
+cookies = ["visid_incap_", "incap_ses_"]
+body = ["Incapsula incident ID", "_Incapsula_Resource"]
+
+[[signature]]
+vendor = "human"
+kind = "captcha"
+status = [403]
+cookies = ["_pxhd", "_px3", "_px2"]
+body = ["px-captcha", "Press &amp; Hold", "Press & Hold"]
+
+[[signature]]
+vendor = "human"
+kind = "captcha"
+status = [403]
+body = ["<div id=\"px-captcha\">", "window._pxAppId"]
+
+[[signature]]
+vendor = "akamai"
+kind = "block"
+status = [403]
+server = "AkamaiGHost"
+body = ["Access Denied"]

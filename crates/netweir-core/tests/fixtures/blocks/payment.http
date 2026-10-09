@@ -1,0 +1,5 @@
+HTTP/1.1 402 Payment Required
+crawler-price: USD 0.01
+content-type: text/plain
+
+payment required
