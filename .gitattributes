@@ -1,0 +1,2 @@
+# HTTP messages: CRLF line endings are part of the format.
+*.http -text
