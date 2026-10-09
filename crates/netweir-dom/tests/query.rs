@@ -221,7 +221,9 @@ fn comma_lists_keep_equal_attribute_values_in_source_order() {
     assert_eq!(q("a::attr(href), a::attr(href)"), ["x", "y"]);
 }
 
-/// Resident memory in kilobytes, from ps.
+/// Resident memory in kilobytes, from ps (so Unix only; the leak this
+/// guards against isn't platform-specific).
+#[cfg(unix)]
 fn rss_kb() -> u64 {
     let out = std::process::Command::new("ps")
         .args(["-o", "rss=", "-p", &std::process::id().to_string()])
@@ -230,6 +232,7 @@ fn rss_kb() -> u64 {
     String::from_utf8_lossy(&out.stdout).trim().parse().unwrap()
 }
 
+#[cfg(unix)]
 #[test]
 fn a_list_that_fails_part_way_frees_what_it_compiled() {
     // Forty good selectors, then a bad one.
