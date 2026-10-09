@@ -13,6 +13,13 @@ use crate::conn::Connection;
 use crate::page::{Cookie, Page, WaitUntil, cookies_from, cookies_to};
 use crate::{Error, Result, launch};
 
+/// Decides whether a page may fetch a document, given its URL.
+pub type Guard = Arc<
+    dyn Fn(String) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send>>
+        + Send
+        + Sync,
+>;
+
 /// For a Chrome major version (such as "154"), the `Sec-CH-UA` value its
 /// pages should present, if not Chrome's own.
 pub type Brands = Arc<dyn Fn(&str) -> Option<String> + Send + Sync>;
@@ -282,7 +289,7 @@ impl Browser {
     /// The client hints Chrome reports for itself, read where no override
     /// is in force and the hints are visible: chrome://version.
     async fn own_metadata(&self) -> Result<Value> {
-        let page = Page::open(self.inner.clone(), None, false).await?;
+        let page = Page::open(self.inner.clone(), None, false, None).await?;
         let read = async {
             page.goto("chrome://version", WaitUntil::Load, None).await?;
             page.evaluate(
@@ -338,7 +345,16 @@ impl Browser {
     /// any other page. Closing it closes the context.
     pub async fn new_page(&self) -> Result<Page> {
         let context = self.create_context().await?;
-        Page::open(self.inner.clone(), Some(context), true).await
+        Page::open(self.inner.clone(), Some(context), true, None).await
+    }
+
+    /// Like [`Browser::new_page`], but every document the page's main
+    /// frame is about to fetch (each hop of a redirect included) is put
+    /// to `guard` first, and one it refuses isn't fetched: navigating there
+    /// fails with `ERR_BLOCKED_BY_CLIENT`.
+    pub async fn new_guarded_page(&self, guard: Guard) -> Result<Page> {
+        let context = self.create_context().await?;
+        Page::open(self.inner.clone(), Some(context), true, Some(guard)).await
     }
 
     /// A context whose pages share cookies and storage with each other.
@@ -761,7 +777,7 @@ pub struct Context {
 
 impl Context {
     pub async fn new_page(&self) -> Result<Page> {
-        Page::open(self.browser.clone(), Some(self.id.clone()), false).await
+        Page::open(self.browser.clone(), Some(self.id.clone()), false, None).await
     }
 
     pub async fn cookies(&self) -> Result<Vec<Cookie>> {

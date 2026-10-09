@@ -230,9 +230,13 @@ they own. Closing the browser closes every page.
   for a page holds no concurrency slot. The whole browser fetch has a
   limit (twice the request timeout plus the challenge wait), so a Chrome
   that stops answering can't hold the request forever.
-- Chrome follows redirects itself; the URL it ends on counts as seen. That
-  URL's own robots.txt isn't consulted, unlike a redirect the HTTP client
-  follows hop by hop.
+- Chrome follows redirects itself; the URL it ends on counts as seen.
+  With `obey_robots`, each document the page's main frame is about to
+  fetch (every redirect hop, and navigations its scripts start) is paused
+  through the Fetch domain and checked against its site's robots.txt,
+  fetched first through the scheduler's own gate if it isn't known; one it
+  disallows is failed before it's sent, and the request is dropped for
+  robots. Frames within the page, and the files it loads, aren't checked.
 - A Chrome that dies is started again for the next browser request; one
   that can't start isn't tried again. A page Chrome answers with a server
   error is retried there like any other, except a blocked request's one

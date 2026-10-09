@@ -466,3 +466,69 @@ async fn wait_for_navigation_follows_a_script_that_moves_the_page_on() {
     assert!(matches!(err, Error::Timeout(_)), "{err}");
     browser.close().await.unwrap();
 }
+
+#[tokio::test]
+async fn a_guard_sees_every_hop_and_can_stop_one_before_it_is_fetched() {
+    let Some(browser) = browser().await else {
+        return;
+    };
+    let server = serve(vec![
+        (
+            "/start",
+            Reply {
+                status: 302,
+                headers: vec![("Location", "/secret".into())],
+                body: String::new(),
+            },
+        ),
+        (
+            "/fine",
+            Reply {
+                status: 302,
+                headers: vec![("Location", "/end".into())],
+                body: String::new(),
+            },
+        ),
+        ("/end", html("<title>end</title>")),
+        ("/secret", html("<p>secret</p>")),
+    ]);
+    let asked = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let log = asked.clone();
+    let guard: netweir_browser::Guard = std::sync::Arc::new(move |url: String| {
+        log.lock().unwrap().push(url.clone());
+        Box::pin(async move { !url.ends_with("/secret") })
+    });
+    let page = browser.new_guarded_page(guard).await.unwrap();
+
+    let r = page
+        .goto(&format!("{}/fine", server.url), WaitUntil::Load, None)
+        .await
+        .unwrap();
+    assert_eq!(r.url, format!("{}/end", server.url));
+    assert_eq!(
+        *asked.lock().unwrap(),
+        [
+            format!("{}/fine", server.url),
+            format!("{}/end", server.url)
+        ]
+    );
+
+    let err = page
+        .goto(&format!("{}/start", server.url), WaitUntil::Load, None)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&err, Error::Navigation(m) if m.contains("BLOCKED_BY_CLIENT")),
+        "{err}"
+    );
+    assert!(
+        !server
+            .seen
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(p, _)| p == "/secret"),
+        "the refused hop was never requested"
+    );
+    browser.close().await.unwrap();
+}

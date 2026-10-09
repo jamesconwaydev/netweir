@@ -419,3 +419,60 @@ async fn a_chrome_that_dies_is_started_again() {
     );
     assert_ne!(c.browser().await.unwrap().pid(), first.pid());
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_redirect_chrome_follows_obeys_the_next_sites_robots_txt() {
+    if !have_chrome() {
+        return;
+    }
+    let other = Site::start(vec![
+        (
+            "/robots.txt",
+            Page::status(200, "User-agent: *\nDisallow: /secret\n"),
+        ),
+        ("/secret", Page::html("secret")),
+        ("/open", Page::html(BUILT_BY_SCRIPT)),
+    ])
+    .await;
+    // localhost, so it's another host from 127.0.0.1 to the crawl.
+    let other_url = |path: &str| format!("http://localhost:{}{path}", other.port);
+    let site = Site::start(vec![
+        (
+            "/to-secret",
+            Page::status(302, "").with_header("location", &other_url("/secret")),
+        ),
+        (
+            "/to-open",
+            Page::status(302, "").with_header("location", &other_url("/open")),
+        ),
+    ])
+    .await;
+    let c = crawler(CrawlSettings {
+        obey_robots: true,
+        ..settings(BrowserMode::Off)
+    });
+    c.submit(request(1, site.url("/to-secret"), true));
+    c.submit(request(2, site.url("/to-open"), true));
+    let events = drain_closing(&c).await;
+    assert!(
+        events.iter().any(|(e, _)| matches!(
+            e,
+            Event::Dropped {
+                id: 1,
+                reason: netweir_core::DropReason::Robots
+            }
+        )),
+        "{events:?}"
+    );
+    assert!(
+        events
+            .iter()
+            .any(|(e, _)| matches!(e, Event::Fetched { id: 2, .. })),
+        "{events:?}"
+    );
+    assert!(
+        !other.paths().iter().any(|p| p == "/secret"),
+        "Chrome never asked for the disallowed page"
+    );
+    assert_eq!(c.stats().dropped_robots, 1);
+}

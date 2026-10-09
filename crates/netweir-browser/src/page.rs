@@ -243,6 +243,7 @@ impl Page {
         browser: Arc<Inner>,
         context: Option<String>,
         owns_context: bool,
+        guard: Option<crate::browser::Guard>,
     ) -> Result<Page> {
         let conn = &browser.conn;
         let mut params = json!({"url": "about:blank"});
@@ -268,10 +269,33 @@ impl Page {
             changed: Notify::new(),
         });
         let watched = shared.clone();
+        // Documents the guard must see first, answered on a task of their
+        // own, since the guard is async and the reader thread can't wait.
+        let guarded = guard.map(|guard| {
+            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<(String, String)>();
+            let (conn, session) = (conn.clone(), session.clone());
+            tokio::spawn(async move {
+                while let Some((id, url)) = rx.recv().await {
+                    let (method, params) = if guard(url).await {
+                        ("Fetch.continueRequest", json!({"requestId": id}))
+                    } else {
+                        (
+                            "Fetch.failRequest",
+                            json!({"requestId": id, "errorReason": "BlockedByClient"}),
+                        )
+                    };
+                    conn.send(&session, method, params);
+                }
+            });
+            tx
+        });
+        let fetching = browser.proxy_login.is_some() || guarded.is_some();
         let login = Login {
             conn: conn.clone(),
             session: session.clone(),
             credentials: browser.proxy_login.clone(),
+            guarded,
+            frame: target.clone(),
         };
         let handler: Handler = Arc::new(move |method, params| {
             match method {
@@ -304,15 +328,23 @@ impl Page {
             page.call("Page.setLifecycleEventsEnabled", json!({"enabled": true}))
                 .await?;
             page.call("Network.enable", json!({})).await?;
-            if browser.proxy_login.is_some() {
-                // To answer the proxy's challenges. Chrome won't handle
-                // them without pausing requests too, so each one is
-                // released as it comes: a round trip per request, only for
-                // a proxy with a login. Page script can't see the Fetch
+            if fetching {
+                // To answer the proxy's challenges, Chrome has every
+                // request paused, each released as it comes: a round trip
+                // per request, only for a proxy with a login. A guard needs
+                // only documents paused. Page script can't see the Fetch
                 // domain.
+                let pattern = if browser.proxy_login.is_some() {
+                    json!({"urlPattern": "*"})
+                } else {
+                    json!({"urlPattern": "*", "resourceType": "Document"})
+                };
                 page.call(
                     "Fetch.enable",
-                    json!({"handleAuthRequests": true, "patterns": [{"urlPattern": "*"}]}),
+                    json!({
+                        "handleAuthRequests": browser.proxy_login.is_some(),
+                        "patterns": [pattern],
+                    }),
                 )
                 .await?;
             }
@@ -787,6 +819,10 @@ struct Login {
     conn: crate::conn::Connection,
     session: String,
     credentials: Option<(String, String)>,
+    /// Where the main frame's documents go to be guarded.
+    guarded: Option<tokio::sync::mpsc::UnboundedSender<(String, String)>>,
+    /// The main frame, whose id is the target's.
+    frame: String,
 }
 
 impl Login {
@@ -806,8 +842,18 @@ impl Login {
 }
 
 impl Login {
-    /// Lets a request Fetch paused go on unchanged.
+    /// Lets a request Fetch paused go on unchanged, unless it's a document
+    /// for the main frame and there's a guard to ask first.
     fn release(&self, params: &Value) {
+        if let Some(guarded) = &self.guarded
+            && params["resourceType"] == "Document"
+            && params["frameId"] == self.frame.as_str()
+        {
+            let url = str_of(&params["request"], "url");
+            if guarded.send((str_of(params, "requestId"), url)).is_ok() {
+                return;
+            }
+        }
         self.conn.send(
             &self.session,
             "Fetch.continueRequest",

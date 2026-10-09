@@ -10,7 +10,7 @@ mod conn;
 mod launch;
 mod page;
 
-pub use browser::{Brands, Browser, Context, LaunchOptions};
+pub use browser::{Brands, Browser, Context, Guard, LaunchOptions};
 pub use launch::{cft_executable, cft_platform, find_chrome, netweir_home};
 pub use page::{Cookie, Page, Response, WaitUntil};
 

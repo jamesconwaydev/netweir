@@ -176,7 +176,11 @@ The page a browser request gives its callback is the one Chrome rendered,
 so `page.css(...)` sees what the scripts built. `page.browser` is the live
 page until the callback returns, then it closes. Browser requests wait their
 turn like any other: robots.txt, each site's limits and its delay all
-apply. `browser_pages` (4 by default) caps how many are open at once.
+apply. Chrome follows redirects, and a page's own scripts, by itself; each
+page it's about to load in the tab is checked against that site's
+robots.txt first, and one it disallows isn't fetched (the request is
+dropped, as over HTTP). `browser_pages` (4 by default) caps how many are
+open at once.
 A declarative spider's rules read the rendered HTML, so callbacks the rules
 call, and a rules spider's own `parse`, get the rendered page but not
 `page.browser`.

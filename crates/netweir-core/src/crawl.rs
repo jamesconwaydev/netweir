@@ -1169,11 +1169,14 @@ async fn browser_fetch(shared: Arc<Shared>, mut q: Queued, permit: OwnedSemaphor
     // A Chrome that stops answering mid-page mustn't hold the request, and
     // its place in the crawl, for good.
     let limit = timeout.saturating_mul(2) + CHALLENGE_WAIT;
+    // Set if robots.txt stopped a redirect Chrome was following.
+    let refused = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let work = render(
         shared.clone(),
         q.request.url.clone(),
         q.blocked.is_some(),
         permit,
+        refused.clone(),
     );
     let rendered = guarded(
         async move {
@@ -1269,6 +1272,10 @@ async fn browser_fetch(shared: Arc<Shared>, mut q: Queued, permit: OwnedSemaphor
                 })
             }
         }
+        (Err(_), _) if refused.load(std::sync::atomic::Ordering::Relaxed) => Some(Event::Dropped {
+            id: q.request.id,
+            reason: DropReason::Robots,
+        }),
         (Err(error), _) if q.attempts < settings.retries && transient(&error) => {
             retry(settings, &mut state, q);
             None
@@ -1315,6 +1322,7 @@ async fn render(
     url: String,
     cookies: bool,
     permit: OwnedSemaphorePermit,
+    refused: Arc<std::sync::atomic::AtomicBool>,
 ) -> Result<Rendered, FetchError> {
     let browser = {
         let mut slot = shared.browser.lock().await;
@@ -1329,7 +1337,26 @@ async fn render(
         kind: FetchErrorKind::Other,
         message: format!("can't start Chrome: {e}"),
     })?;
-    let page = browser.new_page().await.map_err(browser_error)?;
+    let page = if shared.settings.obey_robots {
+        // Chrome follows redirects itself; each hop is checked against its
+        // site's robots.txt before Chrome asks for it, as the HTTP client
+        // checks each hop it follows.
+        let guarding = shared.clone();
+        let guard: netweir_browser::Guard = Arc::new(move |url: String| {
+            let (shared, refused) = (guarding.clone(), refused.clone());
+            Box::pin(async move {
+                let allowed = robots_allow(&shared, &url).await;
+                if !allowed {
+                    refused.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+                allowed
+            })
+        });
+        browser.new_guarded_page(guard).await
+    } else {
+        browser.new_page().await
+    }
+    .map_err(browser_error)?;
     let live = LivePage {
         inner: Arc::new(Live {
             page: page.clone(),
@@ -1400,6 +1427,45 @@ async fn render(
         latency,
         browser.version().to_string(),
     ))
+}
+
+/// Whether robots.txt lets the crawl fetch `url`, fetching the site's
+/// robots.txt first, as the scheduler would, if it isn't known yet.
+async fn robots_allow(shared: &Arc<Shared>, url: &str) -> bool {
+    let settings = &shared.settings;
+    let Ok(parsed) = Url::parse(url) else {
+        return true;
+    };
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return true;
+    }
+    let origin = parsed.origin().ascii_serialization();
+    let path = match parsed.query() {
+        Some(q) => format!("{}?{q}", parsed.path()),
+        None => parsed.path().to_string(),
+    };
+    loop {
+        let fetch = {
+            let mut state = shared.lock();
+            let o = state.origins.entry(origin.clone()).or_default();
+            match &o.robots {
+                Gate::Ready(r) => return r.allowed(&settings.robots_agent, &path),
+                Gate::Fetching => false,
+                Gate::Unknown => {
+                    o.robots = Gate::Fetching;
+                    state.gate_fetches += 1;
+                    true
+                }
+            }
+        };
+        if fetch {
+            check_robots(shared.clone(), origin.clone()).await;
+        } else {
+            // ponytail: another fetch of it is under way; polled, as this
+            // is one request's wait, not the scheduler's.
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
 }
 
 /// How to start Chrome for this crawl: through the crawl's proxy, login
