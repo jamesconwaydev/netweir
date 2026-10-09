@@ -15,9 +15,9 @@ use pyo3::types::PyBytes;
 
 use crate::Node;
 
-/// Raises `netweir.FetchError(message, kind)`, defined in Python so it can
-/// carry a `kind` attribute.
-fn fetch_error(e: CoreError) -> PyErr {
+/// A `netweir.FetchError(message, kind)`, defined in Python so it can carry
+/// a `kind` attribute.
+pub(crate) fn fetch_error_value(py: Python<'_>, e: &CoreError) -> PyResult<Py<PyAny>> {
     let kind = match e.kind {
         FetchErrorKind::Invalid => "invalid",
         FetchErrorKind::Timeout => "timeout",
@@ -27,18 +27,35 @@ fn fetch_error(e: CoreError) -> PyErr {
         FetchErrorKind::Body => "body",
         FetchErrorKind::Other => "other",
     };
-    Python::attach(|py| {
-        match py
-            .import("netweir._errors")
-            .and_then(|m| m.getattr("FetchError"))
-        {
-            Ok(class) => PyErr::from_value(match class.call1((e.message.clone(), kind)) {
-                Ok(err) => err,
-                Err(err) => return err,
-            }),
-            Err(err) => err,
-        }
+    let class = py.import("netweir._errors")?.getattr("FetchError")?;
+    Ok(class.call1((e.message.clone(), kind))?.unbind())
+}
+
+/// Raises `netweir.FetchError(message, kind)`.
+fn fetch_error(e: CoreError) -> PyErr {
+    Python::attach(|py| match fetch_error_value(py, &e) {
+        Ok(err) => PyErr::from_value(err.into_bound(py)),
+        Err(err) => err,
     })
+}
+
+/// Fetch options from the arguments Fetcher and Crawler share.
+pub(crate) fn fetch_options(
+    profile: &str,
+    proxy: Option<String>,
+    timeout: f64,
+    verify: bool,
+) -> PyResult<FetchOptions> {
+    let profile = Profile::named(profile).map_err(|e| PyValueError::new_err(e.to_string()))?;
+    let timeout = Duration::try_from_secs_f64(timeout)
+        .ok()
+        .filter(|t| !t.is_zero())
+        .ok_or_else(|| PyValueError::new_err("timeout must be a positive number of seconds"))?;
+    let mut options = FetchOptions::new(profile);
+    options.proxy = proxy;
+    options.timeout = timeout;
+    options.verify_certificates = verify;
+    Ok(options)
 }
 
 /// A connection pool and cookie jar that sends every request as one
@@ -53,15 +70,7 @@ impl Fetcher {
     #[new]
     #[pyo3(signature = (profile="chrome", proxy=None, timeout=30.0, verify=true))]
     fn new(profile: &str, proxy: Option<String>, timeout: f64, verify: bool) -> PyResult<Fetcher> {
-        let profile = Profile::named(profile).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        let timeout = Duration::try_from_secs_f64(timeout)
-            .ok()
-            .filter(|t| !t.is_zero())
-            .ok_or_else(|| PyValueError::new_err("timeout must be a positive number of seconds"))?;
-        let mut options = FetchOptions::new(profile);
-        options.proxy = proxy;
-        options.timeout = timeout;
-        options.verify_certificates = verify;
+        let options = fetch_options(profile, proxy, timeout, verify)?;
         // Everything that can fail here is a bad argument (profile, proxy).
         let inner = CoreFetcher::new(options).map_err(|e| PyValueError::new_err(e.message))?;
         Ok(Fetcher { inner })

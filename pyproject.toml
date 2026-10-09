@@ -17,11 +17,14 @@ classifiers = [
 ]
 dynamic = ["version"]
 
+[project.scripts]
+netweir = "netweir._cli:main"
+
 [project.urls]
 Repository = "https://github.com/jamesconwaydev/netweir"
 
 [dependency-groups]
-dev = ["pytest>=8", "pytest-asyncio>=1.2", "maturin>=1.15,<2", "ruff>=0.14"]
+dev = ["pytest>=8", "pytest-asyncio>=1.2", "maturin>=1.15,<2", "ruff>=0.14", "pyarrow>=21"]
 bench = ["selectolax>=0.4", "lxml>=6", "cssselect>=1.3", "beautifulsoup4>=4.13", "parsel>=1.10"]
 
 [tool.maturin]

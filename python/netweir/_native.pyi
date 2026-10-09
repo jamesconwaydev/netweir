@@ -1,6 +1,8 @@
 import re
 from collections.abc import Callable, Iterator
-from typing import Literal, TypeVar, overload
+from typing import Any, Literal, TypeVar, overload
+
+from netweir._errors import FetchError
 
 _D = TypeVar("_D")
 
@@ -234,5 +236,55 @@ class Fetcher:
     ) -> None: ...
     async def get(self, url: str, headers: list[tuple[str, str]] | None = None) -> Response: ...
     def get_blocking(self, url: str, headers: list[tuple[str, str]] | None = None) -> Response: ...
+
+class Crawler:
+    def __init__(
+        self,
+        profile: str = "chrome",
+        proxy: str | None = None,
+        timeout: float = 30.0,
+        verify: bool = True,
+        concurrency: int = 64,
+        per_domain: int = 8,
+        obey_robots: bool = True,
+        robots_agent: str = "netweir",
+        obey_tdmrep: bool = True,
+        throttle: bool = True,
+        start_delay: float = 1.0,
+        min_delay: float = 0.0,
+        max_delay: float = 60.0,
+        target_concurrency: float = 1.0,
+    ) -> None: ...
+    def submit(
+        self,
+        id: int,
+        url: str,
+        priority: int = 0,
+        headers: list[tuple[str, str]] | None = None,
+        dont_filter: bool = False,
+    ) -> Literal["queued", "duplicate", "invalid"]: ...
+    async def next(
+        self, max: int = 256
+    ) -> list[
+        tuple[Literal["fetched"], int, Response]
+        | tuple[Literal["failed"], int, FetchError]
+        | tuple[Literal["dropped"], int, Literal["robots", "tdm"]]
+    ]: ...
+    def stats(self) -> dict[str, int]: ...
+
+class JsonlWriter:
+    def __init__(self, path: str) -> None: ...
+    def write(self, item: Any) -> None: ...
+    def close(self) -> None: ...
+
+class CsvWriter:
+    def __init__(self, path: str, fields: list[str] | None = None) -> None: ...
+    def write(self, item: Any) -> list[str]: ...
+    def close(self) -> None: ...
+
+class ParquetWriter:
+    def __init__(self, path: str) -> None: ...
+    def write(self, item: Any) -> None: ...
+    def close(self) -> list[tuple[str, int, int]]: ...
 
 def parse(html: str, timeout: float | None = None) -> Node: ...

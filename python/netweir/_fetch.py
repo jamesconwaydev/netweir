@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Iterable, Mapping
+from urllib.parse import urljoin
 
 from netweir._native import Fetcher, Node, Response, Selection
+from netweir._request import Request
 
 Headers = Mapping[str, str] | Iterable[tuple[str, str]] | None
 
@@ -19,11 +21,13 @@ def _pairs(headers: Headers) -> list[tuple[str, str]]:
 class Page:
     """A fetched page: the response, and the document parsed from it."""
 
-    __slots__ = ("_response", "_root")
+    __slots__ = ("_response", "_root", "request")
 
-    def __init__(self, response: Response):
+    def __init__(self, response: Response, request: Request | None = None):
         self._response = response
         self._root: Node | None = None
+        #: In a crawl, the Request this page answers.
+        self.request = request
 
     @property
     def url(self) -> str:
@@ -78,6 +82,19 @@ class Page:
 
     def xpath(self, query: str, **variables: str | int | float | bool) -> Selection:
         return self.root.xpath(query, **variables)
+
+    @property
+    def meta(self) -> dict:
+        """The meta of the Request this page answers; empty outside a crawl."""
+        return self.request.meta if self.request is not None else {}
+
+    def follow(self, url: str, callback=None, **kwargs) -> Request:
+        """A Request for ``url``, resolved against this page's URL."""
+        return Request(urljoin(self.url, str(url)), callback=callback, **kwargs)
+
+    def follow_all(self, urls, callback=None, **kwargs) -> list[Request]:
+        """``follow`` for every URL in ``urls`` (a list or a Selection)."""
+        return [self.follow(u, callback, **kwargs) for u in urls]
 
     def __getattr__(self, name: str):
         # Everything else a Node offers (find_all, select, get_text ...)

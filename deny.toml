@@ -33,6 +33,12 @@ allow = ["AGPL-3.0-only"]
 crate = "netweir-py"
 allow = ["AGPL-3.0-only"]
 
+# A public-domain hash used by parquet's hasher; CC0 grants no patent
+# licence, so it is allowed for this crate only.
+[[licenses.exceptions]]
+crate = "tiny-keccak"
+allow = ["CC0-1.0"]
+
 [bans]
 multiple-versions = "warn"
 
