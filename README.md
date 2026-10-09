@@ -1,9 +1,40 @@
 # netweir
 
-A web scraping library for Python, with the heavy lifting done in Rust.
+An ultra-fast, self-healing, undetectable web scraper. Rust does the work;
+you write Python.
 
-This is early. What works today is fetching and parsing: ask for a page,
-get it back the way Chrome would have, and pull out what you want with CSS.
+That's the finished product, and it isn't finished yet. Here's what each
+of those words will mean when it is:
+
+- **Ultra-fast.** Fetching, parsing, crawl scheduling and extraction all
+  run in Rust, off Python's GIL. A spider that only declares what it wants
+  never touches Python per page. Every speed claim is a benchmark in this
+  repository that you can run.
+- **Self-healing.** Selectors that find their element again after a site
+  redesign and tell you they had to. Blocks spotted and recovered from by
+  rotating, backing off or slowing down. Crawls that pick up where they
+  stopped after a crash.
+- **Undetectable.** Requests that are byte-for-byte what a real browser
+  sends, from the TLS handshake to the order of the headers, and later a
+  real browser for the pages that need one.
+
+## Where it is now
+
+Working today:
+
+- Fetching that is indistinguishable from Chrome 154 on the wire, over
+  HTTP/2 and HTTP/1.1, with cookies and redirects. Below: how that's
+  proved, and the one known exception.
+- A parser that beats selectolax, the one to beat in Python, on the same
+  pages.
+- CSS queries with Scrapy's `::text` and `::attr()`.
+
+Coming next, in order: XPath and a Beautiful Soup style API; crawling with
+spiders, robots.txt and throttling; declarative spiders that run entirely
+in Rust; self-healing selectors, block recovery and crash-safe resume; then
+a browser driver. The design is in [docs/design/v0.1.md](docs/design/v0.1.md).
+
+## Quick look
 
 ```python
 import netweir
