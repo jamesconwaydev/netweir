@@ -50,6 +50,8 @@ class Handler(BaseHTTPRequestHandler):
             self.send(200, listing(n, 3))
         elif p.startswith("/book/"):
             self.send(200, f"<h1>{p.rsplit('/', 1)[1]}</h1>")
+        elif p == "/based":
+            self.send(200, '<head><base href="/book/"></head><a href="y">y</a>')
         elif p == "/boom":
             self.send(500, "<h1>error</h1>")
         else:
@@ -399,3 +401,39 @@ def test_ignoring_robots_txt_is_said_once(base, caplog):
     assert [r.message for r in caplog.records].count(
         "obey_robots is off: robots.txt is not being checked"
     ) == 1
+
+
+def test_urljoin_resolves_against_the_page(base):
+    seen = []
+
+    class Join(netweir.Spider):
+        settings = FAST
+
+        async def parse(self, page):
+            seen.append((page.urljoin("../book/x"), page.urljoin("https://e.com/a")))
+            return None
+
+    spider = Join()
+    spider.start_urls = [f"{base}/page/1"]
+    spider.run()
+    assert seen == [(f"{base}/book/x", "https://e.com/a")]
+
+    seen.clear()
+    spider.start_urls = [f"{base}/based"]
+    spider.run()
+    assert seen == [(f"{base}/book/x", "https://e.com/a")], "<base href> counts"
+
+    class Follow(netweir.Spider):
+        settings = FAST
+
+        async def parse(self, page):
+            if page.url.endswith("/based"):
+                yield page.follow("y")
+            else:
+                seen.append(page.url)
+
+    seen.clear()
+    spider = Follow()
+    spider.start_urls = [f"{base}/based"]
+    spider.run()
+    assert seen == [f"{base}/book/y"]
