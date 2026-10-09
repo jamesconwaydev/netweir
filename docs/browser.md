@@ -33,7 +33,9 @@ and Chromium in their usual places. Its options:
 | `timeout` | `30.0` | the default limit, in seconds, for navigations and actions |
 
 Use it with `async with`, or `await` it and call `await browser.close()`
-yourself. Each browser gets a fresh profile, deleted when it closes.
+yourself. Each browser gets a fresh profile, deleted when it closes. A
+program that exits without closing it still ends Chrome, but leaves the
+profile behind, as a `netweir-chrome-*` folder in the temporary directory.
 
 ## Pages and contexts
 
@@ -90,8 +92,13 @@ data = await page.evaluate("() => fetch('/api/items').then(r => r.json())")
 
 `evaluate` runs an expression, or a function, which it calls. A promise
 is awaited, and the result comes back as Python values (dicts, lists,
-strings, numbers, `True`, `False`, `None`). An error thrown in the page
-raises `netweir.BrowserError` with its message.
+strings, numbers, `True`, `False`, `None`). Values JSON can't hold come
+back as text: `NaN`, `Infinity`, `-0` and BigInts as `"NaN"`,
+`"Infinity"`, `"-0"` and their digits. An error thrown in the page raises
+`netweir.BrowserError` with its message.
+
+`evaluate` has no timeout of its own, so a promise that never settles
+waits forever. Wrap it in `asyncio.wait_for` if that can happen.
 
 ## Screenshots and cookies
 
@@ -106,18 +113,22 @@ and `same_site`. `await page.set_cookies([...])` takes the same dicts;
 ## Not looking automated
 
 A browser that's being driven usually shows it, and bot protection looks.
-netweir avoids the giveaways:
+netweir avoids these giveaways:
 
 - `navigator.webdriver` is false.
 - Headless Chrome calls itself `HeadlessChrome` in its user agent. netweir
   sends the normal user agent instead, with the client hints Chrome
-  reports for itself, in the request headers, in the page and in workers.
+  reports for itself, in the request headers, in the page and in
+  dedicated workers.
 - It never turns on the DevTools domains whose side effects page scripts
   can notice, and its own scripts run where the page can't see them.
 - Clicks and keys are real input events, not JavaScript calls.
 
-A test in the repository loads a page that checks each of these from page
-script, and fails if any of them shows.
+A test in the repository loads a page that checks the first two from page
+script and the server checks the request headers; the test also fails if
+any of the DevTools domains in the third was turned on.
 
-Service workers still see the `HeadlessChrome` user agent. Pass
-`headless=False` where that matters.
+That isn't everything a site can check. Service workers still see the
+`HeadlessChrome` user agent, and headless Chrome on a Linux server without
+a GPU reports a software renderer to WebGL. Pass `headless=False` where
+that matters.

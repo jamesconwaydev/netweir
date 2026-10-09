@@ -25,12 +25,27 @@ fn raise(e: Error) -> PyErr {
                 Error::Invalid(m) => return Ok(PyValueError::new_err(m.clone())),
                 Error::Timeout(_) => errors.getattr("BrowserTimeout")?.call1((e.to_string(),))?,
                 Error::Navigation(m) => {
+                    // Chrome's net error names: the connection never
+                    // happened, ran out of time, or failed TLS. Anything
+                    // else, such as ERR_ABORTED for a 204 or a download,
+                    // reached the server.
                     let kind = if m.contains("TIMED_OUT") {
                         "timeout"
                     } else if m.contains("CERT") || m.contains("SSL") {
                         "tls"
-                    } else {
+                    } else if [
+                        "CONNECTION",
+                        "NAME_NOT_RESOLVED",
+                        "ADDRESS",
+                        "INTERNET_DISCONNECTED",
+                        "PROXY",
+                    ]
+                    .iter()
+                    .any(|n| m.contains(n))
+                    {
                         "connect"
+                    } else {
+                        "other"
                     };
                     errors.getattr("FetchError")?.call1((m.clone(), kind))?
                 }
@@ -45,7 +60,9 @@ fn raise(e: Error) -> PyErr {
 fn seconds(name: &str, value: Option<f64>) -> PyResult<Option<Duration>> {
     match value {
         None => Ok(None),
-        Some(t) if t > 0.0 && t.is_finite() => Ok(Some(Duration::from_secs_f64(t))),
+        Some(t) if t > 0.0 => Duration::try_from_secs_f64(t)
+            .map(Some)
+            .map_err(|_| PyValueError::new_err(format!("{name} is too long: {t} seconds"))),
         Some(_) => Err(PyValueError::new_err(format!(
             "{name} must be a positive number of seconds"
         ))),

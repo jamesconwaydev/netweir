@@ -121,8 +121,12 @@ impl Connection {
         state.handlers.insert(session.to_string(), handler);
     }
 
+    /// Stops events reaching the session's handler, which hears GONE.
     pub(crate) fn off(&self, session: &str) {
-        self.shared.lock().handlers.remove(session);
+        let handler = self.shared.lock().handlers.remove(session);
+        if let Some(handler) = handler {
+            handler(GONE, &Value::Null);
+        }
     }
 
     pub(crate) fn is_closed(&self) -> bool {

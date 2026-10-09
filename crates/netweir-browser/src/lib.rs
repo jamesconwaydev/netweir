@@ -20,8 +20,10 @@ use std::fmt;
 pub enum Error {
     /// Chrome couldn't be found or started.
     Launch(String),
-    /// The browser, or the page, has closed.
+    /// The browser has closed.
     Closed,
+    /// The page has closed.
+    PageClosed,
     /// Chrome rejected a command.
     Protocol { method: String, message: String },
     /// A wait ran out of time; says what was being waited for.
@@ -42,6 +44,7 @@ impl fmt::Display for Error {
             }
             Error::Timeout(m) => write!(f, "timed out: {m}"),
             Error::Closed => f.write_str("the browser has closed"),
+            Error::PageClosed => f.write_str("the page has closed"),
             Error::Protocol { method, message } => write!(f, "{method}: {message}"),
         }
     }

@@ -198,9 +198,11 @@ impl State {
                     status: r["status"].as_u64().unwrap_or(0) as u16,
                     headers,
                 };
-                if self.responses.len() < KEPT * 2 {
-                    self.responses.insert(str_of(p, "loaderId"), response);
-                }
+                // Navigations that never commit (a 204, a download) leave
+                // responses behind; only committed ones are kept.
+                let committed = &self.committed;
+                self.responses.retain(|l, _| committed.contains(l));
+                self.responses.insert(str_of(p, "loaderId"), response);
             }
             "Inspector.targetCrashed" | GONE => self.gone = true,
             _ => {}
@@ -313,7 +315,7 @@ impl Page {
 
     async fn call(&self, method: &str, params: Value) -> Result<Value> {
         if self.inner.closed.load(Ordering::Relaxed) {
-            return Err(Error::Closed);
+            return Err(Error::PageClosed);
         }
         self.inner
             .browser
@@ -341,7 +343,11 @@ impl Page {
                     return Ok(());
                 }
                 if state.gone {
-                    return Err(Error::Closed);
+                    return Err(if self.inner.browser.conn.is_closed() {
+                        Error::Closed
+                    } else {
+                        Error::PageClosed
+                    });
                 }
             }
             if tokio::time::timeout_at(deadline, changed).await.is_err() {
@@ -350,8 +356,12 @@ impl Page {
         }
     }
 
+    /// The limit for one wait, at most a year: a longer one would overflow
+    /// the clock.
     fn timeout(&self, timeout: Option<Duration>) -> Duration {
-        timeout.unwrap_or(self.inner.browser.timeout)
+        timeout
+            .unwrap_or(self.inner.browser.timeout)
+            .min(Duration::from_secs(365 * 24 * 3600))
     }
 
     /// Navigates and waits for `wait`. An HTTP error status is returned,
@@ -362,9 +372,9 @@ impl Page {
         wait: WaitUntil,
         timeout: Option<Duration>,
     ) -> Result<Response> {
-        let timeout = self.timeout(timeout);
+        let deadline = Instant::now() + self.timeout(timeout);
         let navigate = self.call("Page.navigate", json!({"url": url}));
-        let r = tokio::time::timeout(timeout, navigate)
+        let r = tokio::time::timeout_at(deadline, navigate)
             .await
             .map_err(|_| Error::Timeout(format!("navigating to {url}")))??;
         if let Some(e) = r["errorText"].as_str().filter(|e| !e.is_empty()) {
@@ -377,7 +387,7 @@ impl Page {
         let event = wait.event();
         self.until(
             || format!("{event} of {url}"),
-            timeout,
+            deadline.saturating_duration_since(Instant::now()),
             |s| s.reached(&loader, event),
         )
         .await?;
@@ -458,7 +468,12 @@ impl Page {
                 .unwrap_or("script error");
             return Err(Error::Script(message.to_string()));
         }
-        Ok(r["result"].get("value").cloned().unwrap_or(Value::Null))
+        let result = &r["result"];
+        // NaN, Infinity, -0 and BigInts aren't JSON; they come as text.
+        if let Some(text) = result["unserializableValue"].as_str() {
+            return Ok(Value::from(text.trim_end_matches('n')));
+        }
+        Ok(result.get("value").cloned().unwrap_or(Value::Null))
     }
 
     /// Runs `js` in the page's main world: an expression, or a function,

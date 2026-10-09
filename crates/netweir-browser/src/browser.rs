@@ -171,14 +171,18 @@ impl Browser {
         &self.inner.profile
     }
 
+    /// True once closed, and also once Chrome has exited or crashed.
     pub fn is_closed(&self) -> bool {
-        self.inner.conn.is_closed()
-            && self
-                .inner
-                .child
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .is_none()
+        self.inner.conn.is_closed() || self.child().is_none()
+    }
+
+    /// Chrome's process id, while it runs.
+    pub fn pid(&self) -> Option<u32> {
+        self.child().as_ref().map(|c| c.id())
+    }
+
+    fn child(&self) -> std::sync::MutexGuard<'_, Option<Child>> {
+        self.inner.child.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     /// A page in a context of its own: no cookies or storage shared with

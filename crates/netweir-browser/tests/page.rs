@@ -342,3 +342,86 @@ async fn pages_keep_their_cookies_to_their_own_context() {
     assert!(page.is_closed());
     browser.close().await.unwrap();
 }
+
+#[tokio::test]
+async fn closing_a_page_ends_a_navigation_waiting_on_it() {
+    let Some(browser) = browser().await else {
+        return;
+    };
+    // Accepts and never answers.
+    let silent = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}/", silent.local_addr().unwrap());
+    let page = browser.new_page().await.unwrap();
+    let waiting = tokio::spawn({
+        let page = page.clone();
+        async move {
+            page.goto(&url, WaitUntil::Load, Some(Duration::from_secs(20)))
+                .await
+        }
+    });
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let started = std::time::Instant::now();
+    page.close().await.unwrap();
+    let r = waiting.await.unwrap();
+    assert!(matches!(r, Err(Error::PageClosed)), "{r:?}");
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "{:?}",
+        started.elapsed()
+    );
+    browser.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn evaluate_returns_values_json_cant_hold() {
+    let Some(browser) = browser().await else {
+        return;
+    };
+    let page = browser.new_page().await.unwrap();
+    assert_eq!(page.evaluate("NaN").await.unwrap(), json!("NaN"));
+    assert_eq!(
+        page.evaluate("-Infinity").await.unwrap(),
+        json!("-Infinity")
+    );
+    assert_eq!(
+        page.evaluate("10n ** 20n").await.unwrap(),
+        json!("100000000000000000000")
+    );
+    browser.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn fill_refuses_a_select() {
+    let Some(browser) = browser().await else {
+        return;
+    };
+    let server = serve(vec![(
+        "/",
+        html("<select id=s><option>a</option></select>"),
+    )]);
+    let page = browser.new_page().await.unwrap();
+    page.goto(&server.url, WaitUntil::Load, None).await.unwrap();
+    let err = page.fill("#s", "a", SHORT).await.unwrap_err();
+    assert!(
+        matches!(&err, Error::Timeout(m) if m.contains("editable")),
+        "{err}"
+    );
+    browser.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn an_endless_timeout_is_capped_not_a_panic() {
+    let Some(browser) = browser().await else {
+        return;
+    };
+    let server = serve(vec![("/", html("<p id=x>x</p>"))]);
+    let page = browser.new_page().await.unwrap();
+    page.goto(&server.url, WaitUntil::Load, Some(Duration::MAX))
+        .await
+        .unwrap();
+    page.click("#x", Some(Duration::MAX)).await.unwrap();
+    page.wait_for("#x", "visible", Some(Duration::MAX))
+        .await
+        .unwrap();
+    browser.close().await.unwrap();
+}

@@ -33,7 +33,8 @@
         if (check === "visible" && !visible(el)) return { failed: "visible" };
         if (check === "enabled" && !enabled(el)) return { failed: "enabled" };
         if (check === "editable") {
-          const field = el.matches("input, textarea, select") || el.isContentEditable;
+          // A <select> isn't typed into; fill would do nothing to it.
+          const field = el.matches("input, textarea") || el.isContentEditable;
           const readOnly = el.readOnly || el.getAttribute("aria-readonly") === "true";
           if (!field || readOnly || !enabled(el)) return { failed: "editable" };
         }

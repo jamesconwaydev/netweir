@@ -2,6 +2,7 @@
 NETWEIR_REQUIRE_CHROME is set."""
 
 import os
+import socket
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -31,6 +32,10 @@ class Handler(BaseHTTPRequestHandler):
         pass
 
     def do_GET(self):
+        if self.path == "/empty":
+            self.send_response(204)
+            self.end_headers()
+            return
         body = PAGES.get(self.path)
         self.send_response(200 if body else 404)
         self.send_header("Content-Type", "text/html")
@@ -104,9 +109,20 @@ async def test_failures_raise_what_they_are(browser, base):
         await page.evaluate("(() => { throw new Error('boom') })()")
     with pytest.raises(ValueError, match="wait must be"):
         await page.goto(base + "/", wait="soon")
-    with pytest.raises(netweir.FetchError) as refused:
-        await page.goto("http://127.0.0.1:9/")
+    closed = socket.socket()
+    closed.bind(("127.0.0.1", 0))
+    port = closed.getsockname()[1]
+    closed.close()
+    with pytest.raises(netweir.FetchError, match="REFUSED") as refused:
+        await page.goto(f"http://127.0.0.1:{port}/")
     assert refused.value.kind == "connect"
+    # Chrome abandons a navigation to a 204; the server was reached.
+    with pytest.raises(netweir.FetchError, match="ERR_ABORTED") as aborted:
+        await page.goto(base + "/empty")
+    assert aborted.value.kind == "other"
+    for bad in (0, -1, float("inf"), 1e300):
+        with pytest.raises(ValueError, match="timeout"):
+            await page.click("#q", timeout=bad)
 
 
 async def test_cookies_are_dicts_and_stay_in_their_context(browser, base):

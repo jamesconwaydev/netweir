@@ -107,10 +107,19 @@ pub(crate) fn start(executable: &Path, args: &[String]) -> Result<Started> {
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
-    hand_over(&mut command, &chrome_reads, &chrome_writes).map_err(failed)?;
-    let child = command.spawn().map_err(failed)?;
-    // Our copies of Chrome's ends must close, or we'd never see it exit.
-    drop((chrome_reads, chrome_writes));
+    // On Windows, Chrome's ends are inheritable from hand_over until they're
+    // dropped, and any child started meanwhile would get them too; then a
+    // browser's reader would never see its Chrome exit. Launches here take
+    // turns through that window.
+    static SPAWNING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let child = {
+        let _turn = SPAWNING.lock().unwrap_or_else(|e| e.into_inner());
+        hand_over(&mut command, &chrome_reads, &chrome_writes).map_err(failed)?;
+        let child = command.spawn().map_err(failed)?;
+        // Our copies of Chrome's ends must close, or we'd never see it exit.
+        drop((chrome_reads, chrome_writes));
+        child
+    };
     Ok(Started {
         child,
         commands,
@@ -160,10 +169,9 @@ fn hand_over(
     use std::os::windows::io::AsRawHandle;
     use windows_sys::Win32::Foundation::{HANDLE_FLAG_INHERIT, SetHandleInformation};
 
-    // ponytail: every inheritable handle goes to every child started
-    // meanwhile, so two browsers launched at once may each hold the
-    // other's pipe ends. Harmless while both live; a job object or
-    // PROC_THREAD_ATTRIBUTE_HANDLE_LIST would make it exact.
+    // ponytail: start() keeps netweir's own launches apart, but a process
+    // started elsewhere in the program during the launch would still
+    // inherit these. PROC_THREAD_ATTRIBUTE_HANDLE_LIST would make it exact.
     for handle in [reads.as_raw_handle(), writes.as_raw_handle()] {
         if unsafe { SetHandleInformation(handle as _, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT) }
             == 0

@@ -365,8 +365,10 @@ tells you which of those it was.
 A driven Chrome normally gives itself away: `navigator.webdriver` is true,
 the user agent says `HeadlessChrome`, and the usual drivers switch on
 DevTools features that page scripts can notice. netweir doesn't do any of
-that. A test serves a page that looks for each of these and fails if it
-finds one. [docs/browser.md](docs/browser.md) has the rest.
+that. A test serves a page that looks for the first two from script, and
+also fails if any of those DevTools features was switched on.
+[docs/browser.md](docs/browser.md) has the rest, including what it doesn't
+hide yet.
 
 ## Documentation
 
