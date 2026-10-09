@@ -22,6 +22,14 @@ crate = "netweir-dom"
 allow = ["AGPL-3.0-only"]
 
 [[licenses.exceptions]]
+crate = "netweir-core"
+allow = ["AGPL-3.0-only"]
+
+[[licenses.exceptions]]
+crate = "netweir-fingerprint"
+allow = ["AGPL-3.0-only"]
+
+[[licenses.exceptions]]
 crate = "netweir-py"
 allow = ["AGPL-3.0-only"]
 
@@ -31,3 +39,5 @@ multiple-versions = "warn"
 [sources]
 unknown-registry = "deny"
 unknown-git = "deny"
+# The unreleased wreq and btls commits pinned in Cargo.toml's [patch.crates-io].
+allow-git = ["https://github.com/0x676e67/wreq", "https://github.com/0x676e67/btls"]
