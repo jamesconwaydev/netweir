@@ -34,8 +34,12 @@ Working today:
   to JSON Lines, CSV or Parquet.
 - Declarative spiders, where you describe the item and the links and
   Rust does the rest without running any Python per page.
+- Self-healing: block pages recognised and recovered from, crawls that
+  resume after a crash, and selectors that find their element again after
+  a redesign.
 
-Coming next, in order: self-healing selectors, block recovery and crash-safe resume; then a
+Coming next, in order: Firefox and Safari profiles, a crawl benchmark
+against Scrapy, wheels for every platform and the 0.1 release; then a
 browser driver. The design is in [docs/design/v0.1.md](docs/design/v0.1.md).
 
 ## Quick look
@@ -180,6 +184,49 @@ You don't have to choose. A rule can hand its pages to a callback, a
 callback can call `Book.extract(page)`, and a spider can have both rules
 and its own `parse`. `bench/rules.py` crawls a local 1,050-page shop both
 ways; the declarative spider takes about two thirds of the time.
+
+## When a site pushes back, or changes
+
+Three things go wrong on a long crawl, and netweir handles each without
+being asked.
+
+**The site blocks you.** Every response is checked against the block pages
+of Cloudflare, Akamai, DataDome, HUMAN, Kasada, Imperva and AWS WAF, so a
+challenge that comes back as a 403 isn't mistaken for a page. A blocked
+request is tried again with a new session (an empty cookie jar, and the next
+of your `proxies` if you gave several), and the site is slowed down. A
+server error is retried with backoff, a 429's Retry-After is honoured, and a
+site that keeps blocking is paused for a while instead of hammered. If a
+request is still blocked after all that, your spider's `on_block(request,
+page)` hears about it. Outside a crawl, `netweir.get` raises
+`netweir.Blocked`, naming the vendor.
+
+**The crawl dies.** Give it somewhere to keep its state and run it again
+after a crash, a reboot or a `kill -9`:
+
+```
+netweir crawl books.py -o books.jsonl -s checkpoint=crawls/books
+```
+
+It picks up where it stopped. Pages already done aren't fetched again, and
+no item ends up in `books.jsonl` twice: the tests kill a crawl at random
+moments until it finishes and check exactly that.
+
+**The site is redesigned.** Name a selector and netweir remembers what its
+element looked like:
+
+```python
+price = page.css(".price_color::text", track="price")
+```
+
+When a new build renames `price_color`, wraps it in another `div` or swaps
+`h1` for `h2`, the selector stops matching, and netweir finds the element
+most like the one it remembers. `price.relocated` says it had to, and
+`price.score` says how sure it is. You get a warning, not an empty column.
+`track=` works on Item fields too. Add `repair = netweir.repair.llm()` to a
+spider, and a language model proposes a replacement selector for each one
+that broke. netweir checks every proposal on the page and reports it to you,
+and never applies one itself.
 
 ## Looking like a browser
 
