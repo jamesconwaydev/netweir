@@ -11,13 +11,17 @@ use netweir_core::{
 };
 use site::{Page, Site};
 
-fn have_chrome() -> bool {
+/// A turn with Chrome, or None (and a note) when there isn't one. Only
+/// two tests have a Chrome at once: a small CI runner with one each, all
+/// at once, takes longer over a page than a test waits.
+async fn chrome() -> Option<tokio::sync::SemaphorePermit<'static>> {
+    static TURNS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(2);
     match netweir_browser::find_chrome() {
-        Ok(_) => true,
+        Ok(_) => Some(TURNS.acquire().await.unwrap()),
         Err(e) if std::env::var_os("NETWEIR_REQUIRE_CHROME").is_some() => panic!("{e}"),
         Err(e) => {
             eprintln!("skipped: {e}");
-            false
+            None
         }
     }
 }
@@ -102,9 +106,9 @@ const BUILT_BY_SCRIPT: &str = "<p id=static>static</p><script>document.body.inse
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_browser_request_comes_back_rendered_with_its_page_open() {
-    if !have_chrome() {
+    let Some(_chrome) = chrome().await else {
         return;
-    }
+    };
     let site = Site::start(vec![("/", Page::html(BUILT_BY_SCRIPT))]).await;
     let c = crawler(settings(BrowserMode::Off));
     c.submit(request(1, site.url("/"), true));
@@ -135,9 +139,9 @@ async fn a_browser_request_comes_back_rendered_with_its_page_open() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn other_requests_still_use_the_http_client() {
-    if !have_chrome() {
+    let Some(_chrome) = chrome().await else {
         return;
-    }
+    };
     let site = Site::start(vec![("/", Page::html(BUILT_BY_SCRIPT))]).await;
     let c = crawler(settings(BrowserMode::Off));
     c.submit(request(1, site.url("/"), false));
@@ -152,9 +156,9 @@ async fn other_requests_still_use_the_http_client() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn with_browser_always_every_request_goes_through_chrome() {
-    if !have_chrome() {
+    let Some(_chrome) = chrome().await else {
         return;
-    }
+    };
     let site = Site::start(vec![
         ("/a", Page::html(BUILT_BY_SCRIPT)),
         ("/b", Page::html(BUILT_BY_SCRIPT)),
@@ -193,9 +197,9 @@ fn challenge_moving_on(moves_on: &str) -> Page {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_blocked_request_gets_through_in_chrome_and_hands_its_cookies_back() {
-    if !have_chrome() {
+    let Some(_chrome) = chrome().await else {
         return;
-    }
+    };
     let site = Site::start(vec![("/guarded", challenge()), ("/also", challenge())]).await;
     let c = crawler(settings(BrowserMode::OnBlock));
     c.submit(request(1, site.url("/guarded"), false));
@@ -224,9 +228,9 @@ async fn a_blocked_request_gets_through_in_chrome_and_hands_its_cookies_back() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn without_escalation_a_block_goes_to_on_block() {
-    if !have_chrome() {
+    let Some(_chrome) = chrome().await else {
         return;
-    }
+    };
     let site = Site::start(vec![("/guarded", challenge())]).await;
     let c = crawler(settings(BrowserMode::Off));
     c.submit(request(1, site.url("/guarded"), false));
@@ -262,9 +266,9 @@ async fn a_chrome_that_wont_start_fails_its_requests() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_challenge_that_moves_on_at_once_still_counts_as_passed() {
-    if !have_chrome() {
+    let Some(_chrome) = chrome().await else {
         return;
-    }
+    };
     // Real challenges navigate whenever they like, including before the
     // first page has been read.
     let site = Site::start(vec![
@@ -327,9 +331,9 @@ async fn a_blocked_request_that_cant_reach_chrome_says_why() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn browser_requests_waiting_for_a_page_dont_hold_up_the_rest() {
-    if !have_chrome() {
+    let Some(_chrome) = chrome().await else {
         return;
-    }
+    };
     let slow = Page::html(BUILT_BY_SCRIPT).slow(Duration::from_millis(500));
     let site = Site::start(vec![
         ("/a", slow.clone()),
@@ -367,9 +371,9 @@ async fn browser_requests_waiting_for_a_page_dont_hold_up_the_rest() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_server_error_in_chrome_is_tried_again() {
-    if !have_chrome() {
+    let Some(_chrome) = chrome().await else {
         return;
-    }
+    };
     let site = Site::scripted(vec![(
         "/flaky",
         vec![Page::status(503, "busy"), Page::html(BUILT_BY_SCRIPT)],
@@ -392,9 +396,9 @@ async fn a_server_error_in_chrome_is_tried_again() {
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn a_chrome_that_dies_is_started_again() {
-    if !have_chrome() {
+    let Some(_chrome) = chrome().await else {
         return;
-    }
+    };
     let site = Site::start(vec![
         ("/a", Page::html(BUILT_BY_SCRIPT)),
         ("/b", Page::html(BUILT_BY_SCRIPT)),
@@ -422,9 +426,9 @@ async fn a_chrome_that_dies_is_started_again() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_redirect_chrome_follows_obeys_the_next_sites_robots_txt() {
-    if !have_chrome() {
+    let Some(_chrome) = chrome().await else {
         return;
-    }
+    };
     let other = Site::start(vec![
         (
             "/robots.txt",
@@ -479,9 +483,9 @@ async fn a_redirect_chrome_follows_obeys_the_next_sites_robots_txt() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_503_with_retry_after_is_waited_out_and_tried_again_in_chrome() {
-    if !have_chrome() {
+    let Some(_chrome) = chrome().await else {
         return;
-    }
+    };
     let site = Site::scripted(vec![(
         "/busy",
         vec![
@@ -507,9 +511,9 @@ async fn a_503_with_retry_after_is_waited_out_and_tried_again_in_chrome() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_navigation_a_pages_script_starts_obeys_robots_txt_too() {
-    if !have_chrome() {
+    let Some(_chrome) = chrome().await else {
         return;
-    }
+    };
     let other = Site::start(vec![
         (
             "/robots.txt",
@@ -545,9 +549,9 @@ async fn a_navigation_a_pages_script_starts_obeys_robots_txt_too() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_redirect_chrome_follows_obeys_the_next_sites_tdmrep() {
-    if !have_chrome() {
+    let Some(_chrome) = chrome().await else {
         return;
-    }
+    };
     let tdm = r#"[{"location": "/reserved", "tdm-reservation": 1}]"#;
     let other = Site::start(vec![
         ("/.well-known/tdmrep.json", Page::status(200, tdm)),

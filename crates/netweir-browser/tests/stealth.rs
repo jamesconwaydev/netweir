@@ -126,13 +126,12 @@ async fn pages_present_the_brands_netweir_is_told_to() {
             "\"Chromium\";v=\"{major}\", \"Brand X\";v=\"{major}\", \"Not A(Brand\";v=\"99\""
         ))
     });
-    let browser = netweir_browser::Browser::launch(netweir_browser::LaunchOptions {
+    let browser = common::launch(netweir_browser::LaunchOptions {
         executable: Some(executable),
         brands: Some(brands),
         ..Default::default()
     })
-    .await
-    .unwrap();
+    .await;
     let major = browser
         .version()
         .trim_start_matches("Chrome/")
