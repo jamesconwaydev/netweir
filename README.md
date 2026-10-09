@@ -27,10 +27,11 @@ Working today:
   proved, and the one known exception.
 - A parser that beats selectolax, the one to beat in Python, on the same
   pages.
-- CSS queries with Scrapy's `::text` and `::attr()`.
+- CSS queries with Scrapy's `::text` and `::attr()`, all of XPath 1.0, and
+  Beautiful Soup's `find_all` family, each faster than the library you'd
+  otherwise use for it.
 
-Coming next, in order: XPath and a Beautiful Soup style API; crawling with
-spiders, robots.txt and throttling; declarative spiders that run entirely
+Coming next, in order: crawling with spiders, robots.txt and throttling; declarative spiders that run entirely
 in Rust; self-healing selectors, block recovery and crash-safe resume; then
 a browser driver. The design is in [docs/design/v0.1.md](docs/design/v0.1.md).
 
@@ -52,6 +53,37 @@ for book in page.css("article.product_pod"):
 If you've used Scrapy, `::text`, `::attr()`, `get()` and `getall()` mean what
 you think they mean. Already have the HTML? `netweir.parse(html)` skips the
 request and gives you something you query the same way.
+
+## Bring your selectors with you
+
+Whatever you scrape with now, your selectors should work here unchanged.
+XPath is all of XPath 1.0, plus the extras parsel users lean on:
+
+```python
+page.xpath("//article//h3/a/@title").getall()
+page.xpath("//p[has-class('price_color')]/text()").get()
+page.xpath("//article//a[re:test(@href, '_\\d+/index\\.html$')]/@href").getall()
+page.xpath("//li[@class=$cls]", cls="next").get()  # variables, as in parsel
+page.css(".price_color::text").re(r"[\d.]+")  # ["51.77", "53.74", ...]
+```
+
+And if you think in Beautiful Soup, the same page answers that way too:
+
+```python
+import re
+
+page.find("ul", class_="pager").find("a")["href"]
+page.find_all("a", title=True, limit=10)
+page.find_all(string=re.compile("£"))
+page.find("h3").find_parent("li").find_next_sibling("li")
+```
+
+Two things work slightly differently, on purpose. `get()` on an element
+gives its HTML the way Chrome's `outerHTML` writes it, so an attribute
+holding a quote comes out as `&quot;` where lxml would switch to single
+quotes; the elements and their order are the same. And attribute values are
+plain strings: `node["class"]` is `"star-rating Three"`, not Beautiful
+Soup's list. Filters still match one class out of several, as you'd expect.
 
 ## Looking like a browser
 
@@ -112,6 +144,23 @@ page:
 
 Measured on an Apple M-series laptop with Python 3.14. The lead over selectolax is small because both use lexbor; it comes from doing the extraction in Rust. Run it yourself:
 `uv run --group bench python bench/parse.py`.
+
+XPath and `find_all` are a different story, because the libraries people
+use for them are much slower. `bench/query.py` parses the same shop page and
+asks six XPath questions, or six Beautiful Soup ones:
+
+| | 1 MB page | 3 MB page |
+|---|---|---|
+| netweir, XPath | 9.9 ms | 33 ms |
+| lxml, XPath | 809 ms | 8.8 s |
+| parsel, XPath | 814 ms | 8.8 s |
+| netweir, `find_all` | 9.4 ms | 29 ms |
+| Beautiful Soup, `find_all` | 170 ms | 515 ms |
+
+Look at lxml across the row: three times the page took eleven times as long.
+netweir builds a flat index of the document on the first query, so `//x` is
+a scan over a few arrays, and its time grows with the page and no faster.
+Both benchmarks run in CI, and the build fails if any library beats netweir.
 
 Pages you don't control can be built to be slow to parse. Pass a timeout and
 netweir gives up instead of hanging:
