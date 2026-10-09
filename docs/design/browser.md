@@ -1,0 +1,247 @@
+# netweir browser driver design
+
+Status: draft, October 2026
+Author: James Conway
+
+## What it is for
+
+Some pages only exist after JavaScript runs, and some sites won't serve
+anything until a browser has passed their challenge. For those, netweir
+drives a real Chrome. Everything else keeps going through the HTTP client,
+which is a hundred times cheaper per page.
+
+So the driver has two jobs. On its own, it's an async API for loading a
+page, acting on it and reading it back, close to what Playwright users
+expect. Inside a crawl, it's the step on the recovery ladder between
+"slow down" and "give up": a request that keeps getting blocked is fetched
+in Chrome, and the cookies Chrome earns go back to the HTTP session so the
+next hundred pages don't need it.
+
+## Scope
+
+In this design:
+
+- Launching Chrome (installed, or a path you give) and driving it over the
+  Chrome DevTools Protocol (CDP), through a pipe rather than a port
+- Pages and isolated browser contexts; navigation that reports the status
+  and headers of the document; reading the page back as a netweir `Node`
+- Clicking, typing, pressing keys and waiting for elements, with
+  Playwright-style actionability checks and real input events
+- Running JavaScript in the page, screenshots, cookies
+- Stealth from the first commit: none of the CDP calls that pages can
+  detect, no automation flags, no headless tells in the user agent
+- Crawl integration: per-request browser fetches and browser escalation on
+  the recovery ladder, with cookie hand-back (milestone 9)
+- Firefox over WebDriver BiDi (milestone 10)
+
+Not in this design: request interception and routing, tracing, PDF,
+downloading Chrome for Testing builds (the driver uses an installed
+Chrome or a path), connecting to a browser over a WebSocket (the hosted
+service will need it), Safari (no BiDi), and Camoufox (a third protocol).
+
+## Architecture
+
+A new crate, `netweir-browser`, holds the protocol client and the page
+model. It has no Python in it, so the crawl engine and, later, the hosted
+service can use it directly. `netweir-py` binds it, and the async methods
+return Python awaitables the same way fetching does.
+
+```
+Python: Browser, Context, Page  (python/netweir/browser.py, thin)
+          |
+netweir-py: async bindings
+          |
+netweir-browser: Browser -> Context -> Page -> Frame
+          |   protocol client: one connection, many sessions
+          |
+       Chrome  (--remote-debugging-pipe)
+```
+
+### The connection
+
+Chrome is started with `--remote-debugging-pipe`. It reads commands on
+file descriptor 3 and writes replies on 4, each message a JSON object
+followed by a NUL byte. On Windows the same pipes are passed as inherited
+handles with `--remote-debugging-io-pipes`. A pipe, unlike
+`--remote-debugging-port`, opens no port: no other process on the machine
+can take control of the browser, and no page can find it by probing
+localhost.
+
+One reader thread reads messages and routes them: a reply goes to the
+command waiting for its `id`, an event to the session it names. Commands
+are written by one writer thread fed from a channel, so an async task never
+blocks on the pipe. Targets are attached in flat mode (`sessionId` on each
+message) so one connection carries every page.
+
+Commands are sent as a method name and JSON parameters. The driver uses
+about forty CDP methods; typing each by hand is less code than a generator
+for the 60,000 lines of the whole protocol, and a method that changes
+breaks one test, not a build.
+
+If Chrome exits or the pipe closes, every waiting command fails with an
+error that says so, and the browser is marked closed.
+
+### Stealth rules
+
+These are rules of the driver, not options, and tests enforce them:
+
+- `Runtime.enable`, `Console.enable` and `Log.enable` are never sent.
+  Their side effects are visible to page scripts. The client refuses to
+  send them.
+- netweir's own helper code (finding elements, actionability checks,
+  reading the page) runs in an isolated world made with
+  `Page.createIsolatedWorld`. It shares the DOM but not the page's
+  JavaScript globals, so the page can't see or patch it. The world name
+  is not a recognisable one.
+- `page.evaluate()` runs in the page's main world, because that's where
+  your code expects the page's variables to be. It uses `Runtime.evaluate`
+  with no context id, which needs no `Runtime.enable`.
+- Clicks, typing and key presses are `Input.dispatch*` events at real
+  coordinates, never `element.click()`.
+- Chrome is launched without `--enable-automation`, and with
+  `--disable-blink-features=AutomationControlled`, so
+  `navigator.webdriver` is false.
+- Headless Chrome puts `HeadlessChrome` in its user agent, though not in
+  its client hints. Each page's user agent is overridden with the same
+  string reading `Chrome`, together with the client-hint metadata Chrome
+  itself reports (read once per browser from `chrome://version`, the one
+  page that can see it before any override). The override has to carry
+  that metadata: without it, Chrome stops sending the high-entropy hints,
+  and with the `--user-agent` flag instead, it sends them empty. Dedicated
+  workers inherit the override. Service workers don't, and are a known
+  gap.
+
+### Pages
+
+`Browser.new_page()` opens a page in a new browser context, so pages share
+no cookies or storage unless you ask for a shared one with
+`Browser.new_context()`. Each page is a target with its own session, with
+`Page`, `Network` and lifecycle events enabled; `Network.enable` is what
+reports the document's status and headers, and isn't visible to the page.
+
+`goto(url, wait="load")` navigates and waits for the lifecycle event
+(`domcontentloaded`, `load` or `networkidle`) of that navigation, matched
+by loader id. It returns a `Response` with the status, final URL and
+headers of the main document. A network error (DNS, refused, TLS) raises
+`netweir.FetchError` with Chrome's error text. An HTTP error status
+doesn't raise; the status is in the response, as with `netweir.get()`.
+
+`content()` returns the HTML as Chrome now has it, doctype included, and
+`parse()` returns it as a netweir `Node`, so every selector, `find_all`
+and tracked selector works on a rendered page as on a fetched one.
+
+### Actions
+
+`click(selector)`, `fill(selector, text)`, `press(key)` and
+`wait_for(selector, state="visible")` take a CSS selector. Each action
+retries until its checks pass or its timeout (30 seconds by default)
+runs out, then raises `netweir.BrowserTimeout` naming the check that
+failed:
+
+| Check | Means | Used by |
+|---|---|---|
+| attached | the selector finds an element | all |
+| visible | a non-empty box and not `visibility:hidden` | click, fill, wait_for |
+| stable | the same box in two animation frames | click |
+| enabled | not disabled, not in a disabled fieldset | click, fill |
+| editable | enabled and not read-only | fill |
+| receives events | the element, or one inside it, is what's at the click point | click |
+
+A click scrolls the element into view, moves the mouse to its centre and
+presses and releases the left button. `fill` focuses the element, selects
+what's in it and inserts the text with `Input.insertText`, which fires the
+same input events typing does. `press` sends a key down and up, with the
+key's code and text for the common keys.
+
+### Other page methods
+
+- `evaluate(js)`: runs an expression or a function body in the main world,
+  awaits it if it's a promise, and returns the result as JSON-compatible
+  Python values. A thrown error raises `netweir.BrowserError` with the
+  message.
+- `screenshot(path=None, full_page=False)`: PNG bytes, also written to
+  `path` if given.
+- `cookies()` and `set_cookies(cookies)`: the context's cookies as dicts
+  with `name`, `value`, `domain`, `path`, `expires`, `http_only`, `secure`
+  and `same_site`.
+- `url`, `title()`, `close()`.
+
+### Finding Chrome
+
+`netweir.browser(executable=None, headless=True, args=())` launches Chrome.
+Without `executable`, it uses `$NETWEIR_CHROME`, then the usual install
+paths on each platform (Chrome, then Chrome for Testing, then Chromium).
+If none is found, the error lists where it looked. Each browser gets a
+fresh temporary profile directory, removed on close.
+
+## Python API
+
+```python
+import netweir
+
+async with netweir.browser() as browser:
+    page = await browser.new_page()
+    response = await page.goto("https://quotes.toscrape.com/js/")
+    assert response.status == 200
+    await page.click("li.next a")
+    await page.wait_for("div.quote")
+    root = await page.parse()
+    quotes = root.css("span.text::text").getall()
+```
+
+`Browser`, `Context` and `Page` are async context managers that close what
+they own. Closing the browser closes every page.
+
+## Crawl integration (milestone 9)
+
+- `Request(..., browser=True)` and `page.follow(..., browser=True)` fetch
+  that request in Chrome. The callback gets a netweir `Page` as usual,
+  with `page.browser` the live browser page for actions until the callback
+  returns.
+- `Settings.browser` is `"off"` (the default), `"on_block"` or
+  `"always"`. With `"on_block"`, a request still blocked after its retries
+  is fetched once in Chrome before `on_block` is called. If Chrome gets
+  through, its cookies are copied into the site's HTTP session and
+  following requests go back to the HTTP client.
+- `Settings.browser_pages` caps open pages (default 4). Browser fetches
+  obey the same robots.txt, per-domain limits and delays as HTTP ones.
+- The stats count `browser_fetches` and `browser_unblocked`.
+
+Cookie hand-back only helps if the HTTP client looks like the same browser
+the cookie was issued to, so escalation uses the HTTP profile that matches
+the installed Chrome's major version, and logs a warning when there is
+none.
+
+## Firefox (milestone 10)
+
+Firefox has dropped CDP; its remote protocol is WebDriver BiDi. The page
+model above talks to a backend trait, implemented for CDP first and then
+for BiDi, so `netweir.browser(engine="firefox")` gives the same `Page`.
+
+## Testing
+
+- A detection page served by the test server checks, from page script,
+  everything listed under the stealth rules: `navigator.webdriver`,
+  `Headless` in the user agent, the client hints, and the console getter
+  trick that catches `Runtime.enable`. The test fails if any of them
+  trips.
+- The protocol client records every method it sends in tests; a test
+  drives a full session (navigate, click, fill, evaluate, screenshot) and
+  asserts none of the forbidden methods went out.
+- Action tests use local pages that hide, cover, disable, move and delay
+  elements, and check each action waits for the right thing and that the
+  timeout names the check that failed.
+- CI runs the browser tests on Linux, macOS and Windows with the runner's
+  installed Chrome. Locally they're skipped, with a reason, if no Chrome
+  is found.
+
+## Milestones
+
+**M8, the driver.** `netweir-browser` with launch, the pipe connection,
+contexts, pages, navigation, content and parse, actions with actionability,
+evaluate, screenshots and cookies; the Python API; the stealth tests; docs.
+
+**M9, crawl integration.** Browser requests, escalation on the recovery
+ladder, cookie hand-back, the page pool and its settings and stats.
+
+**M10, Firefox.** The backend trait and a BiDi backend.
