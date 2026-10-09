@@ -62,7 +62,8 @@ impl Fetcher {
         options.proxy = proxy;
         options.timeout = timeout;
         options.verify_certificates = verify;
-        let inner = CoreFetcher::new(options).map_err(fetch_error)?;
+        // Everything that can fail here is a bad argument (profile, proxy).
+        let inner = CoreFetcher::new(options).map_err(|e| PyValueError::new_err(e.message))?;
         Ok(Fetcher { inner })
     }
 

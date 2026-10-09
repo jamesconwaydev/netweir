@@ -51,6 +51,11 @@ class Handler(BaseHTTPRequestHandler):
             self.send(200, b"ok", [("Set-Cookie", "session=abc; Path=/")])
         elif path == "/twice":
             self.send(200, b"ok", [("X-Seen", "a"), ("X-Seen", "b")])
+        elif path == "/two-cookies":
+            self.send(200, b"ok", [("Set-Cookie", "a=1; Path=/"), ("Set-Cookie", "b=2; Path=/")])
+        elif path == "/login":
+            # A cookie set on a redirect must reach the page it redirects to.
+            self.send(302, b"", [("Set-Cookie", "auth=yes; Path=/"), ("Location", "/headers")])
         elif path == "/slow":
             time.sleep(2)
             self.send(200, b"late")
@@ -103,6 +108,13 @@ def test_repeated_headers_are_joined(base):
     assert netweir.get(f"{base}/twice").headers["x-seen"] == "a, b"
 
 
+def test_raw_headers_keep_every_set_cookie(base):
+    page = netweir.get(f"{base}/two-cookies")
+    cookies = [v for k, v in page.raw_headers if k == "set-cookie"]
+    assert cookies == ["a=1; Path=/", "b=2; Path=/"]
+    assert page.headers["set-cookie"] == "b=2; Path=/"
+
+
 def test_profile_headers_go_out_in_chrome_http1_order(base):
     sent = json.loads(netweir.get(f"{base}/headers").body)
     names = [k for k, _ in sent]
@@ -121,14 +133,22 @@ def test_caller_headers_override_and_extend(base):
         )
     )
     assert sent["Accept-Language"] == "de-DE"
-    assert sent["x-trace"] == "1"
+    # New headers keep the caller's capitalisation over HTTP/1.1.
+    assert sent["X-Trace"] == "1"
 
 
 async def test_client_keeps_cookies_between_requests(base):
     async with netweir.Client() as client:
         await client.get(f"{base}/set-cookie")
         sent = dict(json.loads((await client.get(f"{base}/headers")).body))
-    assert sent.get("Cookie") == "session=abc" or sent.get("cookie") == "session=abc"
+    assert sent["Cookie"] == "session=abc"
+
+
+async def test_cookies_set_on_a_redirect_reach_the_next_page(base):
+    async with netweir.Client() as client:
+        page = await client.get(f"{base}/login")
+    assert page.url == f"{base}/headers"
+    assert dict(json.loads(page.body))["Cookie"] == "auth=yes"
 
 
 async def test_get_many_is_concurrent_and_ordered(base):
@@ -170,6 +190,8 @@ def test_bad_arguments_raise_value_error():
         netweir.Client(profile="netscape")
     with pytest.raises(ValueError):
         netweir.Client(timeout=0)
+    with pytest.raises(ValueError):
+        netweir.Client(proxy="not a proxy")
     with pytest.raises(netweir.FetchError) as err:
         netweir.get("ftp://example.com/")
     assert err.value.kind == "invalid"

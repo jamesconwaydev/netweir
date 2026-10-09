@@ -39,9 +39,16 @@ class Page:
         return self._response.version
 
     @property
+    def raw_headers(self) -> list[tuple[str, str]]:
+        """Every header as (name, value), in the order received, repeats
+        included. Names are lowercase."""
+        return self._response.headers
+
+    @property
     def headers(self) -> dict[str, str]:
         """Lowercase names. A header sent more than once has its values
-        joined with ", ", except set-cookie, which keeps the last."""
+        joined with ", ", except set-cookie, which keeps the last; use
+        raw_headers for all of them."""
         out: dict[str, str] = {}
         for name, value in self._response.headers:
             if name in out and name != "set-cookie":
