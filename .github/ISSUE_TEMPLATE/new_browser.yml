@@ -1,0 +1,19 @@
+name: A browser has a new version
+description: Chrome, Firefox or Safari shipped a version netweir has no profile for.
+labels: [profiles]
+body:
+  - type: input
+    id: browser
+    attributes:
+      label: Browser and version
+      placeholder: Firefox 157
+    validations:
+      required: true
+  - type: textarea
+    id: notes
+    attributes:
+      label: Anything that changed
+      description: |
+        If you know of changes to its headers, TLS or HTTP/2 since the last
+        profile, note them here. A new profile is always written from a
+        fresh capture of the real browser.

@@ -31,7 +31,9 @@ dynamic = ["version"]
 netweir = "netweir._cli:main"
 
 [project.urls]
-Repository = "https://github.com/jamesconwaydev/netweir"
+Repository = "https://github.com/netweir/netweir"
+Documentation = "https://github.com/netweir/netweir/tree/main/docs"
+Issues = "https://github.com/netweir/netweir/issues"
 
 [dependency-groups]
 # pip only so editors that list packages with `python -m pip list` (VS

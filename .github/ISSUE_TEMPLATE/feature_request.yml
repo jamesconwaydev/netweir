@@ -1,0 +1,23 @@
+name: An idea
+description: Something netweir should do that it doesn't.
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: What you're trying to do
+      description: The job, not the feature. What's in your way today?
+    validations:
+      required: true
+  - type: textarea
+    id: idea
+    attributes:
+      label: What would help
+      description: How you'd like it to work, with a sketch of the code you'd write if you have one.
+    validations:
+      required: true
+  - type: textarea
+    id: elsewhere
+    attributes:
+      label: How others do it
+      description: If Scrapy, Playwright, Beautiful Soup or another tool already does this, how it looks there.

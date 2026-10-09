@@ -1,0 +1,48 @@
+name: A site can tell it's netweir
+description: A site blocks netweir, or a fingerprint checker sees something a real browser wouldn't send.
+labels: [fingerprint]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        netweir is meant to be indistinguishable from the browser its
+        profile names. If you've found a difference, this is where it goes.
+        Please keep to sites you're allowed to crawl.
+  - type: input
+    id: where
+    attributes:
+      label: Where
+      description: The site, or the checker (for example tls.peet.ws), that tells them apart.
+    validations:
+      required: true
+  - type: input
+    id: profile
+    attributes:
+      label: Profile
+      description: The `profile` setting, or "browser driver" if it's Chrome itself.
+      placeholder: chrome-154-macos
+    validations:
+      required: true
+  - type: textarea
+    id: difference
+    attributes:
+      label: What gives it away
+      description: |
+        If you know, what differs from the real browser: a header, its
+        order, the TLS or HTTP/2 fingerprint, a JavaScript property. A
+        block page's text or status helps too.
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: How to see it happen
+      render: python
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: netweir version
+    validations:
+      required: true

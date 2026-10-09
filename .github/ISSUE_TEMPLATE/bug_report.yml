@@ -1,0 +1,62 @@
+name: Something's broken
+description: netweir crashed, gave a wrong answer, or didn't do what the docs say.
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting it. The smaller the example that shows it, the
+        sooner it gets fixed.
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: And what you expected instead.
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: How to see it happen
+      description: |
+        The shortest code that shows the problem. If it needs a particular
+        site, say which, or save the page and attach it.
+      render: python
+    validations:
+      required: true
+  - type: textarea
+    id: output
+    attributes:
+      label: Error or output
+      description: The full traceback or log, if there is one.
+      render: text
+  - type: input
+    id: version
+    attributes:
+      label: netweir version
+      description: "`python -c \"import netweir; print(netweir.__version__)\"`"
+    validations:
+      required: true
+  - type: input
+    id: python
+    attributes:
+      label: Python version
+      placeholder: "3.14"
+    validations:
+      required: true
+  - type: dropdown
+    id: os
+    attributes:
+      label: Operating system
+      options:
+        - macOS
+        - Linux
+        - Windows
+        - Other
+    validations:
+      required: true
+  - type: input
+    id: chrome
+    attributes:
+      label: Chrome version
+      description: Only if the problem involves the browser driver.

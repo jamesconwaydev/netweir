@@ -6,7 +6,7 @@ members = ["crates/netweir-dom", "crates/netweir-core", "crates/netweir-browser"
 version = "0.1.0"
 edition = "2024"
 license = "AGPL-3.0-only"
-repository = "https://github.com/jamesconwaydev/netweir"
+repository = "https://github.com/netweir/netweir"
 rust-version = "1.88"
 
 [profile.release]
