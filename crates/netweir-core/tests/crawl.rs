@@ -658,7 +658,7 @@ async fn a_checkpoint_remembers_what_was_left() {
         assert_eq!(fetched(&drain(&c).await), [0, 1, 2]);
         // Only /a's page was dealt with before the "crash".
         c.done(&[0]);
-        c.flush();
+        c.flush().unwrap();
     }
     let c = crawler(with_checkpoint());
     let saved = c.saved().unwrap();
@@ -681,7 +681,7 @@ async fn a_checkpoint_remembers_what_was_left() {
     }
     assert_eq!(fetched(&drain(&c).await), [10, 11]);
     c.done(&[10, 11]);
-    c.flush();
+    c.flush().unwrap();
     drop(c);
     let c = crawler(with_checkpoint());
     assert!(c.saved().unwrap().pending.is_empty());

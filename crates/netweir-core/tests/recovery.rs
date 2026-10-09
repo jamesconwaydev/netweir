@@ -287,3 +287,58 @@ async fn without_the_throttle_good_responses_undo_a_blocks_delay() {
         "and it speeds up again: {last:?}"
     );
 }
+
+#[tokio::test]
+async fn a_429_doubles_the_delay_once_with_the_throttle_on() {
+    let site = Site::scripted(vec![(
+        "/a",
+        vec![Page::status(429, "slow down"), Page::html("ok")],
+    )])
+    .await;
+    let c = crawler(CrawlSettings {
+        throttle: true,
+        start_delay: Duration::from_millis(100),
+        ..settings()
+    });
+    c.submit(request(1, site.url("/a")));
+    drain(&c).await;
+    let t = site.times("/a");
+    let gap = t[1] - t[0];
+    // 100 ms doubled is below the half-second floor: 500 ms, not 1 s.
+    assert!(
+        gap >= Duration::from_millis(480) && gap < Duration::from_millis(800),
+        "{gap:?}"
+    );
+}
+
+#[tokio::test]
+async fn the_breaker_judges_after_a_few_responses_not_a_full_window() {
+    let pages: Vec<(String, Page)> = (0..12)
+        .map(|i| (format!("/p{i}"), cloudflare_block()))
+        .collect();
+    let site = Site::start(
+        pages
+            .iter()
+            .map(|(p, page)| (p.as_str(), page.clone()))
+            .collect(),
+    )
+    .await;
+    let c = crawler(CrawlSettings {
+        retries: 0,
+        per_domain: 1,
+        breaker_window: 50,
+        breaker_pause: Duration::from_millis(50),
+        max_delay: Duration::from_millis(5),
+        ..settings()
+    });
+    for i in 0..12 {
+        c.submit(request(i, site.url(&format!("/p{i}"))));
+    }
+    let events = drain(&c).await;
+    assert!(events.iter().any(|e| matches!(e, Event::Paused { .. })));
+    assert_eq!(
+        c.stats().sessions_replaced,
+        0,
+        "no retries, so no new sessions were needed"
+    );
+}

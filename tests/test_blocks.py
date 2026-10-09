@@ -119,7 +119,7 @@ def test_a_spider_hears_about_blocks_it_could_not_get_past(base):
     assert seen == [(f"{base}/datadome-captcha.http", "datadome", 403)]
     assert stats["items"] == 2, "on_block can yield items too"
     assert stats["blocked"] == 2 and stats["retries"] == 1
-    assert stats["sessions_replaced"] == 2
+    assert stats["sessions_replaced"] == 1, "a new session only for the one retry"
 
 
 def test_blocks_are_logged_by_default(base, caplog):

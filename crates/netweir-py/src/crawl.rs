@@ -946,10 +946,12 @@ impl Crawler {
         self.engine.core.save_counters(json);
     }
 
-    /// Waits until every checkpoint write so far is on disk.
-    fn flush(&self, py: Python<'_>) {
+    /// Waits until every checkpoint write so far is on disk. Raises OSError
+    /// if one of them failed.
+    fn flush(&self, py: Python<'_>) -> PyResult<()> {
         let engine = self.engine.clone();
-        py.detach(move || engine.core.flush());
+        py.detach(move || engine.core.flush())
+            .map_err(pyo3::exceptions::PyOSError::new_err)
     }
 
     /// Counters so far.

@@ -377,10 +377,12 @@ impl Crawler {
         }
     }
 
-    /// Waits until every checkpoint write so far is on disk.
-    pub fn flush(&self) {
-        if let Some(cp) = &self.shared.checkpoint {
-            cp.flush();
+    /// Waits until every checkpoint write so far is on disk; an error if
+    /// one of them failed.
+    pub fn flush(&self) -> Result<(), String> {
+        match &self.shared.checkpoint {
+            Some(cp) => cp.flush(),
+            None => Ok(()),
         }
     }
 
@@ -864,8 +866,10 @@ async fn fetch(shared: Arc<Shared>, mut q: Queued, session: Fetcher) {
     let event = match (result, outcome) {
         (Ok(Hop::Done(response)), Some(Outcome::Blocked { vendor, kind })) => {
             state.stats.blocked += 1;
-            new_session(&shared, &mut state, &q.host);
-            slow_down(settings, &mut state, &q.host, None);
+            if can_retry {
+                new_session(&shared, &mut state, &q.host);
+            }
+            slow_down(settings, &mut state, &q.host, None, true);
             if can_retry {
                 retry(settings, &mut state, q);
                 None
@@ -880,7 +884,15 @@ async fn fetch(shared: Arc<Shared>, mut q: Queued, session: Fetcher) {
         }
         (Ok(Hop::Done(response)), Some(Outcome::Throttled { retry_after })) => {
             state.stats.throttled += 1;
-            slow_down(settings, &mut state, &q.host, retry_after);
+            // With the throttle on, it has already doubled the delay for
+            // this 429.
+            slow_down(
+                settings,
+                &mut state,
+                &q.host,
+                retry_after,
+                !settings.throttle,
+            );
             if can_retry {
                 retry(settings, &mut state, q);
                 None
@@ -997,15 +1009,23 @@ fn random_fraction(salt: u64) -> f64 {
 /// Blocks and throttling count against a host's pace: its delay doubles
 /// (to at least half a second), and a Retry-After pushes its next request
 /// back.
-fn slow_down(settings: &CrawlSettings, state: &mut State, host: &str, wait: Option<Duration>) {
+fn slow_down(
+    settings: &CrawlSettings,
+    state: &mut State,
+    host: &str,
+    wait: Option<Duration>,
+    double: bool,
+) {
     let Some(h) = state.hosts.get_mut(host) else {
         return;
     };
-    h.delay = h
-        .delay
-        .saturating_mul(2)
-        .max(Duration::from_millis(500))
-        .min(settings.max_delay);
+    if double {
+        h.delay = h
+            .delay
+            .saturating_mul(2)
+            .max(Duration::from_millis(500))
+            .min(settings.max_delay);
+    }
     // From now, not from the host's next turn, which was set before.
     let wait = wait
         .unwrap_or_default()
@@ -1031,6 +1051,9 @@ fn new_session(shared: &Shared, state: &mut State, host: &str) {
     }
 }
 
+/// Responses the breaker needs to have seen from a host before it judges.
+const BREAKER_MIN_SEEN: usize = 10;
+
 /// Records whether the host's latest response was a block, and pauses the
 /// host when too many of its recent ones were.
 fn breaker(shared: &Shared, state: &mut State, host: &str, blocked: bool) {
@@ -1043,9 +1066,12 @@ fn breaker(shared: &Shared, state: &mut State, host: &str, blocked: bool) {
         h.recent.pop_front();
     }
     let blocks = h.recent.iter().filter(|b| **b).count();
+    // It judges once it has seen a few responses, not only once the window
+    // is full: a site that blocks from its first answer pauses quickly.
+    let enough = settings.breaker_window.min(BREAKER_MIN_SEEN);
     if settings.breaker_window == 0
-        || h.recent.len() < settings.breaker_window
-        || blocks as f64 <= settings.breaker_ratio * settings.breaker_window as f64
+        || h.recent.len() < enough
+        || blocks as f64 <= settings.breaker_ratio * h.recent.len() as f64
     {
         return;
     }

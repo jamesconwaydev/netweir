@@ -11,6 +11,7 @@
 use std::collections::HashSet;
 use std::path::Path;
 use std::sync::mpsc::{Receiver, Sender, channel};
+use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
@@ -63,6 +64,8 @@ enum Op {
 pub struct Checkpoint {
     ops: Option<Sender<Op>>,
     writer: Option<JoinHandle<()>>,
+    /// The first write that failed since the last flush.
+    failed: Arc<Mutex<Option<String>>>,
 }
 
 #[derive(Debug)]
@@ -143,14 +146,17 @@ impl Checkpoint {
         }
         let saved = read(&conn).map_err(sql)?;
         let (ops, inbox) = channel();
+        let failed = Arc::new(Mutex::new(None));
+        let writer_failed = failed.clone();
         let writer = std::thread::Builder::new()
             .name("netweir-checkpoint".into())
-            .spawn(move || write_loop(conn, inbox))
+            .spawn(move || write_loop(conn, inbox, writer_failed))
             .map_err(|e| CheckpointError(format!("can't start the checkpoint writer: {e}")))?;
         Ok((
             Checkpoint {
                 ops: Some(ops),
                 writer: Some(writer),
+                failed,
             },
             saved,
         ))
@@ -190,11 +196,17 @@ impl Checkpoint {
         self.send(Op::Settle(items, counters));
     }
 
-    /// Waits until everything queued so far is committed.
-    pub fn flush(&self) {
+    /// Waits until everything queued so far is committed. An error if a
+    /// write since the last flush failed; that batch is not in the file,
+    /// so a resume would do its work again.
+    pub fn flush(&self) -> Result<(), String> {
         let (tx, rx) = channel();
         self.send(Op::Flush(tx));
         let _ = rx.recv();
+        match self.failed.lock().unwrap_or_else(|e| e.into_inner()).take() {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
     }
 }
 
@@ -250,7 +262,7 @@ fn read(conn: &Connection) -> rusqlite::Result<Saved> {
 }
 
 /// Commits the queued writes in order, a batch per transaction.
-fn write_loop(mut conn: Connection, inbox: Receiver<Op>) {
+fn write_loop(mut conn: Connection, inbox: Receiver<Op>, failed: Arc<Mutex<Option<String>>>) {
     // Waits for the first write, then takes whatever else arrives within
     // this long, so a busy crawl commits in batches rather than per row.
     const GATHER: Duration = Duration::from_millis(50);
@@ -264,23 +276,27 @@ fn write_loop(mut conn: Connection, inbox: Receiver<Op>) {
                 Err(_) => break,
             }
         }
-        let mut replies = Vec::new();
-        if let Err(e) = commit(&mut conn, batch, &mut replies) {
-            // Nothing sensible to do mid-crawl but say so; the crawl goes
-            // on, and a resume would fetch these again.
-            eprintln!("netweir: checkpoint write failed: {e}");
+        // Flushes are answered after the commit's result is known, even
+        // when it fails part way.
+        let (flushes, writes): (Vec<Op>, Vec<Op>) =
+            batch.into_iter().partition(|op| matches!(op, Op::Flush(_)));
+        if let Err(e) = commit(&mut conn, writes) {
+            // The crawl goes on; the next flush reports it, and a resume
+            // would do this batch's work again.
+            failed
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get_or_insert_with(|| format!("checkpoint write failed: {e}"));
         }
-        for reply in replies {
-            let _ = reply.send(());
+        for op in flushes {
+            if let Op::Flush(reply) = op {
+                let _ = reply.send(());
+            }
         }
     }
 }
 
-fn commit(
-    conn: &mut Connection,
-    batch: Vec<Op>,
-    replies: &mut Vec<Sender<()>>,
-) -> rusqlite::Result<()> {
+fn commit(conn: &mut Connection, batch: Vec<Op>) -> rusqlite::Result<()> {
     let tx = conn.transaction()?;
     {
         let mut request = tx.prepare_cached(
@@ -326,7 +342,7 @@ fn commit(
                     }
                     counters.execute(params![json])?;
                 }
-                Op::Flush(reply) => replies.push(reply),
+                Op::Flush(_) => {}
             }
         }
     }
@@ -372,6 +388,25 @@ mod tests {
         assert_eq!(saved.counters.as_deref(), Some(r#"{"items":1}"#));
         assert_eq!(saved.next_row, 3);
         drop(_cp);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_failed_write_is_reported_by_flush() {
+        let dir = std::env::temp_dir().join(format!("netweir-cp-fail-{}", std::process::id()));
+        let path = dir.join("crawl.sqlite3");
+        let _ = std::fs::remove_dir_all(&dir);
+        let (cp, _) = Checkpoint::open(&path).unwrap();
+        cp.flush().unwrap();
+        Connection::open(&path)
+            .unwrap()
+            .execute("DROP TABLE requests", [])
+            .unwrap();
+        cp.request(pending(1, "https://e.com/a"));
+        let err = cp.flush().unwrap_err();
+        assert!(err.contains("requests"), "{err}");
+        assert!(cp.flush().is_ok(), "reported once");
+        drop(cp);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
