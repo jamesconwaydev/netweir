@@ -15,6 +15,7 @@ from netweir._native import (
     Selection,
     SelectorError,
     XPathError,
+    __version__,
     parse,
 )
 from netweir._request import Request
@@ -41,6 +42,7 @@ __all__ = [
     "Selection",
     "SelectorError",
     "XPathError",
+    "__version__",
     "browser",
     "css",
     "export",
