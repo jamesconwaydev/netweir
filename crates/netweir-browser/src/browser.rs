@@ -165,15 +165,26 @@ impl Browser {
         } else {
             url.to_string()
         };
-        let (socket, _) = tokio::time::timeout(
-            Duration::from_secs(30),
-            tokio_tungstenite::connect_async(ws.as_str()),
-        )
-        .await
-        .map_err(|_| Error::Launch(format!("{ws} didn't answer in 30 seconds")))?
-        .map_err(|e| Error::Launch(format!("can't connect to {ws}: {e}")))?;
+        let late = || Error::Launch(format!("{ws} didn't answer in 30 seconds"));
+        let refused = |e: String| Error::Launch(format!("can't connect to {ws}: {e}"));
+        let conn = if ws.starts_with("wss://") {
+            let socket = tokio::time::timeout(Duration::from_secs(30), secure_websocket(&ws))
+                .await
+                .map_err(|_| late())?
+                .map_err(refused)?;
+            Connection::over_websocket(socket)
+        } else {
+            let (socket, _) = tokio::time::timeout(
+                Duration::from_secs(30),
+                tokio_tungstenite::connect_async(ws.as_str()),
+            )
+            .await
+            .map_err(|_| late())?
+            .map_err(|e| refused(e.to_string()))?;
+            Connection::over_websocket(socket)
+        };
         let inner = Inner {
-            conn: Connection::over_websocket(socket),
+            conn,
             child: Mutex::new(None),
             profile: None,
             contexts: Mutex::default(),
@@ -528,6 +539,64 @@ async fn headless_identity(executable: &Path) -> Result<(String, Value)> {
         .get_or_insert_with(HashMap::new)
         .insert(executable.to_path_buf(), known.clone());
     Ok(known)
+}
+
+/// A `wss://` WebSocket over BoringSSL, the TLS library netweir's HTTP
+/// client uses, trusting the roots Chrome trusts.
+async fn secure_websocket(
+    url: &str,
+) -> std::result::Result<
+    tokio_tungstenite::WebSocketStream<tokio_btls::SslStream<tokio::net::TcpStream>>,
+    String,
+> {
+    use btls::ssl::{SslConnector, SslMethod};
+    use btls::x509::X509;
+    use btls::x509::store::X509StoreBuilder;
+
+    let authority = url
+        .trim_start_matches("wss://")
+        .split('/')
+        .next()
+        .unwrap_or_default();
+    let (host, port) = match authority.rsplit_once(':') {
+        Some((host, port)) if !host.ends_with(']') || authority.starts_with('[') => {
+            (host, port.parse::<u16>().map_err(|e| e.to_string())?)
+        }
+        _ => (authority, 443),
+    };
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    let tcp = tokio::net::TcpStream::connect((host, port))
+        .await
+        .map_err(|e| e.to_string())?;
+    static ROOTS: std::sync::LazyLock<Vec<X509>> = std::sync::LazyLock::new(|| {
+        chromium_roots::TLS_SERVER_ROOT_CERTS
+            .iter()
+            .filter_map(|der| X509::from_der(der.as_ref()).ok())
+            .collect()
+    });
+    let mut store = X509StoreBuilder::new().map_err(|e| e.to_string())?;
+    for root in ROOTS.iter() {
+        store.add_cert(root).map_err(|e| e.to_string())?;
+    }
+    let mut connector = SslConnector::builder(SslMethod::tls()).map_err(|e| e.to_string())?;
+    connector.set_cert_store(store.build());
+    let ssl = connector
+        .build()
+        .configure()
+        .and_then(|c| c.into_ssl(host))
+        .map_err(|e| e.to_string())?;
+    let mut tls = tokio_btls::SslStream::new(ssl, tcp).map_err(|e| e.to_string())?;
+    std::pin::Pin::new(&mut tls)
+        .connect()
+        .await
+        .map_err(|e| match tls.ssl().verify_result() {
+            Err(why) => format!("the certificate wasn't trusted: {}", why.error_string()),
+            Ok(()) => e.to_string(),
+        })?;
+    let (socket, _) = tokio_tungstenite::client_async(url, tls)
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(socket)
 }
 
 /// The WebSocket URL a browser's `http://host:port/json/version` names.

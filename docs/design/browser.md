@@ -275,8 +275,9 @@ instead, which is lighter but easier to tell from a real browser.
 
 **Connecting to a running browser.** `netweir.browser(connect=url)` drives
 a Chrome that's already running, or anything else that speaks CDP, over
-a WebSocket: a `ws://` URL as Chrome prints it, or an `http://host:port`
-whose `/json/version` names one. Nothing is launched, so there's no
+a WebSocket: a `ws://` URL as Chrome prints it, an `http://host:port`
+whose `/json/version` names one, or a `wss://` URL, over BoringSSL (the
+TLS library the HTTP client uses) checked against Chrome's root store. Nothing is launched, so there's no
 profile to remove; closing the Browser closes the pages it opened and
 disconnects, leaving the browser running.
 

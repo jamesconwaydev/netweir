@@ -183,3 +183,38 @@ async fn a_refusal_from_devtools_is_shown_as_it_was_given() {
         .unwrap();
     assert!(err.to_string().contains("Host header"), "{err}");
 }
+
+/// A TLS server with a self-signed certificate, which no browser trusts.
+fn untrusted_tls() -> u16 {
+    use btls::pkey::PKey;
+    use btls::ssl::{SslAcceptor, SslMethod};
+    use btls::x509::X509;
+    let made = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+    let cert = X509::from_pem(made.cert.pem().as_bytes()).unwrap();
+    let key = PKey::private_key_from_pem(made.signing_key.serialize_pem().as_bytes()).unwrap();
+    let mut acceptor = SslAcceptor::mozilla_intermediate(SslMethod::tls()).unwrap();
+    acceptor.set_certificate(&cert).unwrap();
+    acceptor.set_private_key(&key).unwrap();
+    let acceptor = acceptor.build();
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        for stream in listener.incoming().flatten() {
+            let _ = acceptor.accept(stream);
+        }
+    });
+    port
+}
+
+#[tokio::test]
+async fn wss_checks_the_certificate() {
+    let port = untrusted_tls();
+    let err = Browser::connect(
+        &format!("wss://localhost:{port}/devtools/browser/x"),
+        LaunchOptions::default(),
+    )
+    .await
+    .err()
+    .unwrap();
+    assert!(err.to_string().contains("certificate"), "{err}");
+}

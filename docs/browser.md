@@ -68,8 +68,8 @@ netweir asks it for the URL; Chrome only answers that when `host` is an IP
 address or `localhost`, so for one in Docker, say, use the `ws://` URL.
 Nothing is launched, so `executable`, `args`, `proxy` and `headless`
 don't apply. Closing the browser, or dropping it, closes the pages
-netweir opened and leaves the browser running. Plain `ws://` only for now,
-not `wss://`.
+netweir opened and leaves the browser running. A `wss://` URL works too:
+its certificate is checked against the roots Chrome trusts.
 
 ## Pages and contexts
 

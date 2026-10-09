@@ -9,9 +9,12 @@ publish = false
 
 [dependencies]
 base64 = "0.23"
+btls = "0.5.6"
+chromium-roots = "0.1.1"
 futures-util = { version = "0.3.34", default-features = false, features = ["sink"] }
 serde_json = "1"
 tokio = { version = "1", features = ["rt", "sync", "time", "macros", "net", "io-util"] }
+tokio-btls = "0.5.6"
 tokio-tungstenite = { version = "0.30.0", default-features = false, features = ["connect"] }
 
 [target.'cfg(unix)'.dependencies]
@@ -24,4 +27,5 @@ windows-sys = { version = "0.61", features = ["Win32_Foundation"] }
 libc = "0.2"
 
 [dev-dependencies]
+rcgen = "0.14"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }

@@ -1152,10 +1152,14 @@ name = "netweir-browser"
 version = "0.1.0"
 dependencies = [
  "base64",
+ "btls",
+ "chromium-roots",
  "futures-util",
  "libc",
+ "rcgen",
  "serde_json",
  "tokio",
+ "tokio-btls",
  "tokio-tungstenite",
  "windows-sys 0.61.2",
 ]
