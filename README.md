@@ -2,13 +2,13 @@
 
 A web scraping library for Python, with the heavy lifting done in Rust.
 
-This is early. What works today is the parser: hand it a page, ask for what
-you want with CSS, get strings back.
+This is early. What works today is fetching and parsing: ask for a page,
+get it back the way Chrome would have, and pull out what you want with CSS.
 
 ```python
 import netweir
 
-page = netweir.parse(html)
+page = netweir.get("https://books.toscrape.com/")
 
 page.css("h1::text").get()  # "All products"
 page.css(".price_color::text").getall()  # ["£51.77", "£53.74", ...]
@@ -19,7 +19,37 @@ for book in page.css("article.product_pod"):
 ```
 
 If you've used Scrapy, `::text`, `::attr()`, `get()` and `getall()` mean what
-you think they mean.
+you think they mean. Already have the HTML? `netweir.parse(html)` skips the
+request and gives you something you query the same way.
+
+## Looking like a browser
+
+Most sites don't block scrapers by reading their code. They block them by
+the first few hundred bytes of the connection: which TLS ciphers and
+extensions arrive, what the HTTP/2 settings frame says, which headers come
+first. A Python HTTP library gives itself away before it has
+asked for anything.
+
+netweir sends what Chrome 154 sends. Not something close to it: the same
+ClientHello, the same HTTP/2 settings and priorities, the same headers in
+the same order and the same capitalisation over HTTP/1.1. You don't have to
+take that on trust. `cargo test -p netweir-core` connects to a local server
+that records every byte of the handshake, and the test fails if anything
+differs from what real Chrome sent that server. The public checker at
+tls.peet.ws reports the same JA4 fingerprint for both:
+`t13d1517h2_8daaf6152771_cb7bf5808d99`.
+
+For many pages at once, use a client. It keeps connections and cookies
+between requests, and the requests run concurrently in Rust:
+
+```python
+async with netweir.Client(proxy="http://user:pass@proxy:8080") as client:
+    pages = await client.get_many(urls)
+```
+
+A request that fails before any response arrives raises `netweir.FetchError`,
+and its `kind` says why: `"timeout"`, `"connect"`, `"tls"` and so on. A 404 is
+still a page; check `page.status`.
 
 ## Why it's fast
 
@@ -56,7 +86,7 @@ parser allocate gigabytes; a cap on that comes with the crawler.
 
 ## Building
 
-You need Rust, a C compiler and [uv](https://docs.astral.sh/uv/).
+You need Rust, a C compiler, CMake and [uv](https://docs.astral.sh/uv/).
 
 ```
 git clone --recurse-submodules https://github.com/jamesconwaydev/netweir
@@ -70,3 +100,6 @@ uv run pytest
 
 AGPL-3.0. If that doesn't work for your company, a commercial licence is
 available. See NOTICE for the licences of what netweir bundles.
+
+Please use it the way you'd want your own site scraped. netweir obeys
+robots.txt once crawling lands; until then, that's on you.
