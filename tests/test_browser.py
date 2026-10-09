@@ -82,7 +82,7 @@ def base():
 @pytest.fixture
 async def browser():
     try:
-        b = await netweir.browser(timeout=10)
+        b = await netweir.browser(timeout=30)
     except netweir.BrowserError as e:
         if "no Chrome found" in str(e) and not os.environ.get("NETWEIR_REQUIRE_CHROME"):
             pytest.skip(str(e))

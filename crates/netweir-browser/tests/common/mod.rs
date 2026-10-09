@@ -118,7 +118,10 @@ pub async fn browser() -> Option<netweir_browser::Browser> {
     Some(
         netweir_browser::Browser::launch(netweir_browser::LaunchOptions {
             executable: Some(executable),
-            timeout: std::time::Duration::from_secs(10),
+            // Generous: the tests start a Chrome each, all at once, and a
+            // small CI runner can take many seconds over a page. Tests
+            // that expect a timeout set a short one themselves.
+            timeout: std::time::Duration::from_secs(30),
             ..Default::default()
         })
         .await
