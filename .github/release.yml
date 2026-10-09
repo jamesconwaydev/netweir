@@ -1,0 +1,13 @@
+# How a release's generated notes group the pull requests in it.
+changelog:
+  categories:
+    - title: New
+      labels: [enhancement]
+    - title: Fixed
+      labels: [bug]
+    - title: Browser profiles
+      labels: [profiles, fingerprint]
+    - title: Dependencies
+      labels: [dependencies]
+    - title: Everything else
+      labels: ["*"]
