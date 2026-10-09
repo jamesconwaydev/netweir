@@ -1,4 +1,4 @@
-use std::ffi::{c_char, c_void};
+use std::ffi::{c_char, c_int, c_void};
 use std::fmt;
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -120,11 +120,26 @@ fn parse_in_chunks(html: &str, budget: Duration, chunk: usize) -> Result<Documen
         rest = tail;
     }
     assert_eq!(
-        unsafe { ffi::nw_chunk_end(doc.raw) },
+        unsafe { ffi::nw_chunk_end(doc.raw, has_template(html) as c_int) },
         0,
         "lexbor failed to allocate while parsing"
     );
     Ok(doc)
+}
+
+/// Whether `html` has a `<template` tag, in any case: the only way a
+/// template gets into a parsed document.
+fn has_template(html: &str) -> bool {
+    // Faster than checking every `<`, of which a page has hundreds of
+    // thousands; `<te` in each case is rare.
+    let bytes = html.as_bytes();
+    [b"<te", b"<tE", b"<Te", b"<TE"].iter().any(|start| {
+        memchr::memmem::find_iter(bytes, start).any(|i| {
+            bytes
+                .get(i + 1..i + 9)
+                .is_some_and(|name| name.eq_ignore_ascii_case(b"template"))
+        })
+    })
 }
 
 /// Returned by [`Document::parse_within`] when parsing ran out of time.

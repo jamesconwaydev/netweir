@@ -62,11 +62,15 @@ static void nw_adopt_templates(lxb_dom_node_t *root) {
     }
 }
 
-int nw_chunk_end(lxb_html_document_t *doc) {
+/* `templates` is whether the markup has a <template> tag at all: the walk
+ * visits every node, which on a large page is a tenth of the parse. */
+int nw_chunk_end(lxb_html_document_t *doc, int templates) {
     if (lxb_html_document_parse_chunk_end(doc) != LXB_STATUS_OK) {
         return -1;
     }
-    nw_adopt_templates(lxb_dom_interface_node(doc));
+    if (templates) {
+        nw_adopt_templates(lxb_dom_interface_node(doc));
+    }
     return 0;
 }
 

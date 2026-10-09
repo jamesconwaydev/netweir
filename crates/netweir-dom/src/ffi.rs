@@ -36,7 +36,7 @@ pub const DOCTYPE: c_int = 0x0A;
 unsafe extern "C" {
     pub fn nw_chunk_begin() -> *mut RawDocument;
     pub fn nw_chunk(doc: *mut RawDocument, html: *const c_char, len: usize) -> c_int;
-    pub fn nw_chunk_end(doc: *mut RawDocument) -> c_int;
+    pub fn nw_chunk_end(doc: *mut RawDocument, templates: c_int) -> c_int;
     pub fn nw_destroy(doc: *mut RawDocument);
     pub fn nw_root(doc: *mut RawDocument) -> *mut RawNode;
 

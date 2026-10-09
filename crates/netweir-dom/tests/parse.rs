@@ -243,6 +243,21 @@ fn readable_text_leaves_out_code() {
 }
 
 #[test]
+fn templates_are_found_whatever_their_case_and_wherever_a_chunk_ends() {
+    // Long enough to be parsed in several chunks, with the tag across a
+    // chunk boundary.
+    let pad = "x".repeat(16 * 1024 - 6);
+    let html = format!("<div>{pad}<TeMpLaTe><p>in</p></TEMPLATE></div>");
+    let doc = Document::parse(&html);
+    let p = doc
+        .root()
+        .descendants()
+        .find(|n| n.tag() == Some("p"))
+        .unwrap();
+    assert_eq!(p.parent().and_then(|t| t.tag()), Some("template"));
+}
+
+#[test]
 fn template_contents_are_the_templates_children() {
     let html =
         "<div>a<template><p class=x>in</p>tx<template><i>deep</i></template></template>b</div>";
