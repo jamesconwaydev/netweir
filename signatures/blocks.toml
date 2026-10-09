@@ -10,7 +10,8 @@
 #
 # Signatures are tried most reliable first: those with a header, then a
 # cookie, then a body marker, then status alone. Body markers always come
-# with a status, or a page about bot detection would count as a block.
+# with a status, a header or a cookie, or a page about bot detection would
+# count as a block. Header values are matched ignoring case.
 #
 # kind is challenge (solvable in a browser), captcha, block or rate_limit.
 # Each vendor has a fixture in crates/netweir-core/tests/fixtures/blocks.
@@ -70,17 +71,20 @@ kind = "challenge"
 status = [429]
 header = { name = "x-kpsdk-ct" }
 
+# Imperva serves x-iinfo, its cookies and an _Incapsula_Resource script on
+# every page it fronts; only the challenge iframe (CWUDNSAI) and the incident
+# text mark a block.
 [[signature]]
 vendor = "imperva"
 kind = "block"
 header = { name = "x-iinfo" }
-body = ["Incapsula incident ID", "_Incapsula_Resource"]
+body = ["Incapsula incident ID", "_Incapsula_Resource?CWUDNSAI="]
 
 [[signature]]
 vendor = "imperva"
 kind = "block"
 cookies = ["visid_incap_", "incap_ses_"]
-body = ["Incapsula incident ID", "_Incapsula_Resource"]
+body = ["Incapsula incident ID", "_Incapsula_Resource?CWUDNSAI="]
 
 [[signature]]
 vendor = "human"

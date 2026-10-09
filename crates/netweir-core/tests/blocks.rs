@@ -88,6 +88,7 @@ fn every_fixture_is_classified_as_it_should_be() {
             blocked("aws-waf", BlockKind::Captcha),
         ),
         ("ok-behind-cloudflare.http", Outcome::Ok),
+        ("ok-behind-imperva.http", Outcome::Ok),
         ("ok-mentions-vendors.http", Outcome::Ok),
         ("not-found.http", Outcome::HttpError(404)),
         ("forbidden-plain.http", Outcome::HttpError(403)),
@@ -151,4 +152,15 @@ fn a_proxy_adding_its_own_server_header_hides_nothing() {
     let mut r = load("cloudflare-block.http");
     r.headers.insert(0, ("server".into(), "envoy".into()));
     assert_eq!(classify(&r), blocked("cloudflare", BlockKind::Block));
+}
+
+#[test]
+fn header_values_match_in_any_case() {
+    let mut r = load("cloudflare-challenge-header.http");
+    for (k, v) in r.headers.iter_mut() {
+        if k == "cf-mitigated" {
+            *v = "Challenge".into();
+        }
+    }
+    assert_eq!(classify(&r), blocked("cloudflare", BlockKind::Challenge));
 }

@@ -113,7 +113,7 @@ impl Signature {
                     && rule
                         .contains
                         .as_ref()
-                        .is_none_or(|c| v.contains(c.as_str()))
+                        .is_none_or(|c| v.to_ascii_lowercase().contains(&c.to_ascii_lowercase()))
             });
             if !found {
                 return false;

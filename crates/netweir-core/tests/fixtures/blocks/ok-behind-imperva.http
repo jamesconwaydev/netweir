@@ -1,0 +1,7 @@
+HTTP/1.1 200 OK
+x-iinfo: 9-1234567-1234568 NNNN CT(0 0 0) RT(1728450000000 0) q(0 0 0 -1) r(0 0) U5
+set-cookie: visid_incap_1234567=AbCdEf0123; expires=Thu, 09 Oct 2027 00:00:00 GMT; path=/; Domain=.example.com
+set-cookie: incap_ses_123_1234567=XyZ012; path=/; Domain=.example.com
+content-type: text/html
+
+<html><head><title>Shop</title></head><body><h1>All products</h1><p class="price">£24.99</p><script type="text/javascript" src="/_Incapsula_Resource?SWJIYLWA=719d34d31c8e3a6e6fffd425f7e032f3"></script></body></html>
