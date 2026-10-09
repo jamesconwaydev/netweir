@@ -4,6 +4,7 @@ on:
   push:
     branches: [main]
   pull_request:
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
@@ -34,6 +35,9 @@ jobs:
         os: [ubuntu-latest, macos-latest, windows-latest]
         python: ["3.10", "3.14", "3.14t"]
     runs-on: ${{ matrix.os }}
+    env:
+      # The runners come with Chrome, so the browser tests run, not skip.
+      NETWEIR_REQUIRE_CHROME: "1"
     steps:
       - uses: actions/checkout@v7
         with:

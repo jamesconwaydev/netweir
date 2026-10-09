@@ -37,9 +37,12 @@ Working today:
 - Self-healing: block pages recognised and recovered from, crawls that
   resume after a crash, and selectors that find their element again after
   a redesign.
+- A Chrome driver for pages that need JavaScript: click, type and wait
+  like Playwright, then read the page with netweir's selectors.
 
-Coming next, in order: a Safari profile and the 0.1 release; then a
-browser driver. The design is in [docs/design/v0.1.md](docs/design/v0.1.md).
+Coming next, in order: a Safari profile and the 0.1 release; a browser
+that steps in when a crawl gets blocked; then Firefox in the driver. The
+designs are in [docs/design/](docs/design/).
 
 ## Quick look
 
@@ -338,6 +341,32 @@ netweir.parse(html, timeout=2.0)  # raises netweir.ParseTimeout
 The timeout bounds time, not memory. A small page built to abuse the HTML5
 spec's rules for misnested formatting tags can still make any spec-compliant
 parser allocate gigabytes; a cap on that comes with the crawler.
+
+## When a page needs a real browser
+
+Some pages are empty until their JavaScript runs. For those, netweir
+drives Chrome, and you get the rendered page back as the same `Node` you'd
+get from a fetch:
+
+```python
+async with netweir.browser() as browser:
+    page = await browser.new_page()
+    await page.goto("https://quotes.toscrape.com/js/")
+    await page.click("li.next a")
+    root = await page.parse()
+    quotes = root.css("span.text::text").getall()
+```
+
+There's no `sleep` in that, and there doesn't need to be. A click waits
+until its button exists, is visible, has stopped moving, is enabled and
+isn't covered by a cookie banner, and if it never gets there, the error
+tells you which of those it was.
+
+A driven Chrome normally gives itself away: `navigator.webdriver` is true,
+the user agent says `HeadlessChrome`, and the usual drivers switch on
+DevTools features that page scripts can notice. netweir doesn't do any of
+that. A test serves a page that looks for each of these and fails if it
+finds one. [docs/browser.md](docs/browser.md) has the rest.
 
 ## Documentation
 

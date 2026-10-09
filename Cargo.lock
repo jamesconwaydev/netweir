@@ -1198,6 +1198,7 @@ name = "netweir-py"
 version = "0.1.0"
 dependencies = [
  "csv",
+ "netweir-browser",
  "netweir-core",
  "netweir-dom",
  "parquet",

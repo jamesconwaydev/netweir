@@ -1,6 +1,7 @@
 //! Python bindings. Kept thin: anything that could live in netweir-dom or
 //! netweir-core does.
 
+mod browser;
 mod crawl;
 mod export;
 mod fetch;
@@ -81,6 +82,7 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("SelectorError", m.py().get_type::<SelectorError>())?;
     m.add("XPathError", m.py().get_type::<XPathError>())?;
     m.add("ParseTimeout", m.py().get_type::<ParseTimeout>())?;
+    browser::register(m)?;
     fetch::register(m)?;
     crawl::register(m)?;
     export::register(m)?;

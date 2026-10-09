@@ -25,3 +25,13 @@ class Blocked(Exception):
         self.vendor = vendor
         self.kind = kind
         self.page = page
+
+
+class BrowserError(Exception):
+    """Chrome couldn't be started, closed under a page, or a script in the
+    page threw."""
+
+
+class BrowserTimeout(BrowserError, TimeoutError):
+    """A navigation or an action ran out of time. The message says what
+    never happened, such as the element never becoming visible."""

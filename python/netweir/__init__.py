@@ -1,15 +1,33 @@
 """Fast web scraping with a Rust engine."""
 
 from netweir import export, repair
+from netweir._browser import browser
 from netweir._crawl import Settings, Spider
-from netweir._errors import Blocked, FetchError
+from netweir._errors import Blocked, BrowserError, BrowserTimeout, FetchError
 from netweir._fetch import Client, Page, get
-from netweir._native import Node, ParseTimeout, Selection, SelectorError, XPathError, parse
+from netweir._native import (
+    Browser,
+    BrowserContext,
+    BrowserPage,
+    BrowserResponse,
+    Node,
+    ParseTimeout,
+    Selection,
+    SelectorError,
+    XPathError,
+    parse,
+)
 from netweir._request import Request
 from netweir._rules import Follow, Item, css, xpath
 
 __all__ = [
     "Blocked",
+    "Browser",
+    "BrowserContext",
+    "BrowserError",
+    "BrowserPage",
+    "BrowserResponse",
+    "BrowserTimeout",
     "Client",
     "Follow",
     "Item",
@@ -23,8 +41,9 @@ __all__ = [
     "Selection",
     "SelectorError",
     "XPathError",
-    "export",
+    "browser",
     "css",
+    "export",
     "get",
     "parse",
     "repair",

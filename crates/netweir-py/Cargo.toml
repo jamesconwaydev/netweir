@@ -11,6 +11,7 @@ crate-type = ["cdylib"]
 
 [dependencies]
 csv = "1"
+netweir-browser = { path = "../netweir-browser" }
 netweir-core = { path = "../netweir-core" }
 netweir-dom = { path = "../netweir-dom" }
 parquet = { version = "60", default-features = false, features = ["snap"] }
