@@ -166,3 +166,66 @@ fn what_can_be_tracked() {
     assert!(Tracker::new("x", "css", "a[title='a, b']::text").is_ok());
     assert!(Tracker::new("x", "xpath", "//a/@href").is_ok());
 }
+
+fn product(title: &str, price: &str, class: &str) -> String {
+    format!(
+        "<html><body><main><h1>{title}</h1><p class=\"{class}\">{price}</p>\
+         <p class=\"stock\">In stock</p></main></body></html>"
+    )
+}
+
+#[test]
+fn across_a_crawl_varying_text_does_not_stop_relocation() {
+    let memory = Memory::default();
+    let ctx = TrackContext {
+        tracks: &memory,
+        site: "shop",
+        threshold: THRESHOLD,
+    };
+    let tracker = Tracker::new("price", "css", "p.price_color::text").unwrap();
+    // Two ordinary product pages teach it that the text and the title before
+    // the price change from page to page.
+    for (title, price) in [("Blue Kettle", "£24.99"), ("Red Toaster", "£31.50")] {
+        let doc = Document::parse(&product(title, price, "price_color"));
+        assert_eq!(tracker.run(doc.root(), &ctx).unwrap().1, Tracking::Matched);
+    }
+    // After a redesign, a third product, with another price.
+    let doc = Document::parse(&product("Green Mug", "£8.75", "ProductPrice"));
+    let (hits, tracking) = tracker.run(doc.root(), &ctx).unwrap();
+    assert_eq!(values(&hits), ["£8.75"]);
+    assert!(matches!(tracking, Tracking::Relocated(_)), "{tracking:?}");
+}
+
+#[test]
+fn relocation_is_quick_on_a_big_page() {
+    let mut html = String::from("<html><body>");
+    for i in 0..18_000 {
+        html.push_str(&format!("<div class=\"c{}\">cell {i}</div>", i % 7));
+    }
+    html.push_str("<div id=\"target\" class=\"special\">Target text</div></body></html>");
+    let doc = Document::parse(&html);
+    let el = Query::new("#target").unwrap().select(doc.root())[0];
+    let fp = Fingerprint::of(el);
+    let page = Document::parse(&html.replace("id=\"target\" class=\"special\"", ""));
+    let start = std::time::Instant::now();
+    let _ = netweir_dom::track::best(page.root(), &fp);
+    assert!(
+        start.elapsed() < std::time::Duration::from_secs(3),
+        "{:?}",
+        start.elapsed()
+    );
+}
+
+#[test]
+fn a_tracked_query_must_find_elements() {
+    let memory = Memory::default();
+    let ctx = TrackContext {
+        tracks: &memory,
+        site: "s",
+        threshold: THRESHOLD,
+    };
+    let doc = Document::parse("<p>a</p><p>b</p>");
+    let tracker = Tracker::new("x", "xpath", "//p/text()[1]").unwrap();
+    let err = tracker.run(doc.root(), &ctx).err().unwrap();
+    assert!(err.contains("element"), "{err}");
+}

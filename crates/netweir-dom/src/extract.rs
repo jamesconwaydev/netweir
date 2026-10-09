@@ -7,7 +7,7 @@ use std::sync::LazyLock;
 
 use crate::document::{Node, NodeKind};
 use crate::query::{Hit, Query};
-use crate::track::{Fingerprint, best};
+use crate::track::{Fingerprint, best, still_repeated};
 use crate::xpath::XPath;
 
 /// A compiled CSS (with `::text`/`::attr()`) or XPath query.
@@ -324,12 +324,23 @@ impl Tracker {
         &self.name
     }
 
-    /// The first element the query's element part finds below `scope`.
+    /// The first element the query's element part finds below `scope`. A
+    /// query that finds things but no element (`//p/text()[1]`) can't be
+    /// followed, and says so.
     pub fn first_element<'a>(&self, scope: Node<'a>) -> Result<Option<Node<'a>>, String> {
-        Ok(self.element.hits(scope)?.into_iter().find_map(|h| match h {
+        let hits = self.element.hits(scope)?;
+        let found = !hits.is_empty();
+        match hits.into_iter().find_map(|h| match h {
             Hit::Node(n) if n.kind() == NodeKind::Element => Some(n),
             _ => None,
-        }))
+        }) {
+            None if found => Err(format!(
+                "track={:?} needs a query that finds an element, with at most an ending \
+                 such as ::text or /text() after it",
+                self.name
+            )),
+            other => Ok(other),
+        }
     }
 
     /// The query's results below `scope`. When the element is there, its
@@ -340,8 +351,15 @@ impl Tracker {
         ctx: &TrackContext<'_>,
     ) -> Result<(Vec<Hit<'a>>, Tracking), String> {
         if let Some(element) = self.first_element(scope)? {
-            ctx.tracks
-                .put(ctx.site, &self.name, &Fingerprint::of(element).to_json());
+            let mut fp = Fingerprint::of(element);
+            if let Some(previous) = ctx
+                .tracks
+                .get(ctx.site, &self.name)
+                .and_then(|json| Fingerprint::from_json(&json))
+            {
+                fp.learn_from(&previous);
+            }
+            ctx.tracks.put(ctx.site, &self.name, &fp.to_json());
             return Ok((self.full.hits(scope)?, Tracking::Matched));
         }
         let Some(fp) = ctx
@@ -351,6 +369,9 @@ impl Tracker {
         else {
             return Ok((Vec::new(), Tracking::Unknown));
         };
+        if still_repeated(scope, &fp) {
+            return Ok((Vec::new(), Tracking::Lost(0.0)));
+        }
         match best(scope, &fp) {
             Some((node, score)) if score >= ctx.threshold => {
                 let hits = match &self.ending {

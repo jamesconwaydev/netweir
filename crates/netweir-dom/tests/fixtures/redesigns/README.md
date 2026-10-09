@@ -9,4 +9,6 @@ of 0.75.
 
 Written by hand, modelled on the changes sites actually make: classes
 renamed by a new build, wrappers added, tags swapped, lists reordered,
-prices changed.
+prices changed. Two cases are the other way round: an element that is simply
+absent this time (a sold-out product's price, a table without its Total
+row) must not be replaced by a neighbour that looks like it.

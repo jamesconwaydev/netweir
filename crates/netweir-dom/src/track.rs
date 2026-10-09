@@ -39,6 +39,9 @@ struct Weights {
 /// and keeps scoring cheap on big pages.
 const TEXT_KEPT: usize = 120;
 
+/// Sibling tags kept in a fingerprint.
+const MAX_SIBLINGS: usize = 32;
+
 /// What an element looked like when its selector last matched.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Fingerprint {
@@ -55,6 +58,14 @@ pub struct Fingerprint {
     parent_class: String,
     /// The nearest text before the element, outside it.
     preceding: String,
+    /// Whether the text, and the text before it, have differed between
+    /// pages where the selector matched (a product's name and price
+    /// differ from product to product). Differences there are then no
+    /// evidence against a candidate.
+    #[serde(default)]
+    text_varies: bool,
+    #[serde(default)]
+    preceding_varies: bool,
 }
 
 fn clip(s: &str) -> String {
@@ -84,17 +95,20 @@ impl Fingerprint {
         }
         path.reverse();
         let parent = node.parent().filter(|p| p.kind() == NodeKind::Element);
+        // A parent with thousands of children would make every fingerprint
+        // cost thousands of steps; the first few siblings say enough.
         let siblings = parent
             .map(|p| {
                 p.children()
                     .filter(|c| c.kind() == NodeKind::Element && *c != node)
                     .filter_map(|c| c.tag().map(str::to_string))
+                    .take(MAX_SIBLINGS)
                     .collect()
             })
             .unwrap_or_default();
         Fingerprint {
             tag: node.tag().unwrap_or_default().to_string(),
-            text: clip(&node.text()),
+            text: clip(&text_start(node)),
             class: attr("class").unwrap_or_default(),
             id: attr("id"),
             attr_names,
@@ -106,7 +120,16 @@ impl Fingerprint {
                 .unwrap_or_default()
                 .to_string(),
             preceding: preceding_text(node),
+            text_varies: false,
+            preceding_varies: false,
         }
+    }
+
+    /// Carries over what the previous fingerprint of the same element
+    /// learned, and learns from the difference between the two.
+    pub fn learn_from(&mut self, previous: &Fingerprint) {
+        self.text_varies = previous.text_varies || previous.text != self.text;
+        self.preceding_varies = previous.preceding_varies || previous.preceding != self.preceding;
     }
 
     pub fn to_json(&self) -> String {
@@ -132,9 +155,29 @@ impl Fingerprint {
             + 0.25 * jaccard(&self.attr_names, &other.attr_names);
         let parent = 0.5 * f64::from(u8::from(self.parent_tag == other.parent_tag))
             + 0.5 * one_sided(&self.parent_class, &other.parent_class, trigram_similarity);
-        let score = w.text * text_similarity(&self.text, &other.text)
+        // A label (the text before the element) that never changed and now
+        // reads differently means a different field, however alike the
+        // two look: the Shipping cell is not the Total cell.
+        if !self.preceding_varies
+            && !self.preceding.is_empty()
+            && !other.preceding.is_empty()
+            && ratio(&self.preceding, &other.preceding) < 0.5
+        {
+            return 0.0;
+        }
+        let text = if self.text_varies {
+            ratio(&shape(&self.text), &shape(&other.text))
+        } else {
+            text_similarity(&self.text, &other.text)
+        };
+        let preceding = if self.preceding_varies {
+            0.5
+        } else {
+            one_sided(&self.preceding, &other.preceding, ratio)
+        };
+        let score = w.text * text
             + w.attrs * attrs
-            + w.preceding * one_sided(&self.preceding, &other.preceding, ratio)
+            + w.preceding * preceding
             + w.path * lcs_ratio(&self.path, &other.path)
             + w.parent * parent
             + w.siblings * jaccard(&self.siblings, &other.siblings);
@@ -193,20 +236,63 @@ pub fn best<'a>(root: Node<'a>, fp: &Fingerprint) -> Option<(Node<'a>, f64)> {
         .max_by(|a, b| a.1.total_cmp(&b.1))
 }
 
-/// `best`, if it scores at least `threshold`.
+/// `best`, if it scores at least `threshold` and the element isn't one of
+/// a list that's still there (see `still_repeated`).
 pub fn relocate<'a>(root: Node<'a>, fp: &Fingerprint, threshold: f64) -> Option<(Node<'a>, f64)> {
+    if still_repeated(root, fp) {
+        return None;
+    }
     best(root, fp).filter(|(_, score)| *score >= threshold)
+}
+
+/// The text with every digit a 0: what a price or a date looks like.
+fn shape(s: &str) -> String {
+    s.chars()
+        .map(|c| if c.is_ascii_digit() { '0' } else { c })
+        .collect()
 }
 
 /// Text similarity that also recognises the same shape with different
 /// numbers: a price that changed is still a price.
 fn text_similarity(a: &str, b: &str) -> f64 {
-    let shape = |s: &str| -> String {
-        s.chars()
-            .map(|c| if c.is_ascii_digit() { '0' } else { c })
-            .collect()
-    };
     ratio(a, b).max(0.85 * ratio(&shape(a), &shape(b)))
+}
+
+/// The start of the text below `node`: enough to compare, without walking
+/// a subtree that may be the whole page.
+fn text_start(node: Node<'_>) -> String {
+    let mut out = String::new();
+    for n in node.descendants() {
+        if n.kind() == NodeKind::Text {
+            out.push_str(n.data().unwrap_or_default());
+            if out.len() > TEXT_KEPT * 4 {
+                break;
+            }
+        }
+    }
+    out
+}
+
+/// Whether several elements still carry all of the remembered element's
+/// classes: a list, where a selector that misses means this item has no
+/// such element (a sold-out product's price), not that the site changed.
+pub fn still_repeated(root: Node<'_>, fp: &Fingerprint) -> bool {
+    let wanted: Vec<&str> = fp.class.split_ascii_whitespace().collect();
+    if wanted.is_empty() {
+        return false;
+    }
+    let kind = family(&fp.tag);
+    root.descendants()
+        .filter(|n| n.kind() == NodeKind::Element && n.tag().is_some_and(|t| family(t) == kind))
+        .filter(|n| {
+            let class = n.attr("class").unwrap_or_default();
+            wanted
+                .iter()
+                .all(|w| class.split_ascii_whitespace().any(|c| c == *w))
+        })
+        .take(2)
+        .count()
+        >= 2
 }
 
 /// 1 minus the edit distance over the longer length; 1 for two blanks.
