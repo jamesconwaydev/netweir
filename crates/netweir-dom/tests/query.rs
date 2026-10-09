@@ -1,4 +1,4 @@
-use netweir_dom::{Document, Output, Query};
+use netweir_dom::{Document, Hit, Output, Query};
 
 const PAGE: &str = r#"
 <html><body>
@@ -66,8 +66,46 @@ fn valueless_attributes_come_back_empty() {
 }
 
 #[test]
-fn plain_selector_gives_text_content() {
-    assert_eq!(strings(".sold .price"), ["£3.75"]);
+fn plain_selector_gives_outer_html_like_parsel() {
+    assert_eq!(
+        strings(".sold .price"),
+        ["<p class=\"price\"><span>£</span>3.75</p>"]
+    );
+}
+
+#[test]
+fn each_selector_in_a_list_keeps_its_own_ending() {
+    // Merged in document order, as parsel's XPath union does.
+    assert_eq!(
+        strings("h1::text, li.next a::attr(href)"),
+        ["All products", "page-2.html"]
+    );
+    assert_eq!(
+        strings("li.next a::attr(href), h1::text"),
+        ["All products", "page-2.html"]
+    );
+    assert_eq!(
+        strings("h1, h1::text"),
+        ["<h1>All products</h1>", "All products"]
+    );
+    // A selector with commas inside parentheses or quotes is one selector.
+    assert_eq!(
+        strings("a[title='Book A, B']::text, :is(h1, h2)::text"),
+        ["All products"]
+    );
+}
+
+#[test]
+fn hits_tell_nodes_from_values() {
+    let doc = Document::parse(PAGE);
+    let hits = Query::new("h1, h1::text, h1::attr(id)")
+        .unwrap()
+        .run(doc.root());
+    assert!(matches!(hits[0], Hit::Node(n) if n.tag() == Some("h1")));
+    assert!(matches!(hits[1], Hit::Node(n) if n.data() == Some("All products")));
+    assert_eq!(hits.len(), 2, "h1 has no id, so ::attr(id) adds nothing");
+    let attrs = Query::new("li.next a::attr(href)").unwrap().run(doc.root());
+    assert!(matches!(&attrs[0], Hit::Value(v) if v == "page-2.html"));
 }
 
 #[test]
@@ -87,7 +125,11 @@ fn a_match_for_two_selectors_is_returned_once() {
 
 #[test]
 fn results_are_in_document_order() {
-    assert_eq!(strings("li a, h1"), ["All products", "next"]);
+    assert_eq!(strings("li a::text, h1::text"), ["All products", "next"]);
+    assert_eq!(
+        strings("li a, h1"),
+        ["<h1>All products</h1>", "<a href=\"page-2.html\">next</a>"]
+    );
 }
 
 #[test]
@@ -117,18 +159,22 @@ fn bare_text_query_returns_text_of_the_scope() {
 
 #[test]
 fn outputs_are_parsed() {
-    assert_eq!(Query::new("a").unwrap().output(), &Output::Nodes);
+    assert_eq!(Query::new("a").unwrap().outputs(), [Output::Nodes]);
     assert_eq!(
-        Query::new("a::text").unwrap().output(),
-        &Output::Text { deep: false }
+        Query::new("a::text").unwrap().outputs(),
+        [Output::Text { deep: false }]
     );
     assert_eq!(
-        Query::new("a ::text").unwrap().output(),
-        &Output::Text { deep: true }
+        Query::new("a ::text").unwrap().outputs(),
+        [Output::Text { deep: true }]
     );
     assert_eq!(
-        Query::new("a::attr(href)").unwrap().output(),
-        &Output::Attr("href".into())
+        Query::new("a::attr(href)").unwrap().outputs(),
+        [Output::Attr("href".into())]
+    );
+    assert_eq!(
+        Query::new("a, b::text").unwrap().outputs(),
+        [Output::Nodes, Output::Text { deep: false }]
     );
 }
 
@@ -142,6 +188,9 @@ fn bad_queries_are_errors_not_panics() {
         "a::attr()",
         "a::attr(href",
         "a::attr(href)::text",
+        "a,",
+        ", a",
+        "a,,b",
         "a::text::text",
         "a::attr(href))",
         "a::attr(a b)",

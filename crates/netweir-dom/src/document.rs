@@ -1,8 +1,10 @@
+use std::ffi::{c_char, c_void};
 use std::fmt;
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use crate::ffi::{self, RawDocument, RawNode, str_at};
+use crate::index::Index;
 
 /// A parsed HTML document.
 ///
@@ -14,6 +16,8 @@ pub struct Document {
     /// Selector runs take this lock. lexbor does not promise that its matcher
     /// is safe with concurrent readers of one document, so we don't assume it.
     pub(crate) select_lock: Mutex<()>,
+    /// A flat, document-order index of every node, built on first use.
+    index: OnceLock<Index>,
 }
 
 // SAFETY: the tree is never modified after `parse` returns. Every other
@@ -41,6 +45,18 @@ impl Document {
         // 6.7 GB in a test). A node cap checked between chunks comes with the
         // crawler.
         parse_in_chunks(html, budget, 16 * 1024)
+    }
+
+    /// The document's index. Building it writes each node's `user` field
+    /// once, inside the OnceLock, before any reader can see the result.
+    pub(crate) fn index(&self) -> &Index {
+        self.index
+            .get_or_init(|| Index::build(unsafe { ffi::nw_root(self.raw) }))
+    }
+
+    fn order_of(&self, raw: *mut RawNode) -> u32 {
+        self.index();
+        unsafe { ffi::nw_order(raw) as u32 }
     }
 
     /// The document node. Its children are the doctype and `<html>`.
@@ -84,6 +100,7 @@ fn parse_in_chunks(html: &str, budget: Duration, chunk: usize) -> Result<Documen
     let doc = Document {
         raw,
         select_lock: Mutex::new(()),
+        index: OnceLock::new(),
     };
     let mut rest = html;
     while !rest.is_empty() {
@@ -152,6 +169,10 @@ pub struct Node<'a> {
 }
 
 impl<'a> Node<'a> {
+    pub(crate) fn from_raw(doc: &'a Document, raw: *mut RawNode) -> Node<'a> {
+        Node { doc, raw }
+    }
+
     pub(crate) fn wrap(doc: &'a Document, raw: *mut RawNode) -> Option<Node<'a>> {
         (!raw.is_null()).then_some(Node { doc, raw })
     }
@@ -217,6 +238,82 @@ impl<'a> Node<'a> {
         }
     }
 
+    /// lexbor's id for this node's name. Two elements share an id exactly
+    /// when their lowercase names are equal.
+    pub(crate) fn tag_id(&self) -> usize {
+        unsafe { ffi::nw_tag_id(self.raw) }
+    }
+
+    /// The id elements named `name` (compared lowercased) carry in this
+    /// node's document; `None` if no element has that name.
+    pub(crate) fn tag_id_named(&self, name: &str) -> Option<usize> {
+        let id = unsafe { ffi::nw_tag_id_named(self.raw, name.as_ptr().cast(), name.len()) };
+        (id != 0).then_some(id)
+    }
+
+    pub fn next_sibling(&self) -> Option<Node<'a>> {
+        Node::wrap(self.doc, unsafe { ffi::nw_next(self.raw) })
+    }
+
+    pub fn prev_sibling(&self) -> Option<Node<'a>> {
+        Node::wrap(self.doc, unsafe { ffi::nw_prev(self.raw) })
+    }
+
+    pub fn first_child(&self) -> Option<Node<'a>> {
+        Node::wrap(self.doc, unsafe { ffi::nw_first_child(self.raw) })
+    }
+
+    pub fn last_child(&self) -> Option<Node<'a>> {
+        Node::wrap(self.doc, unsafe { ffi::nw_last_child(self.raw) })
+    }
+
+    /// The node after this one in document order: its first child, or the
+    /// next sibling of it or its nearest ancestor that has one.
+    pub fn next_in_order(&self) -> Option<Node<'a>> {
+        if let Some(child) = self.first_child() {
+            return Some(child);
+        }
+        let mut at = *self;
+        loop {
+            if let Some(next) = at.next_sibling() {
+                return Some(next);
+            }
+            at = at.parent()?;
+        }
+    }
+
+    /// The node before this one in document order: the last node inside its
+    /// previous sibling, or else its parent.
+    pub fn prev_in_order(&self) -> Option<Node<'a>> {
+        let Some(mut at) = self.prev_sibling() else {
+            return self.parent();
+        };
+        while let Some(last) = at.last_child() {
+            at = last;
+        }
+        Some(at)
+    }
+
+    /// The node's position in document order: smaller comes first.
+    pub fn order(&self) -> u32 {
+        self.doc.order_of(self.raw)
+    }
+
+    /// The node as HTML: an element with its attributes and everything in
+    /// it, a text node escaped, a comment as `<!--...-->`.
+    pub fn html(&self) -> String {
+        extern "C" fn push(data: *const c_char, len: usize, ctx: *mut c_void) {
+            // SAFETY: lexbor passes `len` valid bytes; ctx is the Vec below.
+            let bytes = unsafe { std::slice::from_raw_parts(data.cast::<u8>(), len) };
+            unsafe { (*ctx.cast::<Vec<u8>>()).extend_from_slice(bytes) }
+        }
+        let mut out: Vec<u8> = Vec::new();
+        // Only fails when lexbor cannot allocate; return what was written.
+        unsafe { ffi::nw_serialize(self.raw, push, (&mut out as *mut Vec<u8>).cast()) };
+        // lexbor writes UTF-8; anything else would be memory corruption.
+        String::from_utf8(out).unwrap_or_default()
+    }
+
     pub fn parent(&self) -> Option<Node<'a>> {
         Node::wrap(self.doc, unsafe { ffi::nw_parent(self.raw) })
     }
@@ -244,6 +341,51 @@ impl<'a> Node<'a> {
             }
             Some(current)
         })
+    }
+
+    /// The text nodes below this node, in order, leaving out what is code
+    /// rather than reading matter: the contents of `<script>`, `<style>`
+    /// and `<template>` (Beautiful Soup's `get_text()` does the same). On a
+    /// script or style element itself, gives its own text.
+    pub fn readable_text_pieces(&self) -> Vec<&'a str> {
+        const CODE: [&str; 3] = ["script", "style", "template"];
+        if self.tag().is_some_and(|t| CODE.contains(&t)) || self.kind() == NodeKind::Text {
+            return self.text_pieces();
+        }
+        let mut out = Vec::new();
+        let mut next = self.first_child();
+        while let Some(n) = next {
+            let skip = n.tag().is_some_and(|t| CODE.contains(&t));
+            if !skip && n.kind() == NodeKind::Text {
+                out.extend(n.data());
+            }
+            // Descend unless skipping; otherwise move on past this subtree.
+            next = if !skip { n.first_child() } else { None }.or_else(|| {
+                let mut at = n;
+                loop {
+                    if at.raw == self.raw {
+                        return None;
+                    }
+                    if let Some(s) = at.next_sibling() {
+                        return Some(s);
+                    }
+                    at = at.parent()?;
+                    if at.raw == self.raw {
+                        return None;
+                    }
+                }
+            });
+        }
+        out
+    }
+
+    /// Every text node's text below (or at) this node, in order.
+    fn text_pieces(&self) -> Vec<&'a str> {
+        std::iter::once(*self)
+            .chain(self.descendants())
+            .filter(|n| n.kind() == NodeKind::Text)
+            .filter_map(|n| n.data())
+            .collect()
     }
 
     /// All text below this node, joined. Comments are not text.

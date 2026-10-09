@@ -76,6 +76,16 @@ class Page:
     def css(self, query: str) -> Selection:
         return self.root.css(query)
 
+    def xpath(self, query: str, **variables: str | int | float | bool) -> Selection:
+        return self.root.xpath(query, **variables)
+
+    def __getattr__(self, name: str):
+        # Everything else a Node offers (find_all, select, get_text ...)
+        # works on the page's document.
+        if name.startswith("_"):
+            raise AttributeError(name)
+        return getattr(self.root, name)
+
     def __repr__(self) -> str:
         return f"<Page {self.status} {self.url}>"
 

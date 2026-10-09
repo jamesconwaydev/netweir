@@ -47,8 +47,16 @@ lxb_dom_node_t *nw_root(lxb_html_document_t *doc) {
 
 lxb_dom_node_t *nw_parent(lxb_dom_node_t *n) { return n->parent; }
 lxb_dom_node_t *nw_first_child(lxb_dom_node_t *n) { return n->first_child; }
+lxb_dom_node_t *nw_last_child(lxb_dom_node_t *n) { return n->last_child; }
 lxb_dom_node_t *nw_next(lxb_dom_node_t *n) { return n->next; }
+lxb_dom_node_t *nw_prev(lxb_dom_node_t *n) { return n->prev; }
 int nw_type(lxb_dom_node_t *n) { return (int) n->type; }
+
+/* Tag ids: equal ids mean equal (lowercased) names. 0 is "no such tag". */
+uintptr_t nw_tag_id(lxb_dom_node_t *n) { return n->local_name; }
+uintptr_t nw_tag_id_named(lxb_dom_node_t *n, const char *name, size_t len) {
+    return lxb_tag_id_by_name(n->owner_document->tags, (const lxb_char_t *) name, len);
+}
 
 const char *nw_tag(lxb_dom_node_t *n, size_t *len) {
     return (const char *) lxb_dom_element_local_name(lxb_dom_interface_element(n), len);
@@ -95,6 +103,71 @@ const char *nw_attr_value(lxb_dom_attr_t *a, size_t *len) {
         return "";
     }
     return (const char *) v;
+}
+
+/* ---- whole-tree walks --------------------------------------------------- */
+
+/* The node after `n` in document order, staying inside `root`. */
+static lxb_dom_node_t *nw_step(lxb_dom_node_t *n, lxb_dom_node_t *root) {
+    if (n->first_child != NULL) {
+        return n->first_child;
+    }
+    while (n != root) {
+        if (n->next != NULL) {
+            return n->next;
+        }
+        n = n->parent;
+    }
+    return NULL;
+}
+
+/* Numbers every node under `root` (root first) in document order, keeping
+ * the number in the node's `user` field, which lexbor leaves to callers.
+ * Returns how many nodes there are. */
+size_t nw_number(lxb_dom_node_t *root) {
+    uintptr_t i = 0;
+    for (lxb_dom_node_t *n = root; n != NULL; n = nw_step(n, root)) {
+        n->user = (void *) i++;
+    }
+    return (size_t) i;
+}
+
+uintptr_t nw_order(lxb_dom_node_t *n) { return (uintptr_t) n->user; }
+
+/* After nw_number: fills one entry per node, in document order, with the
+ * node, its parent's number (UINT32_MAX for the root), its type and its tag
+ * id. Each array holds as many entries as nw_number returned. */
+void nw_index_fill(lxb_dom_node_t *root, lxb_dom_node_t **raw, uint32_t *parent,
+                   uint8_t *type, uintptr_t *tag) {
+    size_t i = 0;
+    for (lxb_dom_node_t *n = root; n != NULL; n = nw_step(n, root), i++) {
+        raw[i] = n;
+        parent[i] = (n == root || n->parent == NULL) ? UINT32_MAX : (uint32_t) (uintptr_t) n->parent->user;
+        type[i] = (uint8_t) n->type;
+        tag[i] = n->local_name;
+    }
+}
+
+/* ---- serialising ------------------------------------------------------- */
+
+typedef void (*nw_chunk_fn)(const char *data, size_t len, void *ctx);
+
+typedef struct {
+    nw_chunk_fn chunk;
+    void *ctx;
+} nw_sink_t;
+
+static lxb_status_t nw_on_chunk(const lxb_char_t *data, size_t len, void *ctx) {
+    nw_sink_t *sink = ctx;
+    sink->chunk((const char *) data, len, sink->ctx);
+    return LXB_STATUS_OK;
+}
+
+/* Serialises `n` and everything below it as HTML, in pieces. Returns 0 on
+ * success. Reads the tree only. */
+int nw_serialize(lxb_dom_node_t *n, nw_chunk_fn chunk, void *ctx) {
+    nw_sink_t sink = {chunk, ctx};
+    return lxb_html_serialize_tree_cb(n, nw_on_chunk, &sink) == LXB_STATUS_OK ? 0 : -1;
 }
 
 /* ---- CSS ---------------------------------------------------------------- */

@@ -32,8 +32,9 @@ def test_get_default(page):
     assert page.css("table::text").get("none") == "none"
 
 
-def test_plain_selector_gives_text_content(page):
-    assert page.css(".sold .price").get() == "£3.75"
+def test_plain_selector_gives_outer_html(page):
+    assert page.css(".sold .price").get() == '<p class="price"><span>£</span>3.75</p>'
+    assert page.css(".sold .price")[0].text == "£3.75"
 
 
 def test_selections_chain(page):

@@ -24,6 +24,7 @@ pub struct RawSelectorList {
 }
 
 pub type FoundFn = extern "C" fn(node: *mut RawNode, ctx: *mut c_void);
+pub type ChunkFn = extern "C" fn(data: *const c_char, len: usize, ctx: *mut c_void);
 
 pub const ELEMENT: c_int = 0x01;
 pub const TEXT: c_int = 0x03;
@@ -41,8 +42,22 @@ unsafe extern "C" {
 
     pub fn nw_parent(n: *mut RawNode) -> *mut RawNode;
     pub fn nw_first_child(n: *mut RawNode) -> *mut RawNode;
+    pub fn nw_last_child(n: *mut RawNode) -> *mut RawNode;
     pub fn nw_next(n: *mut RawNode) -> *mut RawNode;
+    pub fn nw_prev(n: *mut RawNode) -> *mut RawNode;
+    pub fn nw_serialize(n: *mut RawNode, chunk: ChunkFn, ctx: *mut c_void) -> c_int;
     pub fn nw_type(n: *mut RawNode) -> c_int;
+    pub fn nw_tag_id(n: *mut RawNode) -> usize;
+    pub fn nw_number(root: *mut RawNode) -> usize;
+    pub fn nw_order(n: *mut RawNode) -> usize;
+    pub fn nw_index_fill(
+        root: *mut RawNode,
+        raw: *mut *mut RawNode,
+        parent: *mut u32,
+        kind: *mut u8,
+        tag: *mut usize,
+    );
+    pub fn nw_tag_id_named(n: *mut RawNode, name: *const c_char, len: usize) -> usize;
     pub fn nw_tag(n: *mut RawNode, len: *mut usize) -> *const c_char;
     pub fn nw_char_data(n: *mut RawNode, len: *mut usize) -> *const c_char;
     pub fn nw_get_attr(

@@ -2,7 +2,7 @@
 
 from netweir._errors import FetchError
 from netweir._fetch import Client, Page, get
-from netweir._native import Node, ParseTimeout, Selection, SelectorError, parse
+from netweir._native import Node, ParseTimeout, Selection, SelectorError, XPathError, parse
 
 __all__ = [
     "Client",
@@ -12,6 +12,7 @@ __all__ = [
     "ParseTimeout",
     "Selection",
     "SelectorError",
+    "XPathError",
     "get",
     "parse",
 ]

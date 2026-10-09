@@ -140,3 +140,104 @@ fn deep_nesting_is_stopped_by_the_budget() {
         start.elapsed()
     );
 }
+
+#[test]
+fn siblings_both_ways() {
+    let doc = Document::parse("<ul><li>a</li>text<li>b</li></ul>");
+    let ul = doc
+        .root()
+        .descendants()
+        .find(|n| n.tag() == Some("ul"))
+        .unwrap();
+    let kids: Vec<_> = ul.children().collect();
+    assert_eq!(kids.len(), 3);
+    assert_eq!(kids[1].prev_sibling(), Some(kids[0]));
+    assert_eq!(kids[1].next_sibling(), Some(kids[2]));
+    assert_eq!(kids[0].prev_sibling(), None);
+    assert_eq!(kids[2].next_sibling(), None);
+}
+
+#[test]
+fn outer_html_serialises_like_a_browser() {
+    let doc =
+        Document::parse(r#"<div id=x class="a b"><p>one &amp; <b>two</b></p><br><!--c--></div>"#);
+    let div = doc
+        .root()
+        .descendants()
+        .find(|n| n.tag() == Some("div"))
+        .unwrap();
+    assert_eq!(
+        div.html(),
+        r#"<div id="x" class="a b"><p>one &amp; <b>two</b></p><br><!--c--></div>"#
+    );
+    let text = div
+        .descendants()
+        .find(|n| n.kind() == NodeKind::Text)
+        .unwrap();
+    assert_eq!(text.html(), "one &amp; ");
+    let comment = div
+        .descendants()
+        .find(|n| n.kind() == NodeKind::Comment)
+        .unwrap();
+    assert_eq!(comment.html(), "<!--c-->");
+}
+
+#[test]
+fn document_order_ranks_every_node() {
+    let doc = Document::parse("<p>a<b>b</b>c</p><i>d</i>");
+    let all: Vec<_> = doc.root().descendants().collect();
+    let ranks: Vec<u32> = all.iter().map(|n| n.order()).collect();
+    let mut sorted = ranks.clone();
+    sorted.sort();
+    assert_eq!(ranks, sorted, "descendants() is document order");
+    assert!(doc.root().order() < ranks[0]);
+    let mut unique = ranks.clone();
+    unique.dedup();
+    assert_eq!(unique.len(), ranks.len());
+}
+
+#[test]
+fn stepping_through_document_order_both_ways() {
+    let doc = Document::parse("<div><p>a<b>b</b></p>c</div><i>d</i>");
+    let forward: Vec<String> = std::iter::successors(Some(doc.root()), |n| n.next_in_order())
+        .map(|n| format!("{n:?}"))
+        .collect();
+    let all: Vec<String> = std::iter::once(doc.root())
+        .chain(doc.root().descendants())
+        .map(|n| format!("{n:?}"))
+        .collect();
+    assert_eq!(forward, all);
+    let last = doc.root().descendants().last().unwrap();
+    let mut backward: Vec<String> = std::iter::successors(Some(last), |n| n.prev_in_order())
+        .map(|n| format!("{n:?}"))
+        .collect();
+    backward.reverse();
+    assert_eq!(backward, all);
+    let div = doc
+        .root()
+        .descendants()
+        .find(|n| n.tag() == Some("div"))
+        .unwrap();
+    assert_eq!(div.last_child().unwrap().data(), Some("c"));
+}
+
+#[test]
+fn readable_text_leaves_out_code() {
+    let doc = Document::parse(
+        "<div>a<script>var x</script><style>p{}</style>b<template>t</template><noscript>n</noscript></div>",
+    );
+    let div = doc
+        .root()
+        .descendants()
+        .find(|n| n.tag() == Some("div"))
+        .unwrap();
+    assert_eq!(div.readable_text_pieces(), ["a", "b", "n"]);
+    // Asked directly, a script or style element gives its own text.
+    let style = div
+        .descendants()
+        .find(|n| n.tag() == Some("style"))
+        .unwrap();
+    assert_eq!(style.readable_text_pieces(), ["p{}"]);
+    // XPath's string value still includes everything.
+    assert_eq!(div.text(), "avar xp{}bn");
+}

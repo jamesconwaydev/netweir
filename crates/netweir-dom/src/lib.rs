@@ -5,7 +5,10 @@
 
 mod document;
 mod ffi;
+mod index;
 mod query;
+mod xpath;
 
 pub use document::{Document, Node, NodeId, NodeKind, ParseTimeout};
-pub use query::{Output, Query, QueryError};
+pub use query::{Hit, Output, Query, QueryError};
+pub use xpath::{XPath, XPathError, XValue};

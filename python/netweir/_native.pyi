@@ -1,18 +1,181 @@
-from collections.abc import Iterator
-from typing import overload
+import re
+from collections.abc import Callable, Iterator
+from typing import Literal, overload
 
 class SelectorError(ValueError): ...
+class XPathError(ValueError): ...
 class ParseTimeout(TimeoutError): ...
 
+Filter = (
+    str
+    | list[str]
+    | tuple[str, ...]
+    | set[str]
+    | bool
+    | re.Pattern[str]
+    | Callable[..., object]
+    | None
+)
+
 class Node:
+    # parsel-style queries
+    def css(self, query: str) -> Selection: ...
+    def xpath(self, query: str, **variables: str | int | float | bool) -> Selection: ...
+    # Beautiful Soup style search
+    def find(
+        self,
+        name: Filter = None,
+        attrs: dict[str, Filter] | None = None,
+        recursive: bool = True,
+        string: Filter = None,
+        class_: Filter = None,
+        **kwargs: Filter,
+    ) -> Node | None: ...
+    def find_all(
+        self,
+        name: Filter = None,
+        attrs: dict[str, Filter] | None = None,
+        recursive: bool = True,
+        string: Filter = None,
+        limit: int | None = None,
+        class_: Filter = None,
+        **kwargs: Filter,
+    ) -> list[Node]: ...
+    def find_parent(
+        self,
+        name: Filter = None,
+        attrs: dict[str, Filter] | None = None,
+        string: Filter = None,
+        class_: Filter = None,
+        **kwargs: Filter,
+    ) -> Node | None: ...
+    def find_parents(
+        self,
+        name: Filter = None,
+        attrs: dict[str, Filter] | None = None,
+        string: Filter = None,
+        limit: int | None = None,
+        class_: Filter = None,
+        **kwargs: Filter,
+    ) -> list[Node]: ...
+    def find_next_sibling(
+        self,
+        name: Filter = None,
+        attrs: dict[str, Filter] | None = None,
+        string: Filter = None,
+        class_: Filter = None,
+        **kwargs: Filter,
+    ) -> Node | None: ...
+    def find_next_siblings(
+        self,
+        name: Filter = None,
+        attrs: dict[str, Filter] | None = None,
+        string: Filter = None,
+        limit: int | None = None,
+        class_: Filter = None,
+        **kwargs: Filter,
+    ) -> list[Node]: ...
+    def find_previous_sibling(
+        self,
+        name: Filter = None,
+        attrs: dict[str, Filter] | None = None,
+        string: Filter = None,
+        class_: Filter = None,
+        **kwargs: Filter,
+    ) -> Node | None: ...
+    def find_previous_siblings(
+        self,
+        name: Filter = None,
+        attrs: dict[str, Filter] | None = None,
+        string: Filter = None,
+        limit: int | None = None,
+        class_: Filter = None,
+        **kwargs: Filter,
+    ) -> list[Node]: ...
+    def find_next(
+        self,
+        name: Filter = None,
+        attrs: dict[str, Filter] | None = None,
+        string: Filter = None,
+        class_: Filter = None,
+        **kwargs: Filter,
+    ) -> Node | None: ...
+    def find_all_next(
+        self,
+        name: Filter = None,
+        attrs: dict[str, Filter] | None = None,
+        string: Filter = None,
+        limit: int | None = None,
+        class_: Filter = None,
+        **kwargs: Filter,
+    ) -> list[Node]: ...
+    def find_previous(
+        self,
+        name: Filter = None,
+        attrs: dict[str, Filter] | None = None,
+        string: Filter = None,
+        class_: Filter = None,
+        **kwargs: Filter,
+    ) -> Node | None: ...
+    def find_all_previous(
+        self,
+        name: Filter = None,
+        attrs: dict[str, Filter] | None = None,
+        string: Filter = None,
+        limit: int | None = None,
+        class_: Filter = None,
+        **kwargs: Filter,
+    ) -> list[Node]: ...
+    def select(self, css: str) -> list[Node]: ...
+    def select_one(self, css: str) -> Node | None: ...
+    # what the node is
     @property
-    def text(self) -> str: ...
+    def kind(self) -> Literal["element", "text", "comment", "document", "doctype", "other"]: ...
     @property
     def tag(self) -> str | None: ...
     @property
+    def name(self) -> str | None: ...
+    @property
+    def text(self) -> str: ...
+    @property
+    def html(self) -> str: ...
+    @property
+    def string(self) -> str | None: ...
+    def get_text(self, separator: str = "", strip: bool = False) -> str: ...
+    # attributes
+    @property
     def attrs(self) -> dict[str, str]: ...
     def attr(self, name: str) -> str | None: ...
-    def css(self, query: str) -> Selection: ...
+    @overload
+    def get(self, name: str) -> str | None: ...
+    @overload
+    def get(self, name: str, default: object) -> object: ...
+    def __getitem__(self, name: str) -> str: ...
+    # navigation
+    @property
+    def parent(self) -> Node | None: ...
+    @property
+    def parents(self) -> list[Node]: ...
+    @property
+    def children(self) -> list[Node]: ...
+    @property
+    def contents(self) -> list[Node]: ...
+    @property
+    def descendants(self) -> list[Node]: ...
+    @property
+    def next_sibling(self) -> Node | None: ...
+    @property
+    def previous_sibling(self) -> Node | None: ...
+    @property
+    def next_siblings(self) -> list[Node]: ...
+    @property
+    def previous_siblings(self) -> list[Node]: ...
+    @property
+    def next_element(self) -> Node | None: ...
+    @property
+    def previous_element(self) -> Node | None: ...
+    def __eq__(self, other: object) -> bool: ...
+    def __hash__(self) -> int: ...
 
 class Selection:
     @overload
@@ -20,12 +183,22 @@ class Selection:
     @overload
     def get(self, default: str) -> str: ...
     def getall(self) -> list[str]: ...
+    def extract(self) -> list[str]: ...
+    def extract_first(self, default: str | None = None) -> str | None: ...
     def css(self, query: str) -> Selection: ...
+    def xpath(self, query: str, **variables: str | int | float | bool) -> Selection: ...
+    def re(self, pattern: str | re.Pattern[str]) -> list[str]: ...
+    def re_first(
+        self, pattern: str | re.Pattern[str], default: str | None = None
+    ) -> str | None: ...
+    @property
+    def attrib(self) -> dict[str, str]: ...
     def __len__(self) -> int: ...
+    @overload
     def __getitem__(self, index: int) -> Node | str: ...
+    @overload
+    def __getitem__(self, index: slice) -> Selection: ...
     def __iter__(self) -> Iterator[Node | str]: ...
-
-def parse(html: str, timeout: float | None = None) -> Node: ...
 
 class Response:
     @property
@@ -51,3 +224,5 @@ class Fetcher:
     ) -> None: ...
     async def get(self, url: str, headers: list[tuple[str, str]] | None = None) -> Response: ...
     def get_blocking(self, url: str, headers: list[tuple[str, str]] | None = None) -> Response: ...
+
+def parse(html: str, timeout: float | None = None) -> Node: ...

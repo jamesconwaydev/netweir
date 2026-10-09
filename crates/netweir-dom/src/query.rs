@@ -31,18 +31,46 @@ impl fmt::Display for QueryError {
 
 impl std::error::Error for QueryError {}
 
+/// One result of a query.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Hit<'a> {
+    /// An element, or with `::text` a text node.
+    Node(Node<'a>),
+    /// An attribute's value, from `::attr()`.
+    Value(String),
+}
+
+impl Hit<'_> {
+    /// What `get()` returns for this hit: an element or comment as HTML, a
+    /// text node's text, an attribute's value.
+    pub fn to_string_value(&self) -> String {
+        match self {
+            Hit::Node(n) if n.kind() == NodeKind::Text => n.data().unwrap_or_default().to_string(),
+            Hit::Node(n) => n.html(),
+            Hit::Value(v) => v.clone(),
+        }
+    }
+}
+
 /// A compiled CSS query, with Scrapy-style `::text` and `::attr()` endings.
+/// A comma-separated list can give each selector its own ending; results
+/// come back in document order.
 ///
 /// Compile once, run on many documents. A `Query` can move between threads
 /// but not be shared by them at once: lexbor does not say its compiled
 /// selectors are safe to match from two threads, so each thread compiles its
 /// own.
 pub struct Query {
+    parts: Vec<Part>,
+}
+
+struct Part {
+    /// Null for an ending with no selector (`::text`), which matches the scope.
     list: *mut RawSelectorList,
     output: Output,
 }
 
-// SAFETY: the selector list is a self-contained allocation with no
+// SAFETY: each selector list is a self-contained allocation with no
 // thread-local state, so moving it to another thread is fine. Not `Sync`.
 unsafe impl Send for Query {}
 
@@ -52,30 +80,77 @@ impl Query {
             query: css.to_string(),
             reason,
         };
-        let (selector, output) = split_output(css).ok_or_else(|| error("bad ::attr()"))?;
-        let list = if selector.trim().is_empty() {
-            if output == Output::Nodes {
-                return Err(error("empty selector"));
-            }
-            std::ptr::null_mut()
-        } else {
-            let list = unsafe { ffi::nw_css_compile(selector.as_ptr().cast(), selector.len()) };
-            if list.is_null() {
-                return Err(error("not valid CSS"));
-            }
-            list
-        };
-        Ok(Query { list, output })
+        let mut parts = Vec::new();
+        for piece in split_top_level(css) {
+            let (selector, output) = split_output(piece).ok_or_else(|| error("bad ::attr()"))?;
+            let list = if selector.trim().is_empty() {
+                if output == Output::Nodes {
+                    return Err(error("empty selector"));
+                }
+                std::ptr::null_mut()
+            } else {
+                let list = unsafe { ffi::nw_css_compile(selector.as_ptr().cast(), selector.len()) };
+                if list.is_null() {
+                    return Err(error("not valid CSS"));
+                }
+                list
+            };
+            parts.push(Part { list, output });
+        }
+        Ok(Query { parts })
     }
 
-    pub fn output(&self) -> &Output {
-        &self.output
+    /// The ending of each selector in the list, in order.
+    pub fn outputs(&self) -> Vec<Output> {
+        self.parts.iter().map(|p| p.output.clone()).collect()
     }
 
-    /// Elements below `scope` (not `scope` itself) that match, in document
-    /// order. A query that is only an ending, such as `::text`, returns
-    /// `scope` itself.
+    /// Elements below `scope` (not `scope` itself) matched by any selector
+    /// in the list, before endings are applied, in document order. A
+    /// selector that is only an ending, such as `::text`, matches `scope`.
     pub fn select<'a>(&self, scope: Node<'a>) -> Vec<Node<'a>> {
+        let mut all: Vec<Node<'a>> = Vec::new();
+        for part in &self.parts {
+            all.extend(part.select(scope));
+        }
+        if self.parts.len() > 1 {
+            sort_and_dedup(&mut all, |n| n.order());
+        }
+        all
+    }
+
+    /// The query's results, in document order.
+    pub fn run<'a>(&self, scope: Node<'a>) -> Vec<Hit<'a>> {
+        if let [part] = self.parts.as_slice() {
+            return part.run(scope);
+        }
+        // Attribute values sort just after their element, before its
+        // children (whose order is higher), as XPath orders attributes.
+        let mut keyed: Vec<((u32, u8), Hit<'a>)> = Vec::new();
+        for part in &self.parts {
+            for (owner, hit) in part.run_with_owner(scope) {
+                let key = (owner.order(), matches!(hit, Hit::Value(_)) as u8);
+                keyed.push((key, hit));
+            }
+        }
+        keyed.sort_by_key(|(k, _)| *k);
+        keyed.dedup_by(|a, b| a.0 == b.0 && a.1 == b.1);
+        keyed.into_iter().map(|(_, h)| h).collect()
+    }
+
+    /// `run`, as the strings `get()`/`getall()` give.
+    pub fn strings(&self, scope: Node<'_>) -> Vec<String> {
+        self.run(scope).iter().map(Hit::to_string_value).collect()
+    }
+}
+
+fn sort_and_dedup<T: PartialEq>(items: &mut Vec<T>, key: impl Fn(&T) -> u32) {
+    items.sort_by_key(|t| key(t));
+    items.dedup();
+}
+
+impl Part {
+    fn select<'a>(&self, scope: Node<'a>) -> Vec<Node<'a>> {
         if self.list.is_null() {
             return vec![scope];
         }
@@ -104,9 +179,15 @@ impl Query {
             .collect()
     }
 
-    /// The query's results as strings: text, attribute values, or for a plain
-    /// selector, the text content of each match.
-    pub fn strings(&self, scope: Node<'_>) -> Vec<String> {
+    fn run<'a>(&self, scope: Node<'a>) -> Vec<Hit<'a>> {
+        self.run_with_owner(scope)
+            .into_iter()
+            .map(|(_, h)| h)
+            .collect()
+    }
+
+    /// Each hit with the node it came from (for a value, its element).
+    fn run_with_owner<'a>(&self, scope: Node<'a>) -> Vec<(Node<'a>, Hit<'a>)> {
         let mut matches = self.select(scope);
         if self.output == (Output::Text { deep: true }) {
             matches = outermost(matches);
@@ -114,8 +195,12 @@ impl Query {
         let mut out = Vec::new();
         for node in matches {
             match &self.output {
-                Output::Nodes => out.push(node.text()),
-                Output::Attr(name) => out.extend(node.attr(name).map(str::to_string)),
+                Output::Nodes => out.push((node, Hit::Node(node))),
+                Output::Attr(name) => {
+                    if let Some(v) = node.attr(name) {
+                        out.push((node, Hit::Value(v.to_string())));
+                    }
+                }
                 Output::Text { deep } => {
                     let texts: Box<dyn Iterator<Item = Node<'_>>> = if *deep {
                         Box::new(node.descendants())
@@ -125,8 +210,7 @@ impl Query {
                     out.extend(
                         texts
                             .filter(|n| n.kind() == NodeKind::Text)
-                            .filter_map(|n| n.data())
-                            .map(str::to_string),
+                            .map(|t| (t, Hit::Node(t))),
                     );
                 }
             }
@@ -137,8 +221,10 @@ impl Query {
 
 impl Drop for Query {
     fn drop(&mut self) {
-        if !self.list.is_null() {
-            unsafe { ffi::nw_css_free(self.list) }
+        for part in &self.parts {
+            if !part.list.is_null() {
+                unsafe { ffi::nw_css_free(part.list) }
+            }
         }
     }
 }
@@ -146,9 +232,37 @@ impl Drop for Query {
 impl fmt::Debug for Query {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Query")
-            .field("output", &self.output)
+            .field("outputs", &self.outputs())
             .finish()
     }
+}
+
+/// Splits a selector list at commas that are not inside parentheses,
+/// brackets or quotes. An empty piece stays, so `a,` is rejected later.
+fn split_top_level(css: &str) -> Vec<&str> {
+    let mut pieces = Vec::new();
+    let (mut depth, mut quote, mut start, mut escaped) = (0i32, None, 0, false);
+    for (i, c) in css.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match (quote, c) {
+            (_, '\\') => escaped = true,
+            (Some(q), c) if c == q => quote = None,
+            (Some(_), _) => {}
+            (None, '"' | '\'') => quote = Some(c),
+            (None, '(' | '[') => depth += 1,
+            (None, ')' | ']') => depth -= 1,
+            (None, ',') if depth == 0 => {
+                pieces.push(&css[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    pieces.push(&css[start..]);
+    pieces
 }
 
 /// Drops matches that sit inside an earlier match, so `div ::text` on nested
