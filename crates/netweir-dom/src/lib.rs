@@ -9,6 +9,7 @@ pub mod extract;
 mod ffi;
 mod index;
 mod query;
+pub mod track;
 mod xpath;
 
 pub use document::{Document, Node, NodeId, NodeKind, ParseTimeout};

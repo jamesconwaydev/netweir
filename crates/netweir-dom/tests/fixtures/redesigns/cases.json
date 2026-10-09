@@ -1,0 +1,12 @@
+[
+  {"case": "class-renamed", "query": "p.price_color", "after": "£24.99"},
+  {"case": "wrapped", "query": "article p.price", "after": "£10.00"},
+  {"case": "tag-changed", "query": "h1.headline", "after": "Spring Sale"},
+  {"case": "price-changed", "query": "#price", "after": "$53.74"},
+  {"case": "reordered", "query": "dd.upc", "after": "a897fe39"},
+  {"case": "id-dropped", "query": "#author", "after": "By Jane Smith"},
+  {"case": "sibling-added", "query": "li.rating", "after": "4.6 stars"},
+  {"case": "many-similar", "query": "td.t", "after": "£8"},
+  {"case": "gone", "query": "p.discount", "after": null},
+  {"case": "unrelated", "query": "p.price_color", "after": null}
+]
