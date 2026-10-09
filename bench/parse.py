@@ -1,7 +1,7 @@
 """Parse + query speed against the Python parsers people use today.
 
     uv run --group bench python bench/parse.py
-    uv run --group bench python bench/parse.py --check   # exit 1 if selectolax wins by >5%
+    uv run --group bench python bench/parse.py --check   # exit 1 if selectolax wins by >15%
 
 Each library parses the page and pulls out every product's price, title and
 link, which is the work a scraper does on every page. The figure is the best
@@ -102,8 +102,12 @@ def main():
     ap.add_argument(
         "--tolerance",
         type=float,
-        default=0.05,
-        help="how much slower than selectolax --check allows; shared CI runners vary by a few %%",
+        default=0.15,
+        help=(
+            "how much slower than selectolax --check allows. The two parse with the same"
+            " lexbor and run within a few %% of each other, which a shared CI runner's"
+            " noise can turn either way; the check is for netweir getting slower"
+        ),
     )
     ap.add_argument("--runs", type=int, default=15)
     args = ap.parse_args()

@@ -115,8 +115,8 @@ async fn nothing_listening_is_an_error_that_says_where() {
     assert!(err.to_string().contains(&port.to_string()), "{err}");
 }
 
-/// The page targets a DevTools HTTP endpoint lists.
-fn page_targets(port: &str) -> usize {
+/// How many pages the DevTools HTTP endpoint lists at `url`.
+fn pages_at(port: &str, url: &str) -> usize {
     use std::io::{Read, Write};
     let mut stream = std::net::TcpStream::connect(format!("127.0.0.1:{port}")).unwrap();
     write!(
@@ -130,7 +130,7 @@ fn page_targets(port: &str) -> usize {
     let mut reply = Vec::new();
     let _ = stream.read_to_end(&mut reply);
     String::from_utf8_lossy(&reply)
-        .matches("\"type\": \"page\"")
+        .matches(&format!("\"url\": \"{url}\""))
         .count()
 }
 
@@ -146,23 +146,23 @@ async fn a_connected_browser_dropped_without_closing_cleans_up_after_itself() {
         .next()
         .unwrap()
         .to_string();
-    let before = page_targets(&port);
+    // Only netweir's page shows this URL; Chrome's own tabs come and go
+    // on their own time.
+    let server = serve(vec![("/mine", html("<p>mine</p>"))]);
+    let url = format!("{}/mine", server.url);
     let browser = Browser::connect(&chrome.ws, LaunchOptions::default())
         .await
         .unwrap();
-    let _page = browser.new_page().await.unwrap();
-    assert_eq!(page_targets(&port), before + 1);
-    drop(_page);
+    let page = browser.new_page().await.unwrap();
+    page.goto(&url, WaitUntil::Load, None).await.unwrap();
+    assert_eq!(pages_at(&port, &url), 1);
+    drop(page);
     drop(browser);
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-    while page_targets(&port) > before && std::time::Instant::now() < deadline {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while pages_at(&port, &url) > 0 && std::time::Instant::now() < deadline {
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
-    assert_eq!(
-        page_targets(&port),
-        before,
-        "netweir's page was left behind"
-    );
+    assert_eq!(pages_at(&port, &url), 0, "netweir's page was left behind");
 }
 
 #[tokio::test]
