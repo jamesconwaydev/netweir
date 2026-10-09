@@ -32,9 +32,10 @@ Working today:
   otherwise use for it.
 - Crawling: spiders, robots.txt, per-site throttling, and items written
   to JSON Lines, CSV or Parquet.
+- Declarative spiders, where you describe the item and the links and
+  Rust does the rest without running any Python per page.
 
-Coming next, in order: declarative spiders that run entirely in Rust;
-self-healing selectors, block recovery and crash-safe resume; then a
+Coming next, in order: self-healing selectors, block recovery and crash-safe resume; then a
 browser driver. The design is in [docs/design/v0.1.md](docs/design/v0.1.md).
 
 ## Quick look
@@ -138,6 +139,47 @@ will look familiar: `Request` with `callback`, `errback`, `meta` and
 `priority`; `page.follow_all()`; `-s concurrency=16` on the command line.
 A callback that raises is logged with the URL and counted, and the crawl
 carries on unless you set `fail_fast=True`.
+
+## Spiders with no Python in the loop
+
+Most spiders are the same three moves: follow the pagination, open each
+product, pull the same fields out of every one. You can say that instead of
+writing it:
+
+```python
+class Book(netweir.Item):
+    title = netweir.css("h1::text")
+    price = netweir.css(".price_color::text", re=r"[\d.]+", into=float)
+    upc = netweir.xpath("//th[.='UPC']/following-sibling::td/text()")
+    stock = netweir.css(".availability::text", re=r"\d+", into=int)
+
+
+class Books(netweir.Spider):
+    start_urls = ["https://books.toscrape.com/"]
+    rules = [
+        netweir.Follow("li.next a"),
+        netweir.Follow("article.product_pod h3 a", extract=Book),
+    ]
+```
+
+Run against the real site, that crawled all 1,050 pages and wrote 1,000
+books like this one:
+
+```json
+{"title": "A Light in the Attic", "price": 51.77, "upc": "a897fe39b1053632", "stock": 22}
+```
+
+Every page in that crawl was parsed, searched and turned into an item in
+Rust, several pages at a time on separate threads. Python saw finished
+items and nothing else, which leaves your event loop and your GIL free for
+whatever your pipelines do. If a price won't turn into a float, you get
+`None` and one warning naming the field and the text it found, rather than
+a crash on page 600.
+
+You don't have to choose. A rule can hand its pages to a callback, a
+callback can call `Book.extract(page)`, and a spider can have both rules
+and its own `parse`. `bench/rules.py` crawls a local 1,050-page shop both
+ways; the declarative spider takes about two thirds of the time.
 
 ## Looking like a browser
 
