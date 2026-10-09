@@ -75,6 +75,7 @@ fn fingerprint(url: &str) -> Option<String> {
 
 #[pymodule]
 fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    m.add("__version__", env!("CARGO_PKG_VERSION"))?;
     m.add_function(wrap_pyfunction!(parse, m)?)?;
     m.add_function(wrap_pyfunction!(fingerprint, m)?)?;
     m.add_class::<Node>()?;

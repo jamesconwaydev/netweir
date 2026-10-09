@@ -127,3 +127,9 @@ def test_names_are_case_insensitive_like_a_browser():
 def test_whitespace_text_nodes_are_kept_like_scrapy():
     root = netweir.parse("<div><p>a</p>\n  <p>b</p></div>")
     assert root.css("div::text").getall() == ["\n  "]
+
+
+def test_the_version_is_the_one_installed():
+    from importlib.metadata import version
+
+    assert netweir.__version__ == version("netweir")
