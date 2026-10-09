@@ -1,0 +1,33 @@
+# Licences netweir can ship under AGPL-3.0 and sell under a commercial
+# licence. Anything GPL-only would rule out the commercial licence.
+[licenses]
+allow = [
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "MIT",
+    "MPL-2.0",
+    "Unicode-3.0",
+    "Zlib",
+]
+confidence-threshold = 0.9
+# The list is what netweir accepts, not what it uses today.
+unused-allowed-license = "allow"
+
+# netweir's own crates.
+[[licenses.exceptions]]
+crate = "netweir-dom"
+allow = ["AGPL-3.0-only"]
+
+[[licenses.exceptions]]
+crate = "netweir-py"
+allow = ["AGPL-3.0-only"]
+
+[bans]
+multiple-versions = "warn"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
