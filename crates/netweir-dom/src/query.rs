@@ -56,10 +56,7 @@ impl Hit<'_> {
 /// A comma-separated list can give each selector its own ending; results
 /// come back in document order.
 ///
-/// Compile once, run on many documents. A `Query` can move between threads
-/// but not be shared by them at once: lexbor does not say its compiled
-/// selectors are safe to match from two threads, so each thread compiles its
-/// own.
+/// Compile once, run on many documents, from any number of threads.
 pub struct Query {
     parts: Vec<Part>,
 }
@@ -71,8 +68,13 @@ struct Part {
 }
 
 // SAFETY: each selector list is a self-contained allocation with no
-// thread-local state, so moving it to another thread is fine. Not `Sync`.
+// thread-local state, so moving it to another thread is fine. Sharing is
+// fine too: matching creates its own lxb_selectors_t per call and takes the
+// list as `const lxb_css_selector_list_t *`; lexbor's matcher
+// (selectors/selectors.c, 3.0.0) writes only to that per-call state and never
+// to the list. The list is freed only in Drop, which needs ownership.
 unsafe impl Send for Query {}
+unsafe impl Sync for Query {}
 
 impl Query {
     pub fn new(css: &str) -> Result<Query, QueryError> {

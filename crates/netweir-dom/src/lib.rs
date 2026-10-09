@@ -1,9 +1,11 @@
-//! HTML parsing and CSS queries for netweir.
+//! HTML parsing, CSS and XPath queries, and declarative extraction for
+//! netweir.
 //!
 //! Parsing is done by lexbor, a C implementation of the HTML5 parsing spec.
 //! The tree stays in lexbor's memory; [`Node`] is a borrowed handle into it.
 
 mod document;
+pub mod extract;
 mod ffi;
 mod index;
 mod query;
