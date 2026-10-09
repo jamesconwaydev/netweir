@@ -25,8 +25,8 @@ Working today:
 - Fetching that is indistinguishable from Chrome 154 or Firefox 156 on the
   wire, over HTTP/2 and HTTP/1.1, with cookies and redirects. Below: how that's
   proved, and the one known exception.
-- A parser that beats selectolax, the one to beat in Python, on the same
-  pages.
+- A parser that keeps pace with selectolax, the one to beat in Python, and
+  pulls data out of the page faster.
 - CSS queries with Scrapy's `::text` and `::attr()`, all of XPath 1.0, and
   Beautiful Soup's `find_all` family, each faster than the library you'd
   otherwise use for it.
@@ -289,7 +289,7 @@ page:
 | lxml + cssselect | 347 ms | 82 s |
 | parsel | 353 ms | 82 s |
 
-Measured on an Apple M-series laptop with Python 3.14. The lead over selectolax is small because both use lexbor; it comes from doing the extraction in Rust. Run it yourself:
+Measured on an Apple M-series laptop with Python 3.14. The lead over selectolax is small, because both parse with lexbor, and it comes from doing the extraction in Rust. On other machines the two can swap places by a few percent; on CI's Linux runners they do. Run it yourself:
 `uv run --group bench python bench/parse.py`.
 
 XPath and `find_all` are a different story, because the libraries people
