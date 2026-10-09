@@ -393,7 +393,7 @@ netweir and every setting with its default.
 You need Rust, a C compiler, CMake and [uv](https://docs.astral.sh/uv/).
 
 ```
-git clone --recurse-submodules https://github.com/jamesconwaydev/netweir
+git clone --recurse-submodules https://github.com/netweir/netweir
 cd netweir
 uv sync --group dev
 uv run maturin develop --uv
@@ -402,6 +402,14 @@ uv run pytest
 
 uv installs the dependencies and maturin builds netweir, so after changing
 any Rust, rerun `uv run maturin develop --uv` before testing.
+
+## Contributing
+
+Issues, fixes and new browser profiles are all welcome.
+[CONTRIBUTING.md](CONTRIBUTING.md) covers building, testing and the one
+hard rule (write it yourself), and before your first pull request is merged
+you'll be asked to agree to the [CLA](CLA.md), once. Questions go in
+[Discussions](https://github.com/netweir/netweir/discussions).
 
 ## Licence
 

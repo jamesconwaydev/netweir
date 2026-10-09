@@ -1,0 +1,32 @@
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      cargo:
+        update-types: [minor, patch]
+    ignore:
+      # The TLS and HTTP stack is pinned on purpose: a new version can
+      # change the fingerprint, so it's moved by hand with the profile
+      # tests run against it.
+      - dependency-name: wreq
+      - dependency-name: btls
+      - dependency-name: btls-sys
+      - dependency-name: tokio-btls
+      - dependency-name: http2
+  - package-ecosystem: uv
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      python:
+        update-types: [minor, patch]
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      actions:
+        patterns: ["*"]

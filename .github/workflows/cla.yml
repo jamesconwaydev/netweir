@@ -1,0 +1,157 @@
+name: cla
+
+# Every author of a pull request agrees to CLA.md once, by commenting the
+# phrase below. Agreements are kept on the cla-signatures branch. This
+# never checks out or runs the pull request's code, which is what makes
+# pull_request_target safe here.
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened]
+  issue_comment:
+    types: [created]
+
+permissions:
+  contents: read
+
+jobs:
+  cla:
+    if: >-
+      github.event_name == 'pull_request_target' ||
+      (github.event.issue.pull_request &&
+       contains(github.event.comment.body, 'I have read the CLA and I agree to it'))
+    runs-on: ubuntu-latest
+    permissions:
+      # To record an agreement on the cla-signatures branch.
+      contents: write
+      # To ask for agreement on the pull request.
+      pull-requests: write
+      # To run the check again once someone has agreed.
+      actions: write
+    steps:
+      - uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        with:
+          script: |
+            const PHRASE = 'I have read the CLA and I agree to it';
+            const BRANCH = 'cla-signatures';
+            const FILE = 'signatures.json';
+            const VERSION = '1.0';
+            // The copyright holder doesn't license their own work to
+            // themselves.
+            const EXEMPT = new Set(['jamesconwaydev']);
+            const MARK = '<!-- netweir-cla -->';
+            const { owner, repo } = context.repo;
+            const CLA = `https://github.com/${owner}/${repo}/blob/main/CLA.md`;
+
+            async function signatures() {
+              const { data } = await github.rest.repos.getContent({
+                owner, repo, path: FILE, ref: BRANCH,
+              });
+              return {
+                list: JSON.parse(Buffer.from(data.content, 'base64').toString('utf8')),
+                sha: data.sha,
+              };
+            }
+
+            const number = context.payload.pull_request?.number ?? context.payload.issue.number;
+            const { data: pr } = await github.rest.pulls.get({ owner, repo, pull_number: number });
+
+            if (context.eventName === 'issue_comment') {
+              const who = context.payload.comment.user;
+              if (!context.payload.comment.body.includes(PHRASE) || who.type === 'Bot') {
+                return;
+              }
+              // Two people agreeing at once both write the file; the
+              // second write fails on the stale sha and tries again.
+              for (let attempt = 0; ; attempt++) {
+                const { list, sha } = await signatures();
+                if (list.some((s) => s.id === who.id)) {
+                  break;
+                }
+                list.push({
+                  login: who.login,
+                  id: who.id,
+                  cla_version: VERSION,
+                  signed_at: context.payload.comment.created_at,
+                  pull_request: number,
+                  comment: context.payload.comment.html_url,
+                });
+                try {
+                  await github.rest.repos.createOrUpdateFileContents({
+                    owner, repo, path: FILE, branch: BRANCH, sha,
+                    message: `cla: ${who.login} agreed to CLA ${VERSION} on #${number}`,
+                    content: Buffer.from(JSON.stringify(list, null, 2) + '\n').toString('base64'),
+                  });
+                  break;
+                } catch (e) {
+                  if (e.status !== 409 || attempt >= 4) {
+                    throw e;
+                  }
+                }
+              }
+              const { data: runs } = await github.rest.actions.listWorkflowRuns({
+                owner, repo, workflow_id: 'cla.yml',
+                event: 'pull_request_target', head_sha: pr.head.sha,
+              });
+              if (runs.workflow_runs.length > 0) {
+                await github.rest.actions.reRunWorkflow({
+                  owner, repo, run_id: runs.workflow_runs[0].id,
+                });
+              }
+              return;
+            }
+
+            const commits = await github.paginate(github.rest.pulls.listCommits, {
+              owner, repo, pull_number: number, per_page: 100,
+            });
+            const authors = new Map();
+            const unlinked = new Set();
+            for (const c of commits) {
+              if (!c.author) {
+                unlinked.add(c.commit.author.email);
+              } else if (c.author.type !== 'Bot' && !EXEMPT.has(c.author.login)) {
+                authors.set(c.author.id, c.author.login);
+              }
+            }
+            const { list } = await signatures();
+            const signed = new Set(list.map((s) => s.id));
+            const missing = [...authors].filter(([id]) => !signed.has(id)).map(([, login]) => login);
+
+            const comments = await github.paginate(github.rest.issues.listComments, {
+              owner, repo, issue_number: number, per_page: 100,
+            });
+            const ours = comments.find((c) => c.user.type === 'Bot' && c.body.startsWith(MARK));
+
+            if (missing.length === 0 && unlinked.size === 0) {
+              if (ours) {
+                await github.rest.issues.updateComment({
+                  owner, repo, comment_id: ours.id,
+                  body: `${MARK}\nEveryone on this pull request has agreed to the [CLA](${CLA}). Thank you.`,
+                });
+              }
+              return;
+            }
+
+            let body = `${MARK}\nThanks for the pull request. Before it can be merged, `;
+            body += `every author needs to agree to the [CLA](${CLA}), once. `;
+            body += 'It keeps your copyright with you and lets netweir be offered under the AGPL and a commercial licence.\n\n';
+            if (missing.length > 0) {
+              body += `Still to agree: ${missing.map((l) => '@' + l).join(', ')}. `;
+              body += 'To agree, post this comment on this pull request:\n\n';
+              body += `> ${PHRASE}.\n\n`;
+            }
+            if (unlinked.size > 0) {
+              body += 'Some commits are by an email address that isn\'t linked to a GitHub account, ';
+              body += 'so there is no one to ask. Add the address to your GitHub account, or ';
+              body += 'rewrite those commits with an address that is, then push again.\n';
+            }
+            if (ours) {
+              await github.rest.issues.updateComment({ owner, repo, comment_id: ours.id, body });
+            } else {
+              await github.rest.issues.createComment({ owner, repo, issue_number: number, body });
+            }
+            // Logs are public, so unlinked authors are counted, not named.
+            const waiting = [...missing];
+            if (unlinked.size > 0) {
+              waiting.push(`${unlinked.size} author(s) with no GitHub account`);
+            }
+            core.setFailed(`waiting for the CLA from: ${waiting.join(', ')}`);
