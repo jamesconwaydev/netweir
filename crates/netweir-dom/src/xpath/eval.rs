@@ -135,7 +135,17 @@ fn python_float(n: f64) -> String {
     }
 }
 
+/// Stack kept free before recursing, and the size of each extra segment.
+/// The parser caps nesting, but debug builds use large frames and callers
+/// may run on small thread stacks.
+const RED_ZONE: usize = 64 * 1024;
+const GROW: usize = 1024 * 1024;
+
 fn eval<'a>(expr: &Expr, ctx: &Context<'a, '_>) -> Result<Value<'a>> {
+    stacker::maybe_grow(RED_ZONE, GROW, || eval_here(expr, ctx))
+}
+
+fn eval_here<'a>(expr: &Expr, ctx: &Context<'a, '_>) -> Result<Value<'a>> {
     Ok(match expr {
         Expr::Literal(s) => text(s.clone()),
         Expr::Number(n) => Value::Num(*n),
@@ -179,10 +189,12 @@ fn eval<'a>(expr: &Expr, ctx: &Context<'a, '_>) -> Result<Value<'a>> {
     })
 }
 
-fn in_document_order(mut items: Vec<Item<'_>>) -> Vec<Item<'_>> {
-    items.sort_by_key(Item::key);
-    items.dedup_by_key(|i| i.key());
-    items
+fn in_document_order(items: Vec<Item<'_>>) -> Vec<Item<'_>> {
+    // A key costs a call into lexbor, so each is read once.
+    let mut keyed: Vec<_> = items.into_iter().map(|i| (i.key(), i)).collect();
+    keyed.sort_unstable_by_key(|(k, _)| *k);
+    keyed.dedup_by_key(|(k, _)| *k);
+    keyed.into_iter().map(|(_, i)| i).collect()
 }
 
 fn walk<'a>(
@@ -212,9 +224,18 @@ fn walk<'a>(
             continue;
         }
         let test = Test::resolve(&step.test, step.axis, ctx.root);
+        // A leading `[k]` with k a whole number from 1 up.
+        let nth = match step.predicates.first() {
+            Some(Expr::Number(k)) if *k >= 1.0 && k.fract() == 0.0 && *k < usize::MAX as f64 => {
+                Some(*k as usize)
+            }
+            _ => None,
+        };
         let mut next = Vec::new();
         for item in &items {
             candidates.clear();
+            // Predicates already applied while collecting candidates.
+            let mut done = 0;
             match (item, test.indexable()) {
                 // Child and descendant steps on names, *, text() and node()
                 // scan the document index instead of walking lexbor's nodes.
@@ -240,10 +261,21 @@ fn walk<'a>(
                     }
                     candidates.extend(scanned.iter().copied().map(Item::Node));
                 }
-                _ => candidates.extend(axis(*item, step.axis).filter(|c| test.matches(c))),
+                _ => {
+                    let mut on_axis = axis(*item, step.axis).filter(|c| test.matches(c));
+                    if nth.is_some() {
+                        done = 1;
+                    }
+                    match nth {
+                        // `[k]` first: stop at the kth node instead of
+                        // collecting the whole axis (following-sibling::dd[1]).
+                        Some(k) => candidates.extend(on_axis.nth(k - 1)),
+                        None => candidates.extend(on_axis),
+                    }
+                }
             }
             let mut kept = std::mem::take(&mut candidates);
-            for p in &step.predicates {
+            for p in &step.predicates[done..] {
                 kept = filter(kept, p, ctx)?;
             }
             next.extend_from_slice(&kept);
@@ -273,11 +305,20 @@ fn descendants_by_parent<'a>(
         return None;
     }
     let mut found = Vec::new();
+    // Items come in document order. One inside an earlier item's subtree
+    // was scanned with it, and scanning it again would count its
+    // descendants twice.
+    let mut covered_to = 0;
     for item in items {
         // An attribute has no children.
         let Item::Node(n) = item else { continue };
         let index = n.doc.index();
-        index.descendants(n.doc, n.order(), false, |k, t| test.keeps(k, t), &mut found);
+        let at = n.order();
+        if at < covered_to {
+            continue;
+        }
+        covered_to = index.end_of(at);
+        index.descendants(n.doc, at, false, |k, t| test.keeps(k, t), &mut found);
     }
     // Group by parent, keeping each group in document order.
     let mut groups: Vec<(u32, Vec<Item<'a>>)> = Vec::new();
@@ -293,7 +334,6 @@ fn descendants_by_parent<'a>(
     let run = || -> Result<Vec<Item<'a>>> {
         let mut out = Vec::new();
         for (_, mut group) in groups {
-            group.dedup_by_key(|i| i.key());
             for p in &step.predicates {
                 group = filter(group, p, ctx)?;
             }
@@ -319,7 +359,12 @@ fn quick_predicate(pred: &Expr, item: &Item<'_>) -> Option<bool> {
                     test: NodeTest::Name(n),
                     predicates,
                 },
-            ] if predicates.is_empty() => Some(n.clone()),
+                // lexbor folds case when looking an attribute up by name, but
+                // XPath names are case-sensitive and HTML attribute names are
+                // stored lowercase: leave capitals to the general path.
+            ] if predicates.is_empty() && !n.bytes().any(|b| b.is_ascii_uppercase()) => {
+                Some(n.clone())
+            }
             _ => None,
         },
         _ => None,
@@ -740,14 +785,17 @@ fn call<'a>(name: &str, args: &[Expr], ctx: &Context<'a, '_>) -> Result<Value<'a
                     .collect(),
                 other => vec![string(&other)],
             };
-            let tokens: Vec<&str> = wanted.iter().flat_map(|s| s.split_whitespace()).collect();
-            let found = ctx
-                .root
-                .descendants()
-                .filter(|n| n.attr("id").is_some_and(|id| tokens.contains(&id)))
+            let index = ctx.root.doc.index();
+            let found = wanted
+                .iter()
+                .flat_map(|s| s.split_whitespace())
+                .flat_map(|id| index.with_id(ctx.root.doc, id))
+                .filter(|n| {
+                    n.order() >= ctx.root.order() && n.order() < index.end_of(ctx.root.order())
+                })
                 .map(Item::Node)
                 .collect();
-            Value::Nodes(found)
+            Value::Nodes(in_document_order(found))
         }
         "local-name" | "name" => {
             arity(0, 1)?;
@@ -945,10 +993,11 @@ fn call<'a>(name: &str, args: &[Expr], ctx: &Context<'a, '_>) -> Result<Value<'a
             arity(4, 4)?;
             let (input, flags, with) = (str_arg(0)?, str_arg(2)?, str_arg(3)?);
             let re = regex(&str_arg(1)?, &flags)?;
+            let expand = |caps: &regex::Captures<'_>| substitute(caps, &with);
             text(if flags.contains('g') {
-                re.replace_all(&input, with.as_str()).into_owned()
+                re.replace_all(&input, expand).into_owned()
             } else {
-                re.replace(&input, with.as_str()).into_owned()
+                re.replace(&input, expand).into_owned()
             })
         }
         _ => return Err(format!("unknown function {name}()")),
@@ -962,8 +1011,58 @@ fn round(x: f64) -> f64 {
     } else if (-0.5..0.0).contains(&x) {
         -0.0
     } else {
-        (x + 0.5).floor()
+        // Not (x + 0.5).floor(): the addition rounds, which turns
+        // 0.49999999999999994 into 1 and moves odd integers above 2^52.
+        let f = x.floor();
+        if x - f >= 0.5 { f + 1.0 } else { f }
     }
+}
+
+/// A replacement written as lxml (and Python's `re`) reads it: `\1` to
+/// `\99` and `\g<name>` are groups, `\\` is a backslash, `\n` and `\t`
+/// are escapes, and `$` is just a dollar sign.
+fn substitute(caps: &regex::Captures<'_>, with: &str) -> String {
+    let group = |out: &mut String, m: Option<regex::Match<'_>>| {
+        if let Some(m) = m {
+            out.push_str(m.as_str());
+        }
+    };
+    let mut out = String::new();
+    let mut chars = with.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        match chars.next() {
+            Some(d @ '0'..='9') => {
+                let mut n = d.to_digit(10).unwrap() as usize;
+                if let Some(e) = chars.peek().and_then(|e| e.to_digit(10)) {
+                    n = n * 10 + e as usize;
+                    chars.next();
+                }
+                group(&mut out, caps.get(n));
+            }
+            Some('g') if chars.peek() == Some(&'<') => {
+                chars.next();
+                let name: String = chars.by_ref().take_while(|&c| c != '>').collect();
+                let m = match name.parse::<usize>() {
+                    Ok(n) => caps.get(n),
+                    Err(_) => caps.name(&name),
+                };
+                group(&mut out, m);
+            }
+            Some('n') => out.push('\n'),
+            Some('t') => out.push('\t'),
+            Some('\\') => out.push('\\'),
+            Some(other) => {
+                out.push('\\');
+                out.push(other);
+            }
+            None => out.push('\\'),
+        }
+    }
+    out
 }
 
 /// EXSLT flags: `i` ignores case, `g` (replace only) replaces every match.

@@ -384,3 +384,123 @@ fn xpath_2_steps_are_rejected_with_a_readable_message() {
     let err = XPath::new("//p/name()").unwrap_err();
     assert!(err.to_string().contains("unexpected \"(\""), "{err}");
 }
+
+fn on(html: &str, query: &str) -> Vec<String> {
+    let doc = Document::parse(html);
+    XPath::new(query)
+        .unwrap_or_else(|e| panic!("{query}: {e}"))
+        .run(doc.root())
+        .unwrap_or_else(|e| panic!("{query}: {e}"))
+        .iter()
+        .map(Hit::to_string_value)
+        .collect()
+}
+
+#[test]
+fn nested_context_nodes_count_each_child_once() {
+    let divs = "<div id=o><div id=i><p>a</p><p>b</p><p>c</p></div></div>";
+    assert_eq!(on(divs, "//div//p[position() > 1]/text()"), ["b", "c"]);
+    assert_eq!(on(divs, "//div//p[4]/text()"), Vec::<String>::new());
+    assert_eq!(on(divs, "//div//p[last() = 3]/text()"), ["a", "b", "c"]);
+    assert_eq!(
+        on(
+            divs,
+            "//div/descendant-or-self::node()/child::p[position() > 1]/text()"
+        ),
+        ["b", "c"]
+    );
+    let lists = "<ul><li>1<ul><li>x</li></ul></li><li>2</li><li>3</li><li>4</li></ul>";
+    assert_eq!(on(lists, "//ul//li[position() > 2]/text()"), ["3", "4"]);
+    let mixed = "<div><ul><li>a</li><li>b</li><li>c</li></ul></div><div><ul><li>x</li></ul></div>";
+    assert_eq!(on(mixed, "(//div | //div/ul)//li[3]/text()"), ["c"]);
+}
+
+#[test]
+fn deeply_nested_expressions_are_errors_not_crashes() {
+    let deep = [
+        "(".repeat(3000) + "1" + &")".repeat(3000),
+        "not(".repeat(10_000) + "1" + &")".repeat(10_000),
+        "//p[".repeat(5000) + "1" + &"]".repeat(5000),
+        "-".repeat(50_000) + "1",
+        vec!["//p"; 30_000].join(" | "),
+        vec!["1"; 100_000].join(" + "),
+    ];
+    for q in deep {
+        let err = XPath::new(&q).unwrap_err();
+        assert!(err.to_string().contains("too"), "{err}");
+    }
+    // Reasonable depth still works.
+    assert_eq!(
+        on("<p>", &("(".repeat(100) + "1" + &")".repeat(100))),
+        ["1.0"]
+    );
+    assert_eq!(on("<p>", &vec!["1"; 200].join(" + ")), ["200.0"]);
+}
+
+#[test]
+fn attribute_names_with_capitals_match_nothing_on_both_paths() {
+    let html = r#"<p id="a">x</p>"#;
+    assert_eq!(on(html, "//p[@ID]/@id"), Vec::<String>::new());
+    assert_eq!(on(html, "//p[@ID='a']/@id"), Vec::<String>::new());
+    assert_eq!(on(html, "//p/@ID"), Vec::<String>::new());
+}
+
+#[test]
+fn first_on_an_axis_from_many_nodes_is_linear() {
+    let html = "<ul>".to_string() + &"<li>x</li>".repeat(10_000) + "</ul>";
+    let doc = Document::parse(&html);
+    let start = std::time::Instant::now();
+    for (q, n) in [
+        ("//li/following-sibling::li[1]", 9_999),
+        ("//li/preceding-sibling::li[1]", 9_999),
+        ("//li/following-sibling::li[2]", 9_998),
+    ] {
+        assert_eq!(
+            XPath::new(q).unwrap().run(doc.root()).unwrap().len(),
+            n,
+            "{q}"
+        );
+    }
+    assert!(
+        start.elapsed() < std::time::Duration::from_secs(3),
+        "{:?}",
+        start.elapsed()
+    );
+    let dl = "<dl><dt>A</dt><dd>1</dd><dd>2</dd><dt>B</dt><dd>3</dd></dl>";
+    assert_eq!(on(dl, "//dt[.='A']/following-sibling::dd[1]/text()"), ["1"]);
+    assert_eq!(on(dl, "//dd[.='3']/preceding-sibling::*[1]/text()"), ["B"]);
+    assert_eq!(on(dl, "//dd[.='3']/preceding-sibling::dd[2]/text()"), ["1"]);
+    assert_eq!(
+        on(dl, "//dt/following-sibling::dd[1][.='2']"),
+        Vec::<String>::new()
+    );
+}
+
+#[test]
+fn round_is_exact_at_the_edges() {
+    assert_eq!(on("<p>", "round(0.49999999999999994)"), ["0.0"]);
+    assert_eq!(on("<p>", "round(4503599627370497)"), ["4503599627370497.0"]);
+    assert_eq!(on("<p>", "round(2.5)"), ["3.0"]);
+    assert_eq!(on("<p>", "round(-2.5)"), ["-2.0"]);
+}
+
+#[test]
+fn re_replace_takes_backslash_groups_like_lxml() {
+    assert_eq!(
+        on("<p>", r"re:replace('a-b', '(\w)-(\w)', 'g', '\2-\1')"),
+        ["b-a"]
+    );
+    assert_eq!(
+        on("<p>", r"re:replace('a-b', '(\w)-(\w)', 'g', '$1')"),
+        ["$1"]
+    );
+}
+
+#[test]
+fn id_finds_every_token_in_document_order() {
+    let html = r#"<p id="a">1</p><p id="b">2</p><p id="c">3</p>"#;
+    assert_eq!(on(html, "id('c a')/text()"), ["1", "3"]);
+    assert_eq!(on(html, "id('a a')/text()"), ["1"]);
+    assert_eq!(on(html, "id(//p[2]/@id)/text()"), ["2"]);
+    assert_eq!(on(html, "id('zz')"), Vec::<String>::new());
+}

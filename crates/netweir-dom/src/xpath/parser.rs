@@ -113,6 +113,7 @@ pub(crate) fn parse(src: &str, tokens: Vec<Token>) -> Result<Expr, XPathError> {
         src,
         tokens,
         pos: 0,
+        depth: 0,
     };
     if p.tokens.is_empty() {
         return Err(p.error("empty expression"));
@@ -131,7 +132,14 @@ struct Parser<'s> {
     src: &'s str,
     tokens: Vec<Token>,
     pos: usize,
+    /// How deep the tree being built goes: brackets, predicates, function
+    /// arguments, negations and operator chains. Evaluating and dropping
+    /// the tree recurse that deep, so it is capped before the tree exists.
+    depth: usize,
 }
+
+/// Far beyond any real query, and far inside a thread's stack.
+const MAX_DEPTH: usize = 256;
 
 const NODE_TYPES: [&str; 4] = ["comment", "text", "processing-instruction", "node"];
 
@@ -168,8 +176,21 @@ impl Parser<'_> {
         }
     }
 
+    fn deeper(&mut self) -> Result<(), XPathError> {
+        self.depth += 1;
+        if self.depth > MAX_DEPTH {
+            return Err(self.error(&format!(
+                "expression nested too deeply (over {MAX_DEPTH} levels)"
+            )));
+        }
+        Ok(())
+    }
+
     fn expr(&mut self) -> Result<Expr, XPathError> {
-        self.binary(0)
+        self.deeper()?;
+        let e = stacker::maybe_grow(64 * 1024, 1024 * 1024, || self.binary(0));
+        self.depth -= 1;
+        e
     }
 
     /// Precedence climbing over the binary operators, loosest first.
@@ -195,28 +216,55 @@ impl Parser<'_> {
             return self.unary();
         }
         let mut left = self.binary(level + 1)?;
-        'outer: loop {
+        // Each operator puts the chain so far one level further down.
+        let mut chain = 0;
+        let result = 'outer: loop {
             for (token, op) in LEVELS[level] {
                 if self.eat(token) {
-                    let right = self.binary(level + 1)?;
+                    chain += 1;
+                    if let Err(e) = self.deeper() {
+                        break 'outer Err(e);
+                    }
+                    let right = match self.binary(level + 1) {
+                        Ok(r) => r,
+                        Err(e) => break 'outer Err(e),
+                    };
                     left = Expr::Binary(*op, Box::new(left), Box::new(right));
                     continue 'outer;
                 }
             }
-            return Ok(left);
-        }
+            break Ok(left);
+        };
+        self.depth -= chain;
+        result
     }
 
     fn unary(&mut self) -> Result<Expr, XPathError> {
         if self.eat(&Token::Minus) {
-            return Ok(Expr::Negate(Box::new(self.unary()?)));
+            self.deeper()?;
+            let inner = stacker::maybe_grow(64 * 1024, 1024 * 1024, || self.unary());
+            self.depth -= 1;
+            return Ok(Expr::Negate(Box::new(inner?)));
         }
         let mut left = self.path_expr()?;
+        let mut chain = 0;
+        let mut result = Ok(());
         while self.eat(&Token::Pipe) {
-            let right = self.path_expr()?;
-            left = Expr::Union(Box::new(left), Box::new(right));
+            chain += 1;
+            result = self.deeper();
+            if result.is_err() {
+                break;
+            }
+            match self.path_expr() {
+                Ok(right) => left = Expr::Union(Box::new(left), Box::new(right)),
+                Err(e) => {
+                    result = Err(e);
+                    break;
+                }
+            }
         }
-        Ok(left)
+        self.depth -= chain;
+        result.map(|()| left)
     }
 
     fn starts_filter(&self) -> bool {

@@ -13,3 +13,4 @@ cc = "1"
 
 [dependencies]
 regex = "1"
+stacker = "0.1"

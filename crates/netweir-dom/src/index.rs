@@ -2,6 +2,9 @@
 //! descendants are the contiguous range after it, so scanning them is a
 //! pass over small arrays rather than a walk through lexbor's linked nodes.
 
+use std::collections::HashMap;
+use std::sync::OnceLock;
+
 use crate::document::{Document, Node};
 use crate::ffi::{self, RawNode};
 
@@ -13,6 +16,8 @@ pub(crate) struct Index {
     end: Vec<u32>,
     kind: Vec<u8>,
     tag: Vec<usize>,
+    /// Positions of the elements carrying each `id`, built on first use.
+    ids: OnceLock<HashMap<String, Vec<u32>>>,
 }
 
 // SAFETY: the pointers are into a document that is never modified after
@@ -51,7 +56,28 @@ impl Index {
             end,
             kind,
             tag,
+            ids: OnceLock::new(),
         }
+    }
+
+    /// The elements whose `id` is `id`, in document order.
+    pub(crate) fn with_id<'a>(&self, doc: &'a Document, id: &str) -> Vec<Node<'a>> {
+        let ids = self.ids.get_or_init(|| {
+            let mut ids: HashMap<String, Vec<u32>> = HashMap::new();
+            for (j, &raw) in self.raw.iter().enumerate() {
+                if let Some(v) = Node::from_raw(doc, raw).attr("id") {
+                    ids.entry(v.to_string()).or_default().push(j as u32);
+                }
+            }
+            ids
+        });
+        ids.get(id)
+            .map(|at| {
+                at.iter()
+                    .map(|&j| Node::from_raw(doc, self.raw[j as usize]))
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     /// Appends to `out` the nodes below `at` (from `at` itself if
@@ -70,6 +96,11 @@ impl Index {
                 out.push(Node::from_raw(doc, self.raw[j]));
             }
         }
+    }
+
+    /// One past the last descendant of `at`.
+    pub(crate) fn end_of(&self, at: u32) -> u32 {
+        self.end[at as usize]
     }
 
     /// The position of the parent of the node at `at`.
