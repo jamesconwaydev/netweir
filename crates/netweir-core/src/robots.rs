@@ -155,7 +155,9 @@ impl Robots {
             .iter()
             .filter_map(|g| g.crawl_delay)
             .reduce(f64::max)
-            .and_then(|s| Duration::try_from_secs_f64(s).ok())
+            // Too large for a Duration means "as slow as allowed"; the
+            // crawler caps it at its max_delay.
+            .map(|s| Duration::try_from_secs_f64(s).unwrap_or(Duration::MAX))
     }
 
     pub fn sitemaps(&self) -> &[String] {
@@ -179,18 +181,20 @@ fn normalize(s: &str) -> String {
     let mut i = 0;
     while i < bytes.len() {
         let b = bytes[i];
-        if b == b'%' && i + 2 < bytes.len() {
-            let hex = &s[i + 1..i + 3];
-            if let Ok(v) = u8::from_str_radix(hex, 16) {
-                if v.is_ascii_alphanumeric() || matches!(v, b'-' | b'.' | b'_' | b'~') {
-                    out.push(v as char);
-                } else {
-                    out.push('%');
-                    out.push_str(&hex.to_ascii_uppercase());
-                }
-                i += 3;
-                continue;
+        // `get` rather than indexing: the two bytes after % may not be
+        // characters on their own (`%aé`).
+        if b == b'%'
+            && let Some(hex) = s.get(i + 1..i + 3)
+            && let Ok(v) = u8::from_str_radix(hex, 16)
+        {
+            if v.is_ascii_alphanumeric() || matches!(v, b'-' | b'.' | b'_' | b'~') {
+                out.push(v as char);
+            } else {
+                out.push('%');
+                out.push_str(&hex.to_ascii_uppercase());
             }
+            i += 3;
+            continue;
         }
         if b.is_ascii() {
             out.push(b as char);
@@ -307,6 +311,39 @@ Sitemap: https://example.com/sitemap.xml
         assert!(Robots::parse("").allowed("x", "/admin"));
         assert!(Robots::allow_all().allowed("x", "/admin"));
         assert!(!Robots::disallow_all().allowed("x", "/"));
+    }
+
+    #[test]
+    fn escapes_cut_short_by_a_multibyte_character_are_kept() {
+        let r = Robots::parse("User-agent: *\nDisallow: /%aé\nDisallow: /x%\nDisallow: /y%4\n");
+        assert!(!r.allowed("netweir", "/%aé"));
+        assert!(!r.allowed("netweir", "/x%"));
+        assert!(r.allowed("netweir", "/other"));
+        assert_eq!(
+            Robots::parse("User-agent: *\nCrawl-delay: 1e300\n").crawl_delay("x"),
+            Some(Duration::MAX)
+        );
+    }
+
+    #[test]
+    fn any_text_parses_without_panicking() {
+        // A fixed-seed xorshift, so a failure reproduces.
+        let mut x: u64 = 0x2545_f491_4f6c_dd1d;
+        let alphabet: Vec<char> = "%aAé€😀*$/:\n \r#\u{feff}disallow:Allow-user agent0123456789"
+            .chars()
+            .collect();
+        for _ in 0..2000 {
+            let mut text = String::new();
+            for _ in 0..(x % 200) {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                text.push(alphabet[(x % alphabet.len() as u64) as usize]);
+            }
+            let r = Robots::parse(&text);
+            let _ = r.allowed("netweir", &text);
+            let _ = r.crawl_delay("netweir");
+        }
     }
 
     #[test]

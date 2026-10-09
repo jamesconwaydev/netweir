@@ -2,7 +2,7 @@
 //! a site's first request, per-host concurrency and adaptive delays, and
 //! deduplication. The caller submits requests and takes events in batches.
 
-use std::cmp::Ordering;
+use std::cmp::{Ordering, Reverse};
 use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -11,7 +11,7 @@ use tokio::sync::Notify;
 use url::Url;
 
 use crate::canonical::{Fingerprint, fingerprint};
-use crate::fetch::{FetchError, FetchOptions, Fetcher, Response};
+use crate::fetch::{FetchError, FetchErrorKind, FetchOptions, Fetcher, Hop, Response};
 use crate::robots::Robots;
 use crate::tdmrep::{self, Reservation, TdmFile};
 
@@ -124,6 +124,11 @@ struct State {
     hosts: HashMap<String, Host>,
     origins: HashMap<String, Origin>,
     events: VecDeque<Event>,
+    /// Hosts that may be able to start a request. The scheduler visits only
+    /// these, so its work follows what changed, not how many hosts exist.
+    ready: VecDeque<String>,
+    /// Hosts waiting out their delay, soonest first.
+    timers: BinaryHeap<Reverse<(Instant, String)>>,
     /// robots.txt and tdmrep.json fetches under way.
     gate_fetches: usize,
     stats: Stats,
@@ -137,12 +142,18 @@ struct Host {
     delay: Duration,
     /// The robots.txt Crawl-delay, below which the delay never goes.
     floor: Duration,
+    /// In `State::ready`.
+    listed: bool,
+    /// When this host's timer is set for, so it is set once.
+    timer: Option<Instant>,
 }
 
 #[derive(Default)]
 struct Origin {
     robots: Gate<Robots>,
     tdm: Gate<Option<TdmFile>>,
+    /// Hosts waiting for this origin's robots.txt or TDMRep file.
+    waiting: Vec<String>,
 }
 
 #[derive(Default)]
@@ -157,8 +168,11 @@ struct Queued {
     priority: i32,
     seq: u64,
     request: CrawlRequest,
+    host: String,
     origin: String,
     path: String,
+    /// Redirects followed so far to get to `request.url`.
+    hops: usize,
 }
 
 impl PartialEq for Queued {
@@ -196,48 +210,18 @@ impl Crawler {
     }
 
     pub fn submit(&self, request: CrawlRequest) -> Submitted {
-        let Ok(url) = Url::parse(&request.url) else {
-            return Submitted::Invalid;
-        };
-        let (Some(host), true) = (url.host_str(), matches!(url.scheme(), "http" | "https")) else {
-            return Submitted::Invalid;
-        };
         let Some(fp) = fingerprint("GET", &request.url) else {
             return Submitted::Invalid;
         };
-        let origin = url.origin().ascii_serialization();
-        let path = match url.query() {
-            Some(q) => format!("{}?{q}", url.path()),
-            None => url.path().to_string(),
-        };
-        let host = host.to_string();
         let mut state = self.shared.lock();
         if !state.seen.insert(fp) && !request.dont_filter {
             state.stats.duplicates += 1;
             return Submitted::Duplicate;
         }
-        state.seq += 1;
-        let seq = state.seq;
-        let settings = &self.shared.settings;
-        let entry = state.hosts.entry(host).or_insert_with(|| Host {
-            queue: BinaryHeap::new(),
-            in_flight: 0,
-            next_at: Instant::now(),
-            delay: if settings.throttle {
-                settings.start_delay
-            } else {
-                settings.min_delay
-            },
-            floor: Duration::ZERO,
-        });
-        entry.queue.push(Queued {
-            priority: request.priority,
-            seq,
-            request,
-            origin,
-            path,
-        });
-        state.stats.queued += 1;
+        let url = request.url.clone();
+        if !enqueue(&self.shared.settings, &mut state, request, &url, 0) {
+            return Submitted::Invalid;
+        }
         drop(state);
         self.shared.schedule.notify_one();
         Submitted::Queued
@@ -273,7 +257,11 @@ async fn next_events(shared: Arc<Shared>, max: usize) -> Vec<Event> {
             let mut state = shared.lock();
             if !state.events.is_empty() {
                 let n = max.max(1).min(state.events.len());
-                return state.events.drain(..n).collect();
+                let batch = state.events.drain(..n).collect();
+                drop(state);
+                // Room in the backlog may let the scheduler start more.
+                shared.schedule.notify_one();
+                return batch;
             }
             if state.stats.queued == 0 && state.stats.in_flight == 0 && state.gate_fetches == 0 {
                 return Vec::new();
@@ -321,6 +309,8 @@ enum Action {
     Fetch(Queued),
     CheckRobots(String),
     CheckTdm(String),
+    /// Another host's check of the same origin is under way.
+    Wait,
 }
 
 /// Runs until the Crawler is dropped, which sets `closed` and wakes it.
@@ -347,6 +337,7 @@ async fn schedule_loop(s: Arc<Shared>) {
                 Action::CheckTdm(origin) => {
                     tokio::spawn(check_tdm(s.clone(), origin));
                 }
+                Action::Wait => {}
             }
         }
         match sleep_until {
@@ -361,6 +352,82 @@ async fn schedule_loop(s: Arc<Shared>) {
     }
 }
 
+/// Queues `request` for `url` (the request's own URL, or where a redirect
+/// led) on its host, and marks the host ready. False if the URL can't be
+/// crawled.
+fn enqueue(
+    settings: &CrawlSettings,
+    state: &mut State,
+    mut request: CrawlRequest,
+    url: &str,
+    hops: usize,
+) -> bool {
+    let Ok(parsed) = Url::parse(url) else {
+        return false;
+    };
+    let (Some(host), true) = (
+        parsed.host_str(),
+        matches!(parsed.scheme(), "http" | "https"),
+    ) else {
+        return false;
+    };
+    let host = host.to_string();
+    let origin = parsed.origin().ascii_serialization();
+    let path = match parsed.query() {
+        Some(q) => format!("{}?{q}", parsed.path()),
+        None => parsed.path().to_string(),
+    };
+    request.url = url.to_string();
+    state.seq += 1;
+    let queued = Queued {
+        priority: request.priority,
+        seq: state.seq,
+        request,
+        host: host.clone(),
+        origin,
+        path,
+        hops,
+    };
+    state
+        .hosts
+        .entry(host.clone())
+        .or_insert_with(|| Host {
+            queue: BinaryHeap::new(),
+            in_flight: 0,
+            next_at: Instant::now(),
+            delay: if settings.throttle {
+                settings.start_delay
+            } else {
+                settings.min_delay
+            },
+            floor: Duration::ZERO,
+            listed: false,
+            timer: None,
+        })
+        .queue
+        .push(queued);
+    state.stats.queued += 1;
+    state.make_ready(&host);
+    true
+}
+
+impl State {
+    fn make_ready(&mut self, name: &str) {
+        if let Some(host) = self.hosts.get_mut(name)
+            && !host.listed
+        {
+            host.listed = true;
+            self.ready.push_back(name.to_string());
+        }
+    }
+}
+
+/// Events held for the reader before the scheduler stops starting fetches,
+/// so a slow reader doesn't mean the whole frontier downloaded into memory.
+fn backlog_limit(settings: &CrawlSettings) -> usize {
+    settings.concurrency.saturating_mul(2)
+}
+
 /// Starts everything that may start now; returns what to do and when to
 /// look again.
 fn plan(
@@ -369,63 +436,96 @@ fn plan(
     shared: &Shared,
 ) -> (Vec<Action>, Option<Instant>) {
     let now = Instant::now();
+    while let Some(Reverse((at, _))) = state.timers.peek() {
+        if *at > now {
+            break;
+        }
+        let Some(Reverse((_, name))) = state.timers.pop() else {
+            break;
+        };
+        if let Some(host) = state.hosts.get_mut(&name) {
+            host.timer = None;
+        }
+        state.make_ready(&name);
+    }
     let mut actions = Vec::new();
-    let mut sleep_until: Option<Instant> = None;
-    let hosts: Vec<String> = state.hosts.keys().cloned().collect();
-    for name in hosts {
+    'hosts: while let Some(name) = state.ready.front().cloned() {
+        // Gate fetches count against the limit like any other request.
+        if state.stats.in_flight + state.gate_fetches >= settings.concurrency
+            || state.events.len() >= backlog_limit(settings)
+        {
+            break;
+        }
+        state.ready.pop_front();
+        if let Some(host) = state.hosts.get_mut(&name) {
+            host.listed = false;
+        }
         loop {
-            if state.stats.in_flight >= settings.concurrency {
-                return (actions, sleep_until);
+            if state.stats.in_flight + state.gate_fetches >= settings.concurrency {
+                // Still has work: back in line for when a slot frees.
+                state.make_ready(&name);
+                break 'hosts;
             }
-            let (origin, path) = {
-                let host = &state.hosts[&name];
-                let Some(next) = host.queue.peek() else { break };
-                (next.origin.clone(), next.path.clone())
+            let Some(host) = state.hosts.get(&name) else {
+                break;
             };
+            let Some(next) = host.queue.peek() else { break };
+            let origin = next.origin.clone();
+            let path = &next.path;
             // Robots and TDMRep must be known for this origin first.
             let o = state.origins.entry(origin.clone()).or_default();
+            let mut gate = None;
             if settings.obey_robots {
                 match o.robots {
                     Gate::Unknown => {
                         o.robots = Gate::Fetching;
-                        state.gate_fetches += 1;
-                        actions.push(Action::CheckRobots(origin));
-                        break;
+                        gate = Some(Action::CheckRobots(origin.clone()));
                     }
-                    Gate::Fetching => break,
+                    Gate::Fetching => gate = Some(Action::Wait),
                     Gate::Ready(_) => {}
                 }
             }
-            if settings.obey_tdmrep {
+            if gate.is_none() && settings.obey_tdmrep {
                 match o.tdm {
                     Gate::Unknown => {
                         o.tdm = Gate::Fetching;
-                        state.gate_fetches += 1;
-                        actions.push(Action::CheckTdm(origin));
-                        break;
+                        gate = Some(Action::CheckTdm(origin.clone()));
                     }
-                    Gate::Fetching => break,
+                    Gate::Fetching => gate = Some(Action::Wait),
                     Gate::Ready(_) => {}
                 }
             }
+            if let Some(gate) = gate {
+                if !o.waiting.contains(&name) {
+                    o.waiting.push(name.clone());
+                }
+                if !matches!(gate, Action::Wait) {
+                    state.gate_fetches += 1;
+                    actions.push(gate);
+                }
+                break;
+            }
             let blocked = match (&o.robots, &o.tdm) {
                 (Gate::Ready(r), _)
-                    if settings.obey_robots && !r.allowed(&settings.robots_agent, &path) =>
+                    if settings.obey_robots && !r.allowed(&settings.robots_agent, path) =>
                 {
                     Some(DropReason::Robots)
                 }
                 (_, Gate::Ready(Some(f)))
-                    if settings.obey_tdmrep && f.reservation(&path).reserved == Some(true) =>
+                    if settings.obey_tdmrep && f.reservation(path).reserved == Some(true) =>
                 {
                     Some(DropReason::TdmReserved)
                 }
                 _ => None,
             };
             let floor = match &o.robots {
-                Gate::Ready(r) => r.crawl_delay(&settings.robots_agent).unwrap_or_default(),
+                Gate::Ready(r) => r
+                    .crawl_delay(&settings.robots_agent)
+                    .unwrap_or_default()
+                    .min(settings.max_delay),
                 _ => Duration::ZERO,
             };
-            let host = state.hosts.get_mut(&name).expect("host listed above");
+            let host = state.hosts.get_mut(&name).expect("looked up above");
             if let Some(reason) = blocked {
                 let q = host.queue.pop().expect("peeked above");
                 state.stats.queued -= 1;
@@ -440,10 +540,14 @@ fn plan(
             }
             host.floor = floor;
             if host.in_flight >= settings.per_domain {
+                // Ready again when one of its fetches finishes.
                 break;
             }
             if now < host.next_at {
-                sleep_until = Some(sleep_until.map_or(host.next_at, |s| s.min(host.next_at)));
+                if host.timer != Some(host.next_at) {
+                    host.timer = Some(host.next_at);
+                    state.timers.push(Reverse((host.next_at, name.clone())));
+                }
                 break;
             }
             let q = host.queue.pop().expect("peeked above");
@@ -454,51 +558,98 @@ fn plan(
             actions.push(Action::Fetch(q));
         }
     }
-    state
-        .hosts
-        .retain(|_, h| !h.queue.is_empty() || h.in_flight > 0 || h.next_at > now);
+    let sleep_until = state.timers.peek().map(|Reverse((at, _))| *at);
     (actions, sleep_until)
+}
+
+/// Runs `work` as its own task, so a panic inside it (a parser bug on
+/// hostile input, say) becomes `fallback` instead of killing the caller
+/// before it has done its bookkeeping.
+async fn guarded<T: Send + 'static>(
+    work: impl std::future::Future<Output = T> + Send + 'static,
+    fallback: impl FnOnce(String) -> T,
+) -> T {
+    match tokio::spawn(work).await {
+        Ok(value) => value,
+        Err(e) => fallback(e.to_string()),
+    }
 }
 
 async fn fetch(shared: Arc<Shared>, q: Queued) {
     let started = Instant::now();
-    let result = shared.fetcher.get(&q.request.url, &q.request.headers).await;
+    let (fetcher, url, headers, hops) = (
+        shared.clone(),
+        q.request.url.clone(),
+        q.request.headers.clone(),
+        q.hops,
+    );
+    let result = guarded(
+        async move { fetcher.fetcher.hop(&url, &headers, hops).await },
+        |why| {
+            Err(FetchError {
+                kind: FetchErrorKind::Other,
+                message: format!("the fetch failed inside netweir: {why}"),
+            })
+        },
+    )
+    .await;
     let latency = started.elapsed();
     let settings = &shared.settings;
     let mut state = shared.lock();
     state.stats.in_flight -= 1;
-    let host_name = Url::parse(&q.request.url)
-        .ok()
-        .and_then(|u| u.host_str().map(str::to_string))
-        .unwrap_or_default();
-    if let Some(host) = state.hosts.get_mut(&host_name) {
+    if let Some(host) = state.hosts.get_mut(&q.host) {
         host.in_flight -= 1;
         if settings.throttle {
-            let status = result.as_ref().map(|r| r.status).ok();
+            let status = match &result {
+                Ok(Hop::Done(r)) => Some(r.status),
+                _ => None,
+            };
             host.delay = adjust_delay(settings, host.delay, latency, status);
         }
     }
+    state.make_ready(&q.host);
     let event = match result {
-        Ok(response) => {
-            let reserved = settings.obey_tdmrep && page_reserved(&state, &q, &response);
-            if reserved {
-                Event::Dropped {
+        Ok(Hop::Done(response)) => {
+            if settings.obey_tdmrep && page_reserved(&state, &q, &response) {
+                Some(Event::Dropped {
                     id: q.request.id,
                     reason: DropReason::TdmReserved,
-                }
+                })
             } else {
-                Event::Fetched {
+                Some(Event::Fetched {
                     id: q.request.id,
                     response,
-                }
+                })
             }
         }
-        Err(error) => Event::Failed {
+        // The next hop is queued like a new request, on its own host, so it
+        // goes through that host's robots.txt, TDMRep and limits. Its URL
+        // counts as seen, but is fetched even if seen: this request has to
+        // end somewhere.
+        Ok(Hop::Redirect(next)) => {
+            if let Some(fp) = fingerprint("GET", &next) {
+                state.seen.insert(fp);
+            }
+            let id = q.request.id;
+            if enqueue(settings, &mut state, q.request, &next, q.hops + 1) {
+                None
+            } else {
+                Some(Event::Failed {
+                    id,
+                    error: FetchError::invalid(format!(
+                        "redirect to a URL netweir can't fetch: {next}"
+                    )),
+                })
+            }
+        }
+        Err(error) => Some(Event::Failed {
             id: q.request.id,
             error,
-        },
+        }),
     };
-    shared.push_event(&mut state, event);
+    if let Some(event) = event {
+        shared.push_event(&mut state, event);
+    }
     drop(state);
     shared.schedule.notify_one();
 }
@@ -543,33 +694,56 @@ fn adjust_delay(
 }
 
 async fn check_robots(shared: Arc<Shared>, origin: String) {
-    let url = format!("{origin}/robots.txt");
-    let robots = match shared.fetcher.get(&url, &[]).await {
-        // The parser reads at most robots::MAX_BYTES of it.
-        Ok(r) if (200..300).contains(&r.status) => Robots::parse(&r.text()),
-        // RFC 9309: an unavailable file (4xx) means no rules.
-        Ok(r) if (400..500).contains(&r.status) => Robots::allow_all(),
-        // An unreachable file (5xx, or no answer) means everything is off
-        // limits for now.
-        _ => Robots::disallow_all(),
-    };
+    let (fetcher, url) = (shared.clone(), format!("{origin}/robots.txt"));
+    let robots = guarded(
+        async move {
+            match fetcher.fetcher.get(&url, &[]).await {
+                // The parser reads at most robots::MAX_BYTES of it.
+                Ok(r) if (200..300).contains(&r.status) => Robots::parse(&r.text()),
+                // RFC 9309: an unavailable file (4xx) means no rules.
+                Ok(r) if (400..500).contains(&r.status) => Robots::allow_all(),
+                // An unreachable file (5xx, or no answer) means everything
+                // is off limits for now.
+                _ => Robots::disallow_all(),
+            }
+        },
+        // A file netweir can't read is treated as unreachable.
+        |_| Robots::disallow_all(),
+    )
+    .await;
     let mut state = shared.lock();
-    state.origins.entry(origin).or_default().robots = Gate::Ready(robots);
-    state.gate_fetches -= 1;
-    drop(state);
-    shared.schedule.notify_one();
-    shared.events.notify_waiters();
+    state.origins.entry(origin.clone()).or_default().robots = Gate::Ready(robots);
+    gate_done(&shared, state, &origin);
 }
 
 async fn check_tdm(shared: Arc<Shared>, origin: String) {
-    let url = format!("{origin}/.well-known/tdmrep.json");
-    let file = match shared.fetcher.get(&url, &[]).await {
-        Ok(r) if r.status == 200 => TdmFile::parse(&r.text()),
-        _ => None,
-    };
+    let (fetcher, url) = (shared.clone(), format!("{origin}/.well-known/tdmrep.json"));
+    let file = guarded(
+        async move {
+            match fetcher.fetcher.get(&url, &[]).await {
+                Ok(r) if r.status == 200 => TdmFile::parse(&r.text()),
+                _ => None,
+            }
+        },
+        |_| None,
+    )
+    .await;
     let mut state = shared.lock();
-    state.origins.entry(origin).or_default().tdm = Gate::Ready(file);
+    state.origins.entry(origin.clone()).or_default().tdm = Gate::Ready(file);
+    gate_done(&shared, state, &origin);
+}
+
+/// A gate fetch finished: the hosts waiting on it may go on.
+fn gate_done(shared: &Shared, mut state: std::sync::MutexGuard<'_, State>, origin: &str) {
     state.gate_fetches -= 1;
+    let waiting = state
+        .origins
+        .get_mut(origin)
+        .map(|o| std::mem::take(&mut o.waiting))
+        .unwrap_or_default();
+    for host in waiting {
+        state.make_ready(&host);
+    }
     drop(state);
     shared.schedule.notify_one();
     shared.events.notify_waiters();
@@ -610,6 +784,17 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn a_panic_in_guarded_work_becomes_the_fallback() {
+        let value = guarded(async { panic!("parser bug") }, |why| {
+            assert!(why.contains("panic"), "{why}");
+            7
+        })
+        .await;
+        assert_eq!(value, 7);
+        assert_eq!(guarded(async { 1 }, |_| 2).await, 1);
+    }
+
     #[test]
     fn queue_order_is_priority_then_arrival() {
         let q = |priority, seq| Queued {
@@ -622,8 +807,10 @@ mod tests {
                 headers: vec![],
                 dont_filter: false,
             },
+            host: String::new(),
             origin: String::new(),
             path: String::new(),
+            hops: 0,
         };
         let mut heap: BinaryHeap<Queued> =
             [q(0, 1), q(5, 2), q(0, 3), q(5, 4)].into_iter().collect();

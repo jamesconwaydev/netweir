@@ -105,7 +105,7 @@ impl fmt::Display for FetchError {
 impl std::error::Error for FetchError {}
 
 impl FetchError {
-    fn invalid(message: impl Into<String>) -> FetchError {
+    pub(crate) fn invalid(message: impl Into<String>) -> FetchError {
         FetchError {
             kind: FetchErrorKind::Invalid,
             message: message.into(),
@@ -155,6 +155,14 @@ fn caused_by_tls(e: &wreq::Error) -> bool {
         source = s.source();
     }
     false
+}
+
+/// What one request of a navigation gave.
+#[derive(Debug)]
+pub enum Hop {
+    Done(Response),
+    /// A redirect, to this absolute URL.
+    Redirect(String),
 }
 
 /// Chrome follows at most 20 redirects.
@@ -242,6 +250,27 @@ impl Fetcher {
         url: &str,
         headers: &[(String, String)],
     ) -> Result<Response, FetchError> {
+        let mut current = url.to_string();
+        for hop in 0..=MAX_REDIRECTS {
+            match self.hop(&current, headers, hop).await? {
+                Hop::Done(response) => return Ok(response),
+                Hop::Redirect(next) => current = next,
+            }
+        }
+        unreachable!("the last hop returns a response or an error")
+    }
+
+    /// One request of a navigation: the response, or where it redirects.
+    /// `hop` counts the redirects already followed, which sets the header
+    /// order Chrome uses after one and, at 20, makes another an error. A
+    /// crawler that follows redirects itself, so each hop goes through its
+    /// own checks, calls this instead of `get`.
+    pub async fn hop(
+        &self,
+        url: &str,
+        headers: &[(String, String)],
+        hop: usize,
+    ) -> Result<Hop, FetchError> {
         let mut caller = Vec::with_capacity(headers.len());
         for (k, v) in headers {
             let name = HeaderName::from_bytes(k.as_bytes())
@@ -250,43 +279,39 @@ impl Fetcher {
                 .map_err(|_| FetchError::invalid(format!("bad value for header {k}")))?;
             caller.push((k.as_str(), name, value));
         }
-        let mut current = parse_url(url)?;
-        for hop in 0..=MAX_REDIRECTS {
-            let uri: Uri = current
-                .as_str()
-                .parse()
-                .map_err(|_| FetchError::invalid(format!("bad URL {url:?}")))?;
-            let response = self.send(&uri, &caller, hop > 0).await?;
-            self.note_version(&uri, response.version());
-            let location = response
-                .status()
-                .is_redirection()
-                .then(|| response.headers().get(LOCATION))
-                .flatten()
-                .and_then(|l| l.to_str().ok());
-            if let Some(location) = location {
-                if hop == MAX_REDIRECTS {
-                    return Err(FetchError {
-                        kind: FetchErrorKind::TooManyRedirects,
-                        message: format!(
-                            "more than {MAX_REDIRECTS} redirects, starting from {url}"
-                        ),
-                    });
-                }
-                let next = current.join(location).map_err(|_| {
-                    FetchError::invalid(format!("redirect to a bad URL {location:?}"))
-                })?;
-                if !matches!(next.scheme(), "http" | "https") {
-                    return Err(FetchError::invalid(format!(
-                        "redirect to an unsupported URL {next}"
-                    )));
-                }
-                current = next;
-                continue;
-            }
-            return into_response(current.to_string(), response).await;
+        let current = parse_url(url)?;
+        let uri: Uri = current
+            .as_str()
+            .parse()
+            .map_err(|_| FetchError::invalid(format!("bad URL {url:?}")))?;
+        let response = self.send(&uri, &caller, hop > 0).await?;
+        self.note_version(&uri, response.version());
+        let location = response
+            .status()
+            .is_redirection()
+            .then(|| response.headers().get(LOCATION))
+            .flatten()
+            .and_then(|l| l.to_str().ok());
+        let Some(location) = location else {
+            return Ok(Hop::Done(
+                into_response(current.to_string(), response).await?,
+            ));
+        };
+        if hop >= MAX_REDIRECTS {
+            return Err(FetchError {
+                kind: FetchErrorKind::TooManyRedirects,
+                message: format!("more than {MAX_REDIRECTS} redirects, the last to {url}"),
+            });
         }
-        unreachable!("the loop returns on its last hop")
+        let next = current
+            .join(location)
+            .map_err(|_| FetchError::invalid(format!("redirect to a bad URL {location:?}")))?;
+        if !matches!(next.scheme(), "http" | "https") {
+            return Err(FetchError::invalid(format!(
+                "redirect to an unsupported URL {next}"
+            )));
+        }
+        Ok(Hop::Redirect(next.into()))
     }
 
     async fn send(

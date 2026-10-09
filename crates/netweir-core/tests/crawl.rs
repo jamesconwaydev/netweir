@@ -391,3 +391,196 @@ async fn requests_added_while_crawling_are_picked_up() {
     c.submit(request(2, site.url("/2")));
     assert_eq!(fetched(&drain(&c).await), [2]);
 }
+
+#[tokio::test]
+async fn a_robots_txt_that_breaks_the_parser_does_not_hang_the_crawl() {
+    let site = Site::start(vec![
+        (
+            "/robots.txt",
+            Page::status(200, "User-agent: *\nDisallow: /%aé\n"),
+        ),
+        ("/a", Page::html("a")),
+    ])
+    .await;
+    let c = crawler(CrawlSettings {
+        obey_tdmrep: false,
+        ..settings()
+    });
+    c.submit(request(1, site.url("/a")));
+    assert_eq!(fetched(&drain(&c).await), [1]);
+}
+
+fn redirect(to: &str) -> Page {
+    Page::status(302, "").with_header("location", to)
+}
+
+#[tokio::test]
+async fn a_redirect_to_another_site_obeys_that_sites_robots_txt() {
+    let other = Site::start(vec![
+        (
+            "/robots.txt",
+            Page::status(200, "User-agent: *\nDisallow: /secret\n"),
+        ),
+        ("/secret", Page::html("secret")),
+        ("/open", Page::html("open")),
+    ])
+    .await;
+    let site = Site::start(vec![
+        ("/robots.txt", Page::status(404, "")),
+        ("/go", redirect(&other.url("/secret"))),
+        ("/go2", redirect(&other.url("/open"))),
+    ])
+    .await;
+    let c = crawler(CrawlSettings {
+        obey_tdmrep: false,
+        ..settings()
+    });
+    c.submit(request(1, site.url("/go")));
+    c.submit(request(2, site.url("/go2")));
+    let events = drain(&c).await;
+    assert_eq!(dropped(&events), [(1, DropReason::Robots)]);
+    assert_eq!(fetched(&events), [2]);
+    let final_url = events.iter().find_map(|e| match e {
+        Event::Fetched { response, .. } => Some(response.url.clone()),
+        _ => None,
+    });
+    assert_eq!(final_url, Some(other.url("/open")));
+    assert!(!other.paths().contains(&"/secret".to_string()));
+    assert_eq!(other.paths()[0], "/robots.txt", "read before anything else");
+}
+
+#[tokio::test]
+async fn a_redirect_target_counts_as_seen() {
+    let site = Site::start(vec![
+        ("/go", redirect("/target")),
+        ("/target", Page::html("t")),
+    ])
+    .await;
+    let c = crawler(CrawlSettings {
+        obey_robots: false,
+        obey_tdmrep: false,
+        per_domain: 1,
+        ..settings()
+    });
+    c.submit(request(1, site.url("/go")));
+    let first = drain(&c).await;
+    assert_eq!(fetched(&first), [1]);
+    assert_eq!(
+        c.submit(request(2, site.url("/target"))),
+        Submitted::Duplicate
+    );
+}
+
+#[tokio::test]
+async fn redirect_loops_end_as_failures() {
+    let site = Site::start(vec![("/loop", redirect("/loop"))]).await;
+    let c = crawler(CrawlSettings {
+        obey_robots: false,
+        obey_tdmrep: false,
+        ..settings()
+    });
+    c.submit(request(1, site.url("/loop")));
+    let events = drain(&c).await;
+    assert!(
+        matches!(&events[..], [Event::Failed { id: 1, error }] if error.kind == netweir_core::FetchErrorKind::TooManyRedirects),
+    );
+    assert_eq!(site.paths().len(), 21, "the first request and 20 redirects");
+}
+
+#[tokio::test]
+async fn the_engine_does_not_run_far_ahead_of_its_reader() {
+    let pages: Vec<(String, Page)> = (0..300)
+        .map(|i| (format!("/p{i}"), Page::html("x")))
+        .collect();
+    let site = Site::start(
+        pages
+            .iter()
+            .map(|(p, page)| (p.as_str(), page.clone()))
+            .collect(),
+    )
+    .await;
+    let c = crawler(CrawlSettings {
+        obey_robots: false,
+        obey_tdmrep: false,
+        concurrency: 4,
+        per_domain: 4,
+        ..settings()
+    });
+    for i in 0..300 {
+        c.submit(request(i, site.url(&format!("/p{i}"))));
+    }
+    let first = c.next(1).await;
+    assert_eq!(first.len(), 1);
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let served = site.paths().len();
+    assert!(
+        served <= 4 * 3 + 1,
+        "served {served} pages nobody asked for yet"
+    );
+    assert_eq!(fetched(&drain(&c).await).len(), 299);
+}
+
+#[tokio::test]
+async fn robots_txt_fetches_count_against_concurrency() {
+    // Two host names for one machine, so the per-host rule can't hide it.
+    let mut sites = Vec::new();
+    for _ in 0..2 {
+        sites.push(
+            Site::start(vec![
+                (
+                    "/robots.txt",
+                    Page::status(404, "").slow(Duration::from_millis(150)),
+                ),
+                ("/a", Page::html("a")),
+            ])
+            .await,
+        );
+    }
+    let c = crawler(CrawlSettings {
+        obey_tdmrep: false,
+        concurrency: 1,
+        ..settings()
+    });
+    c.submit(request(0, sites[0].url("/a")));
+    c.submit(request(
+        1,
+        sites[1].url("/a").replace("127.0.0.1", "localhost"),
+    ));
+    assert_eq!(fetched(&drain(&c).await), [0, 1]);
+    let mut starts: Vec<Instant> = sites.iter().flat_map(|s| s.times("/robots.txt")).collect();
+    starts.sort();
+    for pair in starts.windows(2) {
+        assert!(
+            pair[1] - pair[0] >= Duration::from_millis(140),
+            "two robots.txt fetches overlapped with concurrency=1"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_huge_crawl_delay_is_capped_at_max_delay() {
+    let site = Site::start(vec![
+        (
+            "/robots.txt",
+            Page::status(200, "User-agent: *\nCrawl-delay: 1e300\n"),
+        ),
+        ("/a", Page::html("a")),
+        ("/b", Page::html("b")),
+    ])
+    .await;
+    let c = crawler(CrawlSettings {
+        obey_tdmrep: false,
+        max_delay: Duration::from_millis(300),
+        ..settings()
+    });
+    c.submit(request(1, site.url("/a")));
+    c.submit(request(2, site.url("/b")));
+    assert_eq!(fetched(&drain(&c).await).len(), 2);
+    let t = site.times("/");
+    let gap = t[t.len() - 1] - t[t.len() - 2];
+    assert!(
+        gap >= Duration::from_millis(280),
+        "gap {gap:?}: the delay was ignored"
+    );
+    assert!(gap < Duration::from_secs(2), "gap {gap:?}");
+}

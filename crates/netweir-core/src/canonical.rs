@@ -32,6 +32,11 @@ fn is_tracking(key: &str) -> bool {
 /// The form of `url` used to tell pages apart: scheme and host lowercased,
 /// default port and fragment dropped, tracking parameters removed and the
 /// rest of the query sorted. `None` for anything but an http(s) URL.
+///
+/// The query is read and rewritten as form data, so `?x` and `?x=` are one
+/// page, and so are `a+b` and `a%20b`. Paths and hosts are compared as the
+/// URL parser normalises them; `/%7Euser` and `/~user`, or `e.com.` and
+/// `e.com`, stay different, as servers can treat them differently.
 pub fn canonical(url: &str) -> Option<String> {
     let mut u = Url::parse(url).ok()?;
     if !matches!(u.scheme(), "http" | "https") || u.host_str().is_none() {

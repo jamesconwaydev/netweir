@@ -14,5 +14,5 @@ pub mod tdmrep;
 
 pub use crawl::{CrawlRequest, CrawlSettings, Crawler, DropReason, Event, Stats, Submitted};
 pub use decode::{decode, meta_content};
-pub use fetch::{FetchError, FetchErrorKind, FetchOptions, Fetcher, Response};
+pub use fetch::{FetchError, FetchErrorKind, FetchOptions, Fetcher, Hop, Response};
 pub use profile::{DEFAULT as DEFAULT_PROFILE, Profile, ProfileError};
