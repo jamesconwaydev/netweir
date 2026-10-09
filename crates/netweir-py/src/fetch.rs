@@ -109,6 +109,31 @@ impl Fetcher {
     }
 }
 
+/// A response from its parts, as a worker process gets one.
+#[pyfunction]
+pub(crate) fn _response(
+    url: String,
+    status: u16,
+    version: &str,
+    headers: Vec<(String, String)>,
+    body: Vec<u8>,
+) -> Response {
+    // Only these are ever made; anything else reads as HTTP/1.1.
+    let version = [
+        "HTTP/0.9", "HTTP/1.0", "HTTP/1.1", "HTTP/2", "HTTP/3", "browser",
+    ]
+    .into_iter()
+    .find(|v| *v == version)
+    .unwrap_or("HTTP/1.1");
+    Response::from(netweir_core::Response {
+        url,
+        status,
+        version,
+        headers,
+        body: body.into(),
+    })
+}
+
 #[pyclass(frozen, module = "netweir")]
 pub struct Response {
     inner: Arc<netweir_core::Response>,
@@ -122,6 +147,23 @@ impl From<netweir_core::Response> for Response {
 
 #[pymethods]
 impl Response {
+    /// Pickled as its parts, so a page can go to a worker process.
+    fn __reduce__<'py>(slf: &Bound<'py, Self>) -> PyResult<(Bound<'py, PyAny>, Bound<'py, PyAny>)> {
+        let py = slf.py();
+        let r = &slf.get().inner;
+        let rebuild = py.import("netweir._native")?.getattr("_response")?;
+        let parts = (
+            r.url.clone(),
+            r.status,
+            r.version,
+            r.headers.clone(),
+            PyBytes::new(py, &r.body),
+        )
+            .into_pyobject(py)?
+            .into_any();
+        Ok((rebuild, parts))
+    }
+
     #[getter]
     fn url(&self) -> &str {
         &self.inner.url
@@ -197,5 +239,6 @@ impl Response {
 pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<Fetcher>()?;
     m.add_class::<Response>()?;
+    m.add_function(wrap_pyfunction!(_response, m)?)?;
     Ok(())
 }
