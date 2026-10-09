@@ -1,18 +1,21 @@
-//! The protocol client: one pipe to Chrome, carrying every session.
+//! The protocol client: one connection to Chrome, carrying every session.
 //!
-//! Each message is a JSON object followed by a NUL byte. A reader thread
-//! routes replies to the command waiting for their `id` and events to the
-//! handler of the session they name; a writer thread does the writing, so
-//! no async task waits on the pipe.
+//! Over the pipe a launched Chrome reads, each message is a JSON object
+//! followed by a NUL byte; over a WebSocket, to a browser already running,
+//! each is a text frame. Either way, a reader routes replies to the command
+//! waiting for their `id` and events to the handler of the session they
+//! name, and a writer does the writing, so no async task waits on the
+//! connection.
 
 use std::collections::{BTreeSet, HashMap};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 
+use futures_util::{SinkExt, StreamExt};
 use serde_json::{Value, json};
-use tokio::sync::oneshot;
+use tokio::sync::{mpsc, oneshot};
+use tokio_tungstenite::tungstenite::Message;
 
 use crate::{Error, Result};
 
@@ -31,7 +34,9 @@ pub(crate) struct Connection {
 }
 
 struct Shared {
-    out: Mutex<Option<mpsc::Sender<Vec<u8>>>>,
+    /// Each message ends in a NUL byte, which the pipe needs and a
+    /// WebSocket frame drops.
+    out: Mutex<Option<mpsc::UnboundedSender<Vec<u8>>>>,
     next_id: AtomicU64,
     state: Mutex<State>,
 }
@@ -51,17 +56,12 @@ impl Connection {
         input: impl Read + Send + 'static,
         output: impl Write + Send + 'static,
     ) -> Connection {
-        let (tx, rx) = mpsc::channel::<Vec<u8>>();
-        let shared = Arc::new(Shared {
-            out: Mutex::new(Some(tx)),
-            next_id: AtomicU64::new(1),
-            state: Mutex::new(State::default()),
-        });
+        let (shared, mut rx) = Shared::new();
         std::thread::Builder::new()
             .name("netweir-cdp-write".into())
             .spawn(move || {
                 let mut output = output;
-                for message in rx {
+                while let Some(message) = rx.blocking_recv() {
                     if output.write_all(&message).is_err() {
                         break;
                     }
@@ -73,6 +73,42 @@ impl Connection {
             .name("netweir-cdp-read".into())
             .spawn(move || read_loop(BufReader::new(input), &reader))
             .expect("can't start the CDP reader thread");
+        Connection { shared }
+    }
+
+    /// Over a WebSocket, to a browser already running. Needs a tokio
+    /// runtime.
+    pub(crate) fn over_websocket<S>(socket: tokio_tungstenite::WebSocketStream<S>) -> Connection
+    where
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+    {
+        let (shared, mut rx) = Shared::new();
+        let (mut sink, mut stream) = socket.split();
+        tokio::spawn(async move {
+            while let Some(mut message) = rx.recv().await {
+                message.pop();
+                let text = String::from_utf8(message).expect("serde_json writes UTF-8");
+                if sink.send(Message::text(text)).await.is_err() {
+                    break;
+                }
+            }
+            let _ = sink.close().await;
+        });
+        let reader = shared.clone();
+        tokio::spawn(async move {
+            while let Some(Ok(message)) = stream.next().await {
+                let value = match &message {
+                    Message::Text(text) => serde_json::from_str::<Value>(text).ok(),
+                    Message::Binary(bytes) => serde_json::from_slice::<Value>(bytes).ok(),
+                    Message::Close(_) => break,
+                    _ => None,
+                };
+                if let Some(value) = value {
+                    reader.deliver(value);
+                }
+            }
+            reader.close();
+        });
         Connection { shared }
     }
 
@@ -164,6 +200,16 @@ impl Connection {
 }
 
 impl Shared {
+    fn new() -> (Arc<Shared>, mpsc::UnboundedReceiver<Vec<u8>>) {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let shared = Arc::new(Shared {
+            out: Mutex::new(Some(tx)),
+            next_id: AtomicU64::new(1),
+            state: Mutex::new(State::default()),
+        });
+        (shared, rx)
+    }
+
     fn lock(&self) -> std::sync::MutexGuard<'_, State> {
         self.state.lock().unwrap_or_else(|e| e.into_inner())
     }

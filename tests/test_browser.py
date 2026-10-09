@@ -4,6 +4,7 @@ NETWEIR_REQUIRE_CHROME is set."""
 import asyncio
 import os
 import socket
+import subprocess
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -212,3 +213,43 @@ async def test_a_proxy_with_a_login_carries_the_pages():
             assert (await page.parse()).css("#via::text").get() == "http://shop.test/item"
     finally:
         server.shutdown()
+
+
+async def test_a_running_chrome_can_be_driven_and_is_left_running(base, tmp_path):
+    from netweir._native import find_chrome
+
+    try:
+        executable = find_chrome()
+    except netweir.BrowserError as e:
+        if not os.environ.get("NETWEIR_REQUIRE_CHROME"):
+            pytest.skip(str(e))
+        raise
+    chrome = subprocess.Popen(
+        [
+            executable,
+            "--headless",
+            "--remote-debugging-port=0",
+            "--no-first-run",
+            f"--user-data-dir={tmp_path}",
+            "about:blank",
+        ],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        ws = next(
+            line.split("DevTools listening on ", 1)[1].strip()
+            for line in chrome.stderr
+            if "DevTools listening on " in line
+        )
+        async with netweir.browser(connect=ws) as b:
+            page = await b.new_page()
+            await page.goto(base + "/")
+            assert await page.title() == "shop"
+        assert chrome.poll() is None, "Chrome kept running"
+        with pytest.raises(ValueError, match="already running"):
+            await netweir.browser(connect=ws, proxy="http://127.0.0.1:1")
+    finally:
+        chrome.kill()
+        chrome.wait()

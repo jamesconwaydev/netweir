@@ -77,8 +77,13 @@ pub struct Browser {
 
 pub(crate) struct Inner {
     pub conn: Connection,
+    /// The Chrome netweir launched; None for one it connected to.
     child: Mutex<Option<Child>>,
-    profile: PathBuf,
+    /// The launched Chrome's profile, removed when it closes.
+    profile: Option<PathBuf>,
+    /// Contexts netweir made, for closing a browser it connected to,
+    /// whose other contexts aren't netweir's to close.
+    contexts: Mutex<Vec<String>>,
     version: String,
     pub identity: Option<Identity>,
     pub timeout: Duration,
@@ -88,7 +93,7 @@ pub(crate) struct Inner {
 
 impl Browser {
     pub async fn launch(options: LaunchOptions) -> Result<Browser> {
-        let executable = match options.executable {
+        let executable = match options.executable.clone() {
             Some(path) => path,
             None => launch::find_chrome()?,
         };
@@ -110,7 +115,7 @@ impl Browser {
             args.push(format!("--proxy-server={server}"));
             proxy_login = login;
         }
-        args.extend(options.args);
+        args.extend(options.args.iter().cloned());
         args.push("about:blank".into());
         let started = match launch::start(&executable, &args) {
             Ok(started) => started,
@@ -120,15 +125,53 @@ impl Browser {
             }
         };
         let conn = Connection::new(started.replies, started.commands);
-        let mut inner = Inner {
+        let inner = Inner {
             conn,
             child: Mutex::new(Some(started.child)),
-            profile,
+            profile: Some(profile),
+            contexts: Mutex::default(),
             version: String::new(),
             identity: None,
             timeout: options.timeout,
             proxy_login,
         };
+        Browser::finish(inner, &options, &executable.display().to_string()).await
+    }
+
+    /// Drives a browser that's already running: a `ws://` DevTools URL, as
+    /// Chrome prints it, or an `http://host:port` whose `/json/version`
+    /// names one. `options` give the timeout and the brands; nothing is
+    /// launched. Closing it closes what netweir opened and leaves the
+    /// browser running.
+    pub async fn connect(url: &str, options: LaunchOptions) -> Result<Browser> {
+        let ws = if url.starts_with("http://") {
+            devtools_url(url).await?
+        } else {
+            url.to_string()
+        };
+        let (socket, _) = tokio::time::timeout(
+            Duration::from_secs(30),
+            tokio_tungstenite::connect_async(ws.as_str()),
+        )
+        .await
+        .map_err(|_| Error::Launch(format!("{ws} didn't answer in 30 seconds")))?
+        .map_err(|e| Error::Launch(format!("can't connect to {ws}: {e}")))?;
+        let inner = Inner {
+            conn: Connection::over_websocket(socket),
+            child: Mutex::new(None),
+            profile: None,
+            contexts: Mutex::default(),
+            version: String::new(),
+            identity: None,
+            timeout: options.timeout,
+            proxy_login: None,
+        };
+        Browser::finish(inner, &options, &ws).await
+    }
+
+    /// Asks the browser what it is, and works out what its pages should
+    /// say they are.
+    async fn finish(mut inner: Inner, options: &LaunchOptions, what: &str) -> Result<Browser> {
         let version = match tokio::time::timeout(
             Duration::from_secs(30),
             inner.conn.call("", "Browser.getVersion", json!({})),
@@ -136,18 +179,8 @@ impl Browser {
         .await
         {
             Ok(Ok(v)) => v,
-            Ok(Err(e)) => {
-                return Err(Error::Launch(format!(
-                    "{} didn't answer: {e}",
-                    executable.display()
-                )));
-            }
-            Err(_) => {
-                return Err(Error::Launch(format!(
-                    "{} didn't answer in 30 seconds",
-                    executable.display()
-                )));
-            }
+            Ok(Err(e)) => return Err(Error::Launch(format!("{what} didn't answer: {e}"))),
+            Err(_) => return Err(Error::Launch(format!("{what} didn't answer in 30 seconds"))),
         };
         inner.version = str_of(&version, "product");
         let user_agent = str_of(&version, "userAgent");
@@ -229,13 +262,16 @@ impl Browser {
         &self.inner.version
     }
 
-    pub fn profile_dir(&self) -> &Path {
-        &self.inner.profile
+    /// The launched Chrome's profile directory; None for a browser netweir
+    /// connected to.
+    pub fn profile_dir(&self) -> Option<&Path> {
+        self.inner.profile.as_deref()
     }
 
-    /// True once closed, and also once Chrome has exited or crashed.
+    /// True once closed, and also once Chrome has exited or crashed (or,
+    /// for a browser netweir connected to, the connection has).
     pub fn is_closed(&self) -> bool {
-        self.inner.conn.is_closed() || self.child().is_none()
+        self.inner.conn.is_closed() || (self.inner.profile.is_some() && self.child().is_none())
     }
 
     /// Chrome's process id, while it runs.
@@ -268,7 +304,13 @@ impl Browser {
             .conn
             .call("", "Target.createBrowserContext", json!({}))
             .await?;
-        Ok(str_of(&r, "browserContextId"))
+        let id = str_of(&r, "browserContextId");
+        self.inner
+            .contexts
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(id.clone());
+        Ok(id)
     }
 
     /// Every CDP method sent so far, for tests that check nothing
@@ -281,6 +323,23 @@ impl Browser {
     /// and removes its profile directory.
     pub async fn close(&self) -> Result<()> {
         let inner = self.inner.clone();
+        if inner.profile.is_none() {
+            // Connected, not launched: close what netweir opened, and go.
+            let contexts =
+                std::mem::take(&mut *inner.contexts.lock().unwrap_or_else(|e| e.into_inner()));
+            for id in contexts {
+                let _ = inner
+                    .conn
+                    .call(
+                        "",
+                        "Target.disposeBrowserContext",
+                        json!({"browserContextId": id}),
+                    )
+                    .await;
+            }
+            inner.conn.shut();
+            return Ok(());
+        }
         if inner
             .child
             .lock()
@@ -320,7 +379,10 @@ impl Inner {
                 }
             }
         }
-        remove_profile(&self.profile)
+        match &self.profile {
+            Some(profile) => remove_profile(profile),
+            None => Ok(()),
+        }
     }
 }
 
@@ -362,6 +424,63 @@ fn profile_dir() -> std::io::Result<PathBuf> {
     ));
     std::fs::create_dir_all(&dir)?;
     Ok(dir)
+}
+
+/// The WebSocket URL a browser's `http://host:port/json/version` names.
+async fn devtools_url(base: &str) -> Result<String> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let failed = |e: String| Error::Launch(format!("{base}: {e}"));
+    let host = base
+        .trim_start_matches("http://")
+        .split('/')
+        .next()
+        .unwrap_or_default()
+        .to_string();
+    let read = async {
+        let mut stream = tokio::net::TcpStream::connect(&host)
+            .await
+            .map_err(|e| failed(e.to_string()))?;
+        let request =
+            format!("GET /json/version HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n");
+        stream
+            .write_all(request.as_bytes())
+            .await
+            .map_err(|e| failed(e.to_string()))?;
+        // Chrome keeps the connection open whatever the request says, so
+        // the body is read by its length, not to the end.
+        let mut reply = Vec::new();
+        let mut chunk = [0u8; 4096];
+        loop {
+            if let Some(at) = reply.windows(4).position(|w| w == b"\r\n\r\n") {
+                let head = String::from_utf8_lossy(&reply[..at]).to_ascii_lowercase();
+                let length: usize = head
+                    .lines()
+                    .find_map(|l| l.strip_prefix("content-length:"))
+                    .and_then(|v| v.trim().parse().ok())
+                    .ok_or_else(|| failed("no Content-Length in the reply".into()))?;
+                if reply.len() >= at + 4 + length {
+                    return Ok::<_, Error>(reply[at + 4..at + 4 + length].to_vec());
+                }
+            }
+            let n = stream
+                .read(&mut chunk)
+                .await
+                .map_err(|e| failed(e.to_string()))?;
+            if n == 0 {
+                return Err(failed("the reply ended early".into()));
+            }
+            reply.extend_from_slice(&chunk[..n]);
+        }
+    };
+    let body = tokio::time::timeout(Duration::from_secs(30), read)
+        .await
+        .map_err(|_| failed("no answer in 30 seconds".into()))??;
+    let version: Value =
+        serde_json::from_slice(&body).map_err(|e| failed(format!("not DevTools: {e}")))?;
+    version["webSocketDebuggerUrl"]
+        .as_str()
+        .map(str::to_string)
+        .ok_or_else(|| failed("no webSocketDebuggerUrl in /json/version".into()))
 }
 
 /// `"Chromium";v="154", "Google Chrome";v="154"` as (brand, version)

@@ -50,9 +50,18 @@ The options:
 | `args` | `()` | more Chrome command-line switches |
 | `timeout` | `30.0` | the default limit, in seconds, for navigations and actions |
 | `proxy` | `None` | an `http://`, `https://` or `socks5://` proxy for everything Chrome fetches; a username and password in it are given when the proxy asks |
+| `connect` | `None` | drive a browser that's already running, instead of starting one: a `ws://` DevTools URL, or `http://host:port` |
 
 Use it with `async with`, or `await` it and call `await browser.close()`
-yourself. Each browser gets a fresh profile, deleted when it closes. A
+yourself.
+
+With `connect`, netweir drives a Chrome that's already running, started
+with `--remote-debugging-port`, or anything else that speaks the DevTools
+protocol. Pass the `ws://` URL Chrome prints, or `http://host:port` and
+netweir asks it for the URL. Nothing is launched, so `executable`, `args`
+and `proxy` don't apply; closing the browser closes the pages netweir
+opened and leaves the browser running. Plain `ws://` only for now, not
+`wss://`. Each browser gets a fresh profile, deleted when it closes. A
 program that exits without closing it still ends Chrome, but leaves the
 profile behind, as a `netweir-chrome-*` folder in the temporary directory.
 

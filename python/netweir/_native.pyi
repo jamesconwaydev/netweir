@@ -410,7 +410,9 @@ def launch(
     args: list[str] = ...,
     timeout: float = 30.0,
     proxy: str | None = None,
+    connect: str | None = None,
 ) -> Awaitable[Browser]: ...
+def find_chrome() -> str: ...
 def install_chrome(
     headless_shell: bool = False, index: str = ..., home: str | os.PathLike[str] | None = None
 ) -> tuple[str, str, bool]: ...

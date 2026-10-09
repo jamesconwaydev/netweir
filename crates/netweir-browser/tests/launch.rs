@@ -12,7 +12,7 @@ async fn closing_the_browser_ends_chrome_and_removes_its_profile() {
     })
     .await
     .unwrap();
-    let profile = browser.profile_dir().to_path_buf();
+    let profile = browser.profile_dir().unwrap().to_path_buf();
     assert!(profile.exists());
     assert!(
         browser.version().starts_with("Chrome/"),
@@ -55,5 +55,5 @@ async fn a_browser_that_dies_reads_as_closed() {
     assert!(browser.is_closed());
     assert!(browser.new_page().await.is_err());
     browser.close().await.unwrap();
-    assert!(!browser.profile_dir().exists());
+    assert!(!browser.profile_dir().unwrap().exists());
 }

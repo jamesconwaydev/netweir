@@ -26,6 +26,11 @@ class browser:
     (seconds) is the default limit for navigations and actions. ``proxy``
     (``http://``, ``https://`` or ``socks5://``, with a login if it needs
     one) carries everything Chrome fetches.
+
+    ``connect`` drives a browser that's already running instead of
+    starting one: a ``ws://`` DevTools URL, or ``http://host:port``.
+    Closing it closes the pages netweir opened and leaves the browser
+    running.
     """
 
     def __init__(
@@ -36,6 +41,7 @@ class browser:
         args: Sequence[str] = (),
         timeout: float = 30.0,
         proxy: str | None = None,
+        connect: str | None = None,
     ):
         self._options: dict[str, Any] = {
             "executable": None if executable is None else os.fspath(executable),
@@ -43,6 +49,7 @@ class browser:
             "args": list(args),
             "timeout": timeout,
             "proxy": proxy,
+            "connect": connect,
         }
         self._browser: Browser | None = None
 

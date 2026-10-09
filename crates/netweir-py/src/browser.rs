@@ -71,7 +71,7 @@ fn seconds(name: &str, value: Option<f64>) -> PyResult<Option<Duration>> {
 
 /// Starts Chrome. Resolves to a Browser.
 #[pyfunction]
-#[pyo3(signature = (executable=None, headless=true, args=Vec::new(), timeout=30.0, proxy=None))]
+#[pyo3(signature = (executable=None, headless=true, args=Vec::new(), timeout=30.0, proxy=None, connect=None))]
 pub(crate) fn launch(
     py: Python<'_>,
     executable: Option<PathBuf>,
@@ -79,7 +79,14 @@ pub(crate) fn launch(
     args: Vec<String>,
     timeout: f64,
     proxy: Option<String>,
+    connect: Option<String>,
 ) -> PyResult<Bound<'_, PyAny>> {
+    if connect.is_some() && (executable.is_some() || proxy.is_some() || !args.is_empty()) {
+        return Err(PyValueError::new_err(
+            "connect= drives a browser that's already running, so executable, args and proxy \
+             don't apply",
+        ));
+    }
     let timeout = seconds("timeout", Some(timeout))?.expect("checked above");
     let options = LaunchOptions {
         executable,
@@ -91,7 +98,11 @@ pub(crate) fn launch(
         brands: Some(Arc::new(netweir_core::Profile::chrome_brands)),
     };
     pyo3_async_runtimes::tokio::future_into_py(py, async move {
-        let inner = CoreBrowser::launch(options).await.map_err(raise)?;
+        let inner = match connect {
+            Some(url) => CoreBrowser::connect(&url, options).await,
+            None => CoreBrowser::launch(options).await,
+        }
+        .map_err(raise)?;
         Ok(Browser { inner })
     })
 }
@@ -619,8 +630,16 @@ fn install_chrome(
     })
 }
 
+/// The Chrome `netweir.browser()` would start, or BrowserError saying
+/// where it looked.
+#[pyfunction]
+fn find_chrome() -> PyResult<PathBuf> {
+    netweir_browser::find_chrome().map_err(raise)
+}
+
 pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(launch, m)?)?;
+    m.add_function(wrap_pyfunction!(find_chrome, m)?)?;
     m.add_function(wrap_pyfunction!(install_chrome, m)?)?;
     m.add_class::<Browser>()?;
     m.add_class::<BrowserContext>()?;
