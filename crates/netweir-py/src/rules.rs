@@ -3,7 +3,9 @@
 
 use std::sync::Arc;
 
-use netweir_dom::extract::{self, Convert, Field, Selector, Value};
+use netweir_dom::extract::{
+    self, Convert, Field, Selector, TrackContext, Tracker, Tracking, Tracks, Value,
+};
 use netweir_dom::{Query, XPath};
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
@@ -34,6 +36,49 @@ pub(crate) type Problem = (String, String, &'static str);
 /// An extracted item, and its problems.
 pub(crate) type Extracted<'py> = (Bound<'py, PyDict>, Vec<Problem>);
 
+/// Where tracked selectors keep their fingerprints: an SQLite file.
+#[pyclass(frozen, module = "netweir")]
+pub struct TrackStore {
+    inner: Arc<netweir_core::tracks::TrackStore>,
+}
+
+/// A TrackStore as netweir-dom's Tracks.
+#[derive(Clone)]
+pub(crate) struct StoreRef(Arc<netweir_core::tracks::TrackStore>);
+
+impl Tracks for StoreRef {
+    fn get(&self, site: &str, name: &str) -> Option<String> {
+        self.0.get(site, name)
+    }
+
+    fn put(&self, site: &str, name: &str, fingerprint: &str) {
+        self.0.put(site, name, fingerprint)
+    }
+}
+
+impl TrackStore {
+    pub(crate) fn tracks(&self) -> StoreRef {
+        StoreRef(self.inner.clone())
+    }
+}
+
+#[pymethods]
+impl TrackStore {
+    #[new]
+    fn new(path: std::path::PathBuf) -> PyResult<TrackStore> {
+        Ok(TrackStore {
+            inner: Arc::new(
+                netweir_core::tracks::TrackStore::open(&path)
+                    .map_err(|e| PyValueError::new_err(e.to_string()))?,
+            ),
+        })
+    }
+}
+
+/// What tracking did to an item's fields: (field, "relocated" or "lost",
+/// score, or for a lost one the best candidate's).
+pub(crate) type Notes = Vec<(String, &'static str, Option<f64>)>;
+
 pub(crate) struct ItemInner {
     spec: extract::ItemSpec,
     /// Python's class name, for messages.
@@ -45,6 +90,27 @@ pub(crate) struct ItemInner {
 impl ItemInner {
     pub(crate) fn extract(&self, root: netweir_dom::Node<'_>) -> Vec<Value> {
         self.spec.extract(root)
+    }
+
+    /// `extract`, with tracked fields followed through `ctx`.
+    pub(crate) fn extract_tracked(
+        &self,
+        root: netweir_dom::Node<'_>,
+        ctx: &TrackContext<'_>,
+    ) -> (Vec<Value>, Notes) {
+        let (values, notes) = self.spec.extract_with(root, ctx);
+        let notes = notes
+            .into_iter()
+            .map(|(i, t)| {
+                let name = format!("{}.{}", self.name, self.fields[i]);
+                match t {
+                    Tracking::Relocated(score) => (name, "relocated", Some(score)),
+                    Tracking::Lost(best) => (name, "lost", Some(best)),
+                    _ => (name, "lost", None),
+                }
+            })
+            .collect();
+        (values, notes)
     }
 
     /// The item as a dict in field order, a missing value replaced by its
@@ -109,7 +175,8 @@ pub struct ItemSpec {
 #[pymethods]
 impl ItemSpec {
     /// `fields` holds (name, "css" | "xpath", query, pattern, all, strip,
-    /// "text" | "int" | "float" | "bool", default) for each field.
+    /// "text" | "int" | "float" | "bool", default, track name or None) for
+    /// each field.
     #[new]
     #[allow(clippy::type_complexity)]
     fn new(
@@ -123,12 +190,13 @@ impl ItemSpec {
             bool,
             String,
             Py<PyAny>,
+            Option<String>,
         )>,
     ) -> PyResult<ItemSpec> {
         let mut compiled = Vec::new();
         let mut names = Vec::new();
         let mut defaults = Vec::new();
-        for (field, kind, query, pattern, all, strip, convert, default) in fields {
+        for (field, kind, query, pattern, all, strip, convert, default, track) in fields {
             let convert = match convert.as_str() {
                 "text" => Convert::Text,
                 "int" => Convert::Int,
@@ -147,6 +215,9 @@ impl ItemSpec {
             if let Some(p) = pattern {
                 f = f.re(&p).map_err(PyValueError::new_err)?;
             }
+            if let Some(t) = track {
+                f = f.track(Tracker::new(&t, &kind, &query).map_err(PyValueError::new_err)?);
+            }
             compiled.push(f);
             names.push(field);
             defaults.push(default);
@@ -161,13 +232,37 @@ impl ItemSpec {
         })
     }
 
-    /// The item found below `node`, and its problems.
-    fn extract<'py>(&self, py: Python<'py>, node: &Node) -> PyResult<Extracted<'py>> {
+    /// The item found below `node`, its problems, and what tracking did
+    /// (with `store`, tracked fields are followed on `site`).
+    #[pyo3(signature = (node, store=None, site="", threshold=0.75))]
+    fn extract<'py>(
+        &self,
+        py: Python<'py>,
+        node: &Node,
+        store: Option<&TrackStore>,
+        site: &str,
+        threshold: f64,
+    ) -> PyResult<(Bound<'py, PyDict>, Vec<Problem>, Notes)> {
         let (doc, id, inner) = (node.document().clone(), node.node_id(), self.inner.clone());
+        let (tracks, site) = (store.map(TrackStore::tracks), site.to_string());
         // SAFETY: the id came from a Node of this document, which `doc` keeps
         // alive.
-        let values = py.detach(move || inner.extract(unsafe { doc.node(id) }));
-        self.inner.to_python(py, values)
+        let (values, notes) = py.detach(move || {
+            let root = unsafe { doc.node(id) };
+            match &tracks {
+                Some(tracks) => inner.extract_tracked(
+                    root,
+                    &TrackContext {
+                        tracks,
+                        site: &site,
+                        threshold,
+                    },
+                ),
+                None => (inner.extract(root), Vec::new()),
+            }
+        });
+        let (dict, problems) = self.inner.to_python(py, values)?;
+        Ok((dict, problems, notes))
     }
 }
 
@@ -184,5 +279,6 @@ pub(crate) struct Rule {
 }
 
 pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
-    m.add_class::<ItemSpec>()
+    m.add_class::<ItemSpec>()?;
+    m.add_class::<TrackStore>()
 }

@@ -3,12 +3,14 @@
 
 use std::sync::Arc;
 
+use netweir_dom::extract::{TrackContext, Tracker, Tracking};
 use netweir_dom::{Document, Hit, NodeId, NodeKind, Query, XPath, XValue};
 use pyo3::exceptions::{PyIndexError, PyKeyError, PyTypeError};
 use pyo3::prelude::*;
 use pyo3::types::{PyBool, PyDict, PyFloat, PyInt, PySlice, PyString};
 
 use crate::filter::{Criteria, Filter, single_string};
+use crate::rules::TrackStore;
 use crate::{SelectorError, XPathError};
 
 /// A node in a parsed document: an element, a piece of text, a comment, or
@@ -33,6 +35,13 @@ enum Entry {
 pub(crate) struct Selection {
     doc: Arc<Document>,
     entries: Vec<Entry>,
+    /// With track=: the selector found nothing and these results were
+    /// found by similarity.
+    relocated: bool,
+    /// With track=: 1.0 when the selector matched, the similarity when
+    /// relocated, the nearest candidate's score when nothing was similar
+    /// enough, None when there was nothing to look for.
+    score: Option<f64>,
 }
 
 impl Node {
@@ -114,6 +123,22 @@ fn css_entries(
         }
         out
     }))
+}
+
+/// css(track=...) and xpath(track=...) on a bare Node: netweir._track knows
+/// the store and threshold in force, and reports what happened.
+fn tracked_through_python(
+    py: Python<'_>,
+    node: &Bound<'_, Node>,
+    kind: &str,
+    query: &str,
+    name: &str,
+) -> PyResult<Py<PyAny>> {
+    Ok(py
+        .import("netweir._track")?
+        .getattr("tracked")?
+        .call1((node, kind, query, name, ""))?
+        .unbind())
 }
 
 /// Keyword arguments to XPath variables: str, int, float or bool.
@@ -327,28 +352,113 @@ finders! {
 impl Node {
     // --- parsel-style queries -----------------------------------------
 
-    fn css(&self, py: Python<'_>, query: &str) -> PyResult<Selection> {
-        let entries = css_entries(py, &self.doc, vec![self.id], query)?;
+    /// Runs a CSS query. With `track`, the element is followed by that
+    /// name through redesigns (see netweir.track).
+    #[pyo3(signature = (query, track=None))]
+    fn css(
+        slf: &Bound<'_, Self>,
+        py: Python<'_>,
+        query: &str,
+        track: Option<&str>,
+    ) -> PyResult<Py<PyAny>> {
+        if let Some(name) = track {
+            return tracked_through_python(py, slf, "css", query, name);
+        }
+        let me = slf.get();
+        let entries = css_entries(py, &me.doc, vec![me.id], query)?;
+        Ok(Py::new(
+            py,
+            Selection {
+                doc: me.doc.clone(),
+                entries,
+                relocated: false,
+                score: None,
+            },
+        )?
+        .into_any())
+    }
+
+    /// The query's results, following the element as `name` on `site`
+    /// through redesigns: when the query finds it, its fingerprint is
+    /// saved in `store`; when it doesn't, the most similar element is
+    /// used if it scores at least `threshold`. Used by css(track=...) and
+    /// xpath(track=...).
+    #[allow(clippy::too_many_arguments)]
+    fn tracked(
+        &self,
+        py: Python<'_>,
+        kind: &str,
+        query: &str,
+        name: &str,
+        store: &TrackStore,
+        site: &str,
+        threshold: f64,
+    ) -> PyResult<Selection> {
+        let tracker = Tracker::new(name, kind, query).map_err(|e| match kind {
+            "css" => SelectorError::new_err(e),
+            _ => XPathError::new_err(e),
+        })?;
+        let (doc, id, tracks) = (self.doc.clone(), self.id, store.tracks());
+        let site = site.to_string();
+        let (entries, tracking) = py
+            .detach(move || {
+                let ctx = TrackContext {
+                    tracks: &tracks,
+                    site: &site,
+                    threshold,
+                };
+                // SAFETY: the id came from this Node's document.
+                tracker
+                    .run(unsafe { doc.node(id) }, &ctx)
+                    .map(|(hits, tracking)| (entries_of(hits), tracking))
+            })
+            .map_err(XPathError::new_err)?;
+        let (relocated, score) = match tracking {
+            Tracking::Matched => (false, Some(1.0)),
+            Tracking::Relocated(s) => (true, Some(s)),
+            // How close the nearest candidate came.
+            Tracking::Lost(best) => (false, Some(best)),
+            Tracking::Unknown => (false, None),
+        };
         Ok(Selection {
             doc: self.doc.clone(),
             entries,
+            relocated,
+            score,
         })
     }
 
     /// Runs an XPath 1.0 query with this node as the context. Keyword
-    /// arguments bind `$variables`.
-    #[pyo3(signature = (query, **vars))]
+    /// arguments bind `$variables`; `track` follows the element through
+    /// redesigns, as css(track=...) does.
+    #[pyo3(signature = (query, track=None, **vars))]
     fn xpath(
-        &self,
+        slf: &Bound<'_, Self>,
         py: Python<'_>,
         query: &str,
+        track: Option<&str>,
         vars: Option<&Bound<'_, PyDict>>,
-    ) -> PyResult<Selection> {
-        let entries = xpath_entries(py, &self.doc, vec![self.id], query, vars)?;
-        Ok(Selection {
-            doc: self.doc.clone(),
-            entries,
-        })
+    ) -> PyResult<Py<PyAny>> {
+        if let Some(name) = track {
+            if vars.is_some_and(|v| !v.is_empty()) {
+                return Err(PyTypeError::new_err(
+                    "track= can't be combined with $variables",
+                ));
+            }
+            return tracked_through_python(py, slf, "xpath", query, name);
+        }
+        let me = slf.get();
+        let entries = xpath_entries(py, &me.doc, vec![me.id], query, vars)?;
+        Ok(Py::new(
+            py,
+            Selection {
+                doc: me.doc.clone(),
+                entries,
+                relocated: false,
+                score: None,
+            },
+        )?
+        .into_any())
     }
 
     // --- Beautiful Soup style search ----------------------------------
@@ -689,6 +799,8 @@ impl Selection {
         Ok(Selection {
             doc: self.doc.clone(),
             entries,
+            relocated: false,
+            score: None,
         })
     }
 
@@ -704,6 +816,8 @@ impl Selection {
         Ok(Selection {
             doc: self.doc.clone(),
             entries,
+            relocated: false,
+            score: None,
         })
     }
 
@@ -741,6 +855,22 @@ impl Selection {
         }
     }
 
+    /// With track=: whether the selector missed and these results were
+    /// found by similarity instead.
+    #[getter]
+    fn relocated(&self) -> bool {
+        self.relocated
+    }
+
+    /// With track=: 1.0 when the selector matched, the similarity (0 to 1)
+    /// when the results were relocated, the nearest candidate's score when
+    /// nothing was similar enough, and None when there was nothing to
+    /// look for.
+    #[getter]
+    fn score(&self) -> Option<f64> {
+        self.score
+    }
+
     /// The first element's attributes; empty if there is none.
     #[getter]
     fn attrib<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
@@ -772,6 +902,8 @@ impl Selection {
                 Selection {
                     doc: self.doc.clone(),
                     entries: picked,
+                    relocated: false,
+                    score: None,
                 },
             )?
             .into_any());

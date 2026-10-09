@@ -3,8 +3,11 @@
 
 use regex::Regex;
 
+use std::sync::LazyLock;
+
 use crate::document::{Node, NodeKind};
 use crate::query::{Hit, Query};
+use crate::track::{Fingerprint, best};
 use crate::xpath::XPath;
 
 /// A compiled CSS (with `::text`/`::attr()`) or XPath query.
@@ -26,7 +29,7 @@ impl Selector {
             .map_err(|e| e.to_string())
     }
 
-    fn hits<'a>(&self, scope: Node<'a>) -> Result<Vec<Hit<'a>>, String> {
+    pub fn hits<'a>(&self, scope: Node<'a>) -> Result<Vec<Hit<'a>>, String> {
         match self {
             Selector::Css(q) => Ok(q.run(scope)),
             Selector::XPath(x) => x.run(scope).map_err(|e| e.to_string()),
@@ -65,6 +68,7 @@ pub enum Value {
 pub struct Field {
     name: String,
     selector: Selector,
+    tracker: Option<Tracker>,
     re: Option<Regex>,
     all: bool,
     strip: bool,
@@ -76,6 +80,7 @@ impl Field {
         Field {
             name: name.to_string(),
             selector,
+            tracker: None,
             re: None,
             all: false,
             strip: false,
@@ -114,13 +119,31 @@ impl Field {
         self
     }
 
+    /// Follows the element through redesigns as `name` (see Tracker).
+    /// Without a TrackContext when extracting, the field works as usual.
+    pub fn track(mut self, tracker: Tracker) -> Field {
+        self.tracker = Some(tracker);
+        self
+    }
+
     pub fn name(&self) -> &str {
         &self.name
     }
 
-    fn texts(&self, scope: Node<'_>) -> Result<Vec<String>, String> {
+    fn texts(
+        &self,
+        scope: Node<'_>,
+        ctx: Option<&TrackContext<'_>>,
+    ) -> Result<(Vec<String>, Option<Tracking>), String> {
+        let (hits, tracking) = match (&self.tracker, ctx) {
+            (Some(t), Some(ctx)) => {
+                let (hits, tracking) = t.run(scope, ctx)?;
+                (hits, Some(tracking))
+            }
+            _ => (self.selector.hits(scope)?, None),
+        };
         let mut out = Vec::new();
-        for hit in self.selector.hits(scope)? {
+        for hit in hits {
             let text = hit.to_string_value();
             match &self.re {
                 Some(re) => {
@@ -129,19 +152,19 @@ impl Field {
                         let m = if grouped { caps.get(1) } else { caps.get(0) };
                         out.push(m.map_or("", |m| m.as_str()).to_string());
                         if !self.all {
-                            return Ok(out);
+                            return Ok((out, tracking));
                         }
                     }
                 }
                 None => {
                     out.push(text);
                     if !self.all {
-                        return Ok(out);
+                        return Ok((out, tracking));
                     }
                 }
             }
         }
-        Ok(out)
+        Ok((out, tracking))
     }
 
     fn value(&self, text: String) -> Value {
@@ -164,17 +187,176 @@ impl Field {
     }
 
     pub fn extract(&self, scope: Node<'_>) -> Value {
-        let texts = match self.texts(scope) {
+        self.extract_with(scope, None).0
+    }
+
+    /// `extract`, tracking the field's element if it's tracked and `ctx`
+    /// says where.
+    pub fn extract_with(
+        &self,
+        scope: Node<'_>,
+        ctx: Option<&TrackContext<'_>>,
+    ) -> (Value, Option<Tracking>) {
+        let (texts, tracking) = match self.texts(scope, ctx) {
             Ok(t) => t,
-            Err(e) => return Value::Error(e),
+            Err(e) => return (Value::Error(e), None),
         };
-        if self.all {
+        let value = if self.all {
             Value::List(texts.into_iter().map(|t| self.value(t)).collect())
         } else {
             texts
                 .into_iter()
                 .next()
                 .map_or(Value::Missing, |t| self.value(t))
+        };
+        (value, tracking)
+    }
+}
+
+/// Where tracked fingerprints are kept, by site and name.
+pub trait Tracks: Sync {
+    fn get(&self, site: &str, name: &str) -> Option<String>;
+    fn put(&self, site: &str, name: &str, fingerprint: &str);
+}
+
+/// What tracking a query did on one page.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Tracking {
+    /// The selector matched; its element's fingerprint was saved.
+    Matched,
+    /// The selector found nothing, and the element was found by
+    /// similarity, with this score.
+    Relocated(f64),
+    /// The selector found nothing, and nothing scored well enough; the
+    /// best candidate's score (0 if there was none).
+    Lost(f64),
+    /// The selector found nothing, and there is no fingerprint to look
+    /// for: an element that has never been seen.
+    Unknown,
+}
+
+/// Where tracking reads and writes, for one page.
+pub struct TrackContext<'t> {
+    pub tracks: &'t dyn Tracks,
+    /// The page's host, so one name can mean different elements on
+    /// different sites.
+    pub site: &'t str,
+    pub threshold: f64,
+}
+
+/// A tracked query, split into the part that finds the element and the
+/// ending (`::text`, `::attr(x)`, `/text()`, `/@x`) that takes a value
+/// from it.
+pub struct Tracker {
+    name: String,
+    full: Selector,
+    element: Selector,
+    ending: Option<Selector>,
+}
+
+static CSS_ENDING: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"^(?s)(.*?)(\s*::(?:text|attr\([^)]*\)))\s*$").expect("a valid pattern")
+});
+static XPATH_ENDING: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"^(?s)(.*?)(/{1,2})(text\(\)|@[\w:.*-]+)\s*$").expect("a valid pattern")
+});
+
+/// Whether `query` has a comma outside brackets and quotes: a list.
+fn is_list(query: &str) -> bool {
+    let (mut depth, mut quote) = (0i32, None);
+    for c in query.chars() {
+        match (quote, c) {
+            (Some(q), c) if c == q => quote = None,
+            (Some(_), _) => {}
+            (None, '"' | '\'') => quote = Some(c),
+            (None, '(' | '[') => depth += 1,
+            (None, ')' | ']') => depth -= 1,
+            (None, ',') if depth == 0 => return true,
+            _ => {}
+        }
+    }
+    false
+}
+
+impl Tracker {
+    /// `kind` is "css" or "xpath".
+    pub fn new(name: &str, kind: &str, query: &str) -> Result<Tracker, String> {
+        let compile = |q: &str| match kind {
+            "css" => Selector::css(q),
+            _ => Selector::xpath(q),
+        };
+        if kind == "css" && is_list(query) {
+            return Err(format!(
+                "track={name:?} follows one selector, not a list: {query:?}"
+            ));
+        }
+        let (element, ending) = match kind {
+            "css" => match CSS_ENDING.captures(query) {
+                Some(c) => (c[1].to_string(), Some(c[2].trim().to_string())),
+                None => (query.to_string(), None),
+            },
+            _ => match XPATH_ENDING.captures(query) {
+                Some(c) => {
+                    let relative = if &c[2] == "//" {
+                        format!(".//{}", &c[3])
+                    } else {
+                        c[3].to_string()
+                    };
+                    (c[1].to_string(), Some(relative))
+                }
+                None => (query.to_string(), None),
+            },
+        };
+        if element.trim().is_empty() {
+            return Err(format!(
+                "track={name:?} needs an element to follow, not just {query:?}"
+            ));
+        }
+        Ok(Tracker {
+            name: name.to_string(),
+            full: compile(query)?,
+            element: compile(&element)?,
+            ending: ending.map(|e| compile(&e)).transpose()?,
+        })
+    }
+
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// The query's results below `scope`. When the element is there, its
+    /// fingerprint is saved; when it isn't, it's looked for by similarity.
+    pub fn run<'a>(
+        &self,
+        scope: Node<'a>,
+        ctx: &TrackContext<'_>,
+    ) -> Result<(Vec<Hit<'a>>, Tracking), String> {
+        let first = self.element.hits(scope)?.into_iter().find_map(|h| match h {
+            Hit::Node(n) if n.kind() == NodeKind::Element => Some(n),
+            _ => None,
+        });
+        if let Some(element) = first {
+            ctx.tracks
+                .put(ctx.site, &self.name, &Fingerprint::of(element).to_json());
+            return Ok((self.full.hits(scope)?, Tracking::Matched));
+        }
+        let Some(fp) = ctx
+            .tracks
+            .get(ctx.site, &self.name)
+            .and_then(|json| Fingerprint::from_json(&json))
+        else {
+            return Ok((Vec::new(), Tracking::Unknown));
+        };
+        match best(scope, &fp) {
+            Some((node, score)) if score >= ctx.threshold => {
+                let hits = match &self.ending {
+                    Some(ending) => ending.hits(node)?,
+                    None => vec![Hit::Node(node)],
+                };
+                Ok((hits, Tracking::Relocated(score)))
+            }
+            Some((_, score)) => Ok((Vec::new(), Tracking::Lost(score))),
+            None => Ok((Vec::new(), Tracking::Lost(0.0))),
         }
     }
 }
@@ -196,6 +378,31 @@ impl ItemSpec {
     /// One value per field, in the fields' order.
     pub fn extract(&self, scope: Node<'_>) -> Vec<Value> {
         self.fields.iter().map(|f| f.extract(scope)).collect()
+    }
+
+    /// `extract`, with tracked fields tracked. Also returns, by field
+    /// number, each tracked field that had to be relocated or was lost.
+    pub fn extract_with(
+        &self,
+        scope: Node<'_>,
+        ctx: &TrackContext<'_>,
+    ) -> (Vec<Value>, Vec<(usize, Tracking)>) {
+        let mut notes = Vec::new();
+        let values = self
+            .fields
+            .iter()
+            .enumerate()
+            .map(|(i, f)| {
+                let (value, tracking) = f.extract_with(scope, Some(ctx));
+                if let Some(t) =
+                    tracking.filter(|t| matches!(t, Tracking::Relocated(_) | Tracking::Lost(_)))
+                {
+                    notes.push((i, t));
+                }
+                value
+            })
+            .collect();
+        (values, notes)
     }
 }
 

@@ -7,6 +7,7 @@ import logging
 from collections.abc import Callable
 from typing import Any
 
+from netweir import _track
 from netweir._native import ItemSpec, Node
 
 #: `into` values Rust converts itself; anything else runs in Python.
@@ -16,9 +17,9 @@ _BUILTIN = {str: "text", int: "int", float: "float", bool: "bool"}
 class Field:
     """One field of an Item. Made by ``netweir.css`` or ``netweir.xpath``."""
 
-    __slots__ = ("all", "default", "into", "kind", "query", "re", "strip")
+    __slots__ = ("all", "default", "into", "kind", "query", "re", "strip", "track")
 
-    def __init__(self, kind, query, re, into, all, strip, default):
+    def __init__(self, kind, query, re, into, all, strip, default, track=None):
         if into is not None and not callable(into):
             raise TypeError(f"into= takes a type or a function, not {into!r}")
         self.kind = kind
@@ -28,12 +29,23 @@ class Field:
         self.all = all
         self.strip = strip
         self.default = default
+        self.track = track
         # Compiling now reports a bad query or pattern where it was written.
         ItemSpec("check", [self._spec("check")])
 
     def _spec(self, name: str) -> tuple:
         convert = _BUILTIN.get(self.into, "text")
-        return (name, self.kind, self.query, self.re, self.all, self.strip, convert, self.default)
+        return (
+            name,
+            self.kind,
+            self.query,
+            self.re,
+            self.all,
+            self.strip,
+            convert,
+            self.default,
+            self.track,
+        )
 
     def _python_into(self) -> Callable[[Any], Any] | None:
         return None if self.into is None or self.into in _BUILTIN else self.into
@@ -47,6 +59,7 @@ def css(
     all: bool = False,
     strip: bool = False,
     default: Any = None,
+    track: str | None = None,
 ) -> Field:
     """A field found by a CSS query (with ``::text`` and ``::attr()``).
 
@@ -57,8 +70,10 @@ def css(
     ``int``, ``float``, ``bool`` or ``str`` converts in Rust; a value that
     won't convert becomes None, with a warning. Any other callable is applied
     to the finished value in Python. Nothing found gives ``default``.
+    ``track`` follows the element through redesigns under that name (see
+    ``Page.css``).
     """
-    return Field("css", query, re, into, all, strip, default)
+    return Field("css", query, re, into, all, strip, default, track)
 
 
 def xpath(
@@ -69,9 +84,10 @@ def xpath(
     all: bool = False,
     strip: bool = False,
     default: Any = None,
+    track: str | None = None,
 ) -> Field:
     """A field found by an XPath 1.0 query; see ``css`` for the options."""
-    return Field("xpath", query, re, into, all, strip, default)
+    return Field("xpath", query, re, into, all, strip, default, track)
 
 
 class Item:
@@ -112,8 +128,13 @@ class Item:
         root = getattr(node, "root", node)
         if not isinstance(root, Node):
             raise TypeError(f"extract() takes a Page or a Node, not {type(node).__name__}")
-        item, invalid = cls._spec.extract(root)
+        store, threshold = _track.context()
+        page_url = getattr(node, "url", None)
+        site = _track.site_of(page_url)
+        item, invalid, notes = cls._spec.extract(root, store, site, threshold)
         _warn_invalid(invalid)
+        for field, what, score in notes:
+            _track.report(field, site, what, score)
         return cls._finish(item)
 
     @classmethod

@@ -4,6 +4,7 @@ import asyncio
 from collections.abc import Iterable, Mapping
 from urllib.parse import urljoin
 
+from netweir import _track
 from netweir._errors import Blocked
 from netweir._native import Fetcher, Node, Response, Selection
 from netweir._request import Request
@@ -100,10 +101,22 @@ class Page:
             self._root = self._response.parse()
         return self._root
 
-    def css(self, query: str) -> Selection:
+    def css(self, query: str, track: str | None = None) -> Selection:
+        """A CSS query. ``track`` names the element so it's found again
+        after a redesign breaks the query (see ``Selection.relocated``)."""
+        if track is not None:
+            return _track.tracked(self.root, "css", query, track, _track.site_of(self.url))
         return self.root.css(query)
 
-    def xpath(self, query: str, **variables: str | int | float | bool) -> Selection:
+    def xpath(
+        self, query: str, track: str | None = None, **variables: str | int | float | bool
+    ) -> Selection:
+        """An XPath 1.0 query; keyword arguments bind ``$variables``.
+        ``track`` works as in ``css``."""
+        if track is not None:
+            if variables:
+                raise TypeError("track= can't be combined with $variables")
+            return _track.tracked(self.root, "xpath", query, track, _track.site_of(self.url))
         return self.root.xpath(query, **variables)
 
     @property

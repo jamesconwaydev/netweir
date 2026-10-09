@@ -23,8 +23,19 @@ Filter = (
 
 class Node:
     # parsel-style queries
-    def css(self, query: str) -> Selection: ...
-    def xpath(self, query: str, **variables: str | int | float | bool) -> Selection: ...
+    def css(self, query: str, track: str | None = None) -> Selection: ...
+    def xpath(
+        self, query: str, track: str | None = None, **variables: str | int | float | bool
+    ) -> Selection: ...
+    def tracked(
+        self,
+        kind: Literal["css", "xpath"],
+        query: str,
+        name: str,
+        store: TrackStore,
+        site: str,
+        threshold: float,
+    ) -> Selection: ...
     # Beautiful Soup style search
     def find(
         self,
@@ -182,6 +193,10 @@ class Node:
     def __hash__(self) -> int: ...
 
 class Selection:
+    @property
+    def relocated(self) -> bool: ...
+    @property
+    def score(self) -> float | None: ...
     @overload
     def get(self) -> str | None: ...
     @overload
@@ -298,6 +313,7 @@ class Crawler:
     ) -> Literal["queued", "duplicate", "invalid", "too_deep", "trap", "domain_full"]: ...
     def resume(self) -> dict[str, Any] | None: ...
     def ack(self) -> None: ...
+    def set_tracks(self, store: TrackStore, threshold: float) -> None: ...
     def item_done(self, id: str) -> None: ...
     def settle(self, items: list[str], state: str) -> None: ...
     def save_counters(self, json: str) -> None: ...
@@ -309,7 +325,14 @@ class Crawler:
         | tuple[Literal["failed"], int, FetchError]
         | tuple[Literal["dropped"], int, Literal["robots", "tdm"]]
         | tuple[Literal["handled"], int]
-        | tuple[Literal["item"], int, dict[str, Any], list[tuple[str, str, str]], str]
+        | tuple[
+            Literal["item"],
+            int,
+            dict[str, Any],
+            list[tuple[str, str, str]],
+            str,
+            list[tuple[str, str, float | None]],
+        ]
         | tuple[Literal["ruled"], int, str, Response, Node | None, int]
         | tuple[Literal["rule_failed"], int, str, FetchError]
         | tuple[Literal["rule_dropped"], int, str, Literal["robots", "tdm"]]
@@ -334,10 +357,20 @@ class ItemSpec:
                 bool,
                 Literal["text", "int", "float", "bool"],
                 object,
+                str | None,
             ]
         ],
     ) -> None: ...
-    def extract(self, node: Node) -> tuple[dict[str, Any], list[tuple[str, str, str]]]: ...
+    def extract(
+        self,
+        node: Node,
+        store: TrackStore | None = None,
+        site: str = "",
+        threshold: float = 0.75,
+    ) -> tuple[dict[str, Any], list[tuple[str, str, str]], list[tuple[str, str, float | None]]]: ...
+
+class TrackStore:
+    def __init__(self, path: str) -> None: ...
 
 class JsonlWriter:
     def __init__(self, path: str, append: bool = False) -> None: ...

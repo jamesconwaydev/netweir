@@ -12,7 +12,7 @@ use std::time::Duration;
 use netweir_core::{
     CrawlRequest, CrawlSettings, Crawler as CoreCrawler, DropReason, Event, FetchError, Submitted,
 };
-use netweir_dom::extract::{self, Value};
+use netweir_dom::extract::{self, TrackContext, Value};
 use netweir_dom::{Document, Query};
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
@@ -21,7 +21,7 @@ use url::Url;
 
 use crate::fetch::{Response, fetch_error_value, fetch_options};
 use crate::node::Node;
-use crate::rules::{ItemSpec, Rule, selector};
+use crate::rules::{ItemSpec, Notes, Rule, StoreRef, TrackStore, selector};
 
 fn seconds(name: &str, value: f64) -> PyResult<Duration> {
     Duration::try_from_secs_f64(value).map_err(|_| {
@@ -80,6 +80,8 @@ struct Processed {
     root: Option<Arc<Document>>,
     links: Vec<(String, usize)>,
     item: Option<Vec<Value>>,
+    /// What tracking did to the item's tracked fields.
+    notes: Notes,
     error: Option<String>,
     /// Why the rules left the page alone: an error status, or not HTML.
     ignored: Option<String>,
@@ -108,6 +110,7 @@ enum Out {
         rule: usize,
         url: String,
         values: Vec<Value>,
+        notes: Notes,
     },
     Ruled {
         rule: usize,
@@ -153,6 +156,8 @@ enum Out {
 
 struct Engine {
     core: CoreCrawler,
+    /// Where tracked Item fields keep fingerprints, and the threshold.
+    tracks: Mutex<Option<(StoreRef, f64)>>,
     /// Requests whose events Python has but hasn't finished with.
     unacked: Mutex<Vec<u64>>,
     /// One permit per core: how many rule pages are parsed at once.
@@ -215,6 +220,7 @@ impl Engine {
             root: None,
             links: Vec::new(),
             item: None,
+            notes: Vec::new(),
             error: None,
             ignored: not_a_page(&response),
         };
@@ -229,7 +235,28 @@ impl Engine {
                         }
                     }
                     if let Some(item) = done.tag.rule.and_then(|r| rules[r].item.as_ref()) {
-                        done.item = Some(item.extract(root));
+                        let tracks = self
+                            .tracks
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .clone();
+                        match tracks {
+                            Some((tracks, threshold)) => {
+                                let site = Url::parse(&response.url)
+                                    .ok()
+                                    .and_then(|u| u.host_str().map(str::to_string))
+                                    .unwrap_or_default();
+                                let ctx = TrackContext {
+                                    tracks: &tracks,
+                                    site: &site,
+                                    threshold,
+                                };
+                                let (values, notes) = item.extract_tracked(root, &ctx);
+                                done.item = Some(values);
+                                done.notes = notes;
+                            }
+                            None => done.item = Some(item.extract(root)),
+                        }
                     }
                     if done.tag.to_python {
                         done.root = Some(Arc::new(doc));
@@ -408,6 +435,7 @@ impl Engine {
                         rule,
                         url: done.tag.url.clone(),
                         values,
+                        notes: done.notes,
                     });
                 }
                 match (done.tag.rule, done.response) {
@@ -486,7 +514,12 @@ fn out_py<'py>(py: Python<'py>, engine: &Engine, event: Out) -> PyResult<Bound<'
         ),
         Out::Dropped { id, why } => tuple(py, vec![s("dropped")?, n(id)?, s(why)?]),
         Out::Handled { id } => tuple(py, vec![s("handled")?, n(id)?]),
-        Out::Item { rule, url, values } => {
+        Out::Item {
+            rule,
+            url,
+            values,
+            notes,
+        } => {
             let rules = engine
                 .rules
                 .lock()
@@ -505,6 +538,7 @@ fn out_py<'py>(py: Python<'py>, engine: &Engine, event: Out) -> PyResult<Bound<'
                     dict.into_any(),
                     invalid.into_pyobject(py)?.into_any(),
                     s(&url)?,
+                    notes.into_pyobject(py)?.into_any(),
                 ],
             )
         }
@@ -668,6 +702,7 @@ impl Crawler {
         Ok(Crawler {
             engine: Arc::new(Engine {
                 core,
+                tracks: Mutex::new(None),
                 unacked: Mutex::new(Vec::new()),
                 parsers: Arc::new(tokio::sync::Semaphore::new(
                     std::thread::available_parallelism().map_or(4, |n| n.get()),
@@ -775,7 +810,8 @@ impl Crawler {
     /// - ("dropped", id, "robots" | "tdm")
     /// - ("handled", id): dealt with by the rules in Rust
     /// - ("blocked", id, rule or None, url, vendor, kind, Response)
-    /// - ("item", rule, dict, [(field, text, kind)] problems, url)
+    /// - ("item", rule, dict, [(field, text, kind)] problems, url,
+    ///   [(field, "relocated" | "lost", score)] tracking notes)
     /// - ("ruled", rule, url, Response, root Node, depth)
     /// - ("rule_failed", rule, url, FetchError)
     /// - ("rule_dropped", rule, url, reason)
@@ -860,6 +896,13 @@ impl Crawler {
         out.set_item("items", saved.items.into_iter().collect::<Vec<_>>())?;
         out.set_item("counters", saved.counters)?;
         Ok(Some(out))
+    }
+
+    /// Tracked Item fields keep their fingerprints in `store`, and are
+    /// relocated when they score at least `threshold`.
+    fn set_tracks(&self, store: &TrackStore, threshold: f64) {
+        *self.engine.tracks.lock().unwrap_or_else(|e| e.into_inner()) =
+            Some((store.tracks(), threshold));
     }
 
     /// Python has dealt with every event of the batches it has: their

@@ -63,3 +63,106 @@ fn an_unchanged_page_scores_one() {
     assert_eq!(found, el);
     assert!((score - 1.0).abs() < 1e-9, "{score}");
 }
+
+use std::collections::HashMap;
+use std::sync::Mutex;
+
+use netweir_dom::Hit;
+use netweir_dom::extract::{
+    Field, ItemSpec, Selector, TrackContext, Tracker, Tracking, Tracks, Value,
+};
+
+#[derive(Default)]
+struct Memory(Mutex<HashMap<(String, String), String>>);
+
+impl Tracks for Memory {
+    fn get(&self, site: &str, name: &str) -> Option<String> {
+        self.0
+            .lock()
+            .unwrap()
+            .get(&(site.into(), name.into()))
+            .cloned()
+    }
+    fn put(&self, site: &str, name: &str, fingerprint: &str) {
+        self.0
+            .lock()
+            .unwrap()
+            .insert((site.into(), name.into()), fingerprint.into());
+    }
+}
+
+fn values(hits: &[Hit<'_>]) -> Vec<String> {
+    hits.iter().map(Hit::to_string_value).collect()
+}
+
+#[test]
+fn a_tracked_query_learns_then_relocates() {
+    let memory = Memory::default();
+    let ctx = TrackContext {
+        tracks: &memory,
+        site: "shop.example",
+        threshold: THRESHOLD,
+    };
+    let before = Document::parse(&page("class-renamed.before.html"));
+    let after = Document::parse(&page("class-renamed.after.html"));
+    for (kind, query) in [
+        ("css", "p.price_color::text"),
+        ("xpath", "//p[@class='price_color']/text()"),
+    ] {
+        let tracker = Tracker::new("price", kind, query).unwrap();
+        let (hits, tracking) = tracker.run(before.root(), &ctx).unwrap();
+        assert_eq!(
+            (values(&hits), tracking),
+            (vec!["£24.99".to_string()], Tracking::Matched)
+        );
+        let (hits, tracking) = tracker.run(after.root(), &ctx).unwrap();
+        assert_eq!(values(&hits), ["£24.99"], "{kind}");
+        assert!(
+            matches!(tracking, Tracking::Relocated(s) if s >= THRESHOLD),
+            "{tracking:?}"
+        );
+    }
+    // Another site's fingerprint is its own.
+    let other = TrackContext {
+        site: "other.example",
+        ..ctx
+    };
+    let tracker = Tracker::new("price", "css", "p.price_color::text").unwrap();
+    assert_eq!(
+        tracker.run(after.root(), &other).unwrap().1,
+        Tracking::Unknown
+    );
+}
+
+#[test]
+fn a_tracked_field_in_an_item() {
+    let memory = Memory::default();
+    let ctx = TrackContext {
+        tracks: &memory,
+        site: "s",
+        threshold: THRESHOLD,
+    };
+    let field = |q: &str| {
+        Field::new("price", Selector::css(q).unwrap())
+            .track(Tracker::new("price", "css", q).unwrap())
+    };
+    let spec = ItemSpec::new(vec![field("p.price_color::text")]);
+    let before = Document::parse(&page("class-renamed.before.html"));
+    let after = Document::parse(&page("class-renamed.after.html"));
+    let (v, notes) = spec.extract_with(before.root(), &ctx);
+    assert_eq!((v, notes), (vec![Value::Text("£24.99".into())], vec![]));
+    let (v, notes) = spec.extract_with(after.root(), &ctx);
+    assert_eq!(v, vec![Value::Text("£24.99".into())]);
+    assert!(matches!(notes[..], [(0, Tracking::Relocated(_))]));
+    // Without a context, a tracked field is an ordinary one.
+    assert_eq!(spec.extract(after.root()), vec![Value::Missing]);
+}
+
+#[test]
+fn what_can_be_tracked() {
+    let err = |kind: &str, q: &str| Tracker::new("x", kind, q).err().unwrap();
+    assert!(err("css", "a, b").contains("list"));
+    assert!(err("css", "::text").contains("element"));
+    assert!(Tracker::new("x", "css", "a[title='a, b']::text").is_ok());
+    assert!(Tracker::new("x", "xpath", "//a/@href").is_ok());
+}

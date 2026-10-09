@@ -19,8 +19,9 @@ import time
 from collections.abc import AsyncIterator, Callable, Iterable
 from typing import Any
 
+from netweir import _track
 from netweir._fetch import Page, _pairs
-from netweir._native import Crawler, fingerprint
+from netweir._native import Crawler, TrackStore, fingerprint
 from netweir._request import Request
 from netweir._rules import Follow, _warn_invalid
 
@@ -72,6 +73,9 @@ class Settings:
     #: again, and items carry an ``_id`` so none is written twice. Delete
     #: the directory to start over.
     checkpoint: str | None = None
+    #: How similar (0 to 1) an element must be to count as a tracked
+    #: selector's element after the selector stops matching.
+    track_threshold: float = 0.75
     #: Stop the crawl at the first exception in a callback or pipeline.
     fail_fast: bool = False
 
@@ -94,6 +98,8 @@ class Settings:
             raise ValueError("backoffs must be positive, with backoff_base <= backoff_max")
         if not 0 <= self.breaker_ratio <= 1:
             raise ValueError("breaker_ratio must be between 0 and 1")
+        if not 0 < self.track_threshold <= 1:
+            raise ValueError("track_threshold must be above 0 and at most 1")
         # A list is fine to pass; stored as a tuple, as Settings is frozen.
         object.__setattr__(self, "proxies", tuple(self.proxies))
 
@@ -241,6 +247,12 @@ class _Run:
         self.warned: set[str] = set()
         #: Depth of requests the running callback yields.
         self.depth = 0
+        # Tracked selectors keep fingerprints in the checkpoint file, or in
+        # the default store.
+        state = self.settings._checkpoint_file()
+        store = TrackStore(state) if state else _track.context()[0]
+        self.tracks = (store, self.settings.track_threshold)
+        self.engine.set_tracks(store, self.settings.track_threshold)
         self.counts = {
             "items": 0,
             "items_dropped": 0,
@@ -248,6 +260,8 @@ class _Run:
             "invalid_urls": 0,
             "pages_ignored": 0,
             "items_already_written": 0,
+            "relocated": 0,
+            "lost": 0,
         }
 
     def resume(self) -> dict[str, int] | None:
@@ -338,6 +352,14 @@ class _Run:
         return fn
 
     async def go(self) -> dict[str, int]:
+        # page.css(track=...) in callbacks uses this crawl's store.
+        token = _track._crawl.set(self.tracks)
+        try:
+            return await self.crawl()
+        finally:
+            _track._crawl.reset(token)
+
+    async def crawl(self) -> dict[str, int]:
         started = time.monotonic()
         if not self.settings.obey_robots:
             log.warning("obey_robots is off: robots.txt is not being checked")
@@ -402,9 +424,12 @@ class _Run:
     async def dispatch(self, event: tuple) -> None:
         kind = event[0]
         if kind == "item":
-            _, rule, item, invalid, url = event
+            _, rule, item, invalid, url, notes = event
             item_class = self.rules[rule].extract
             _warn_invalid(invalid, self.warned)
+            for field, what, score in notes:
+                self.counts["relocated" if what == "relocated" else "lost"] += 1
+                _track.report(field, _track.site_of(url), what, score)
             self.source, self.position = url, 0
             await self.handle(item_class._finish(item, self.warned))
         elif kind == "ruled":
