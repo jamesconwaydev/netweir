@@ -11,6 +11,7 @@ use tokio::sync::Notify;
 use url::Url;
 
 use crate::canonical::{Fingerprint, fingerprint};
+use crate::checkpoint::{Checkpoint, Pending, Saved};
 use crate::classify::{BlockKind, Outcome, classify};
 use crate::fetch::{FetchError, FetchErrorKind, FetchOptions, Fetcher, Hop, Response};
 use crate::robots::Robots;
@@ -55,6 +56,8 @@ pub struct CrawlSettings {
     pub breaker_window: usize,
     pub breaker_ratio: f64,
     pub breaker_pause: Duration,
+    /// A file to keep the crawl's state in, so it resumes after a crash.
+    pub checkpoint: Option<std::path::PathBuf>,
 }
 
 impl Default for CrawlSettings {
@@ -79,6 +82,7 @@ impl Default for CrawlSettings {
             breaker_window: 50,
             breaker_ratio: 0.3,
             breaker_pause: Duration::from_secs(300),
+            checkpoint: None,
         }
     }
 }
@@ -179,6 +183,9 @@ pub struct Crawler {
 
 struct Shared {
     fetcher: Fetcher,
+    checkpoint: Option<Checkpoint>,
+    /// What the checkpoint held at the start, until the caller takes it.
+    saved: Mutex<Option<Saved>>,
     /// What new sessions are made from.
     options: FetchOptions,
     /// The next entry of `settings.proxies` a new session takes.
@@ -194,6 +201,9 @@ struct Shared {
 #[derive(Default)]
 struct State {
     seq: u64,
+    /// Each saved request's row in the checkpoint, by id.
+    rows: HashMap<u64, i64>,
+    next_row: i64,
     seen: HashSet<Fingerprint>,
     hosts: HashMap<String, Host>,
     origins: HashMap<String, Origin>,
@@ -280,12 +290,25 @@ impl Ord for Queued {
 impl Crawler {
     /// Starts the scheduler on the current tokio runtime.
     pub fn new(fetch: FetchOptions, settings: CrawlSettings) -> Result<Crawler, FetchError> {
+        let mut state = State::default();
+        let (checkpoint, saved) = match &settings.checkpoint {
+            Some(path) => {
+                let (cp, mut saved) =
+                    Checkpoint::open(path).map_err(|e| FetchError::invalid(e.to_string()))?;
+                state.seen = std::mem::take(&mut saved.seen);
+                state.next_row = saved.next_row;
+                (Some(cp), Some(saved))
+            }
+            None => (None, None),
+        };
         let shared = Arc::new(Shared {
             fetcher: Fetcher::new(fetch.clone())?,
+            checkpoint,
+            saved: Mutex::new(saved),
             options: fetch,
             proxy_turn: std::sync::atomic::AtomicUsize::new(0),
             settings,
-            state: Mutex::new(State::default()),
+            state: Mutex::new(state),
             schedule: Notify::new(),
             events: Notify::new(),
         });
@@ -294,6 +317,74 @@ impl Crawler {
     }
 
     pub fn submit(&self, request: CrawlRequest) -> Submitted {
+        self.submit_with(request, "{}")
+    }
+
+    /// `submit`, saving `payload` (the caller's own part of the request, as
+    /// JSON) with it in the checkpoint, if there is one.
+    pub fn submit_with(&self, request: CrawlRequest, payload: &str) -> Submitted {
+        self.admit(request, Persist::New(payload))
+    }
+
+    /// Queues a request read back from the checkpoint (`saved().pending`).
+    /// It was accepted before, so it isn't checked again.
+    pub fn resubmit(&self, request: CrawlRequest, row: i64) -> Submitted {
+        self.admit(request, Persist::Restored(row))
+    }
+
+    /// What the checkpoint held when the crawl started; once.
+    pub fn saved(&self) -> Option<Saved> {
+        self.shared
+            .saved
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+    }
+
+    /// The caller has finished with these requests' events: they are done
+    /// for good, and a resumed crawl won't fetch them again.
+    pub fn done(&self, ids: &[u64]) {
+        let Some(cp) = &self.shared.checkpoint else {
+            return;
+        };
+        let mut state = self.shared.lock();
+        for id in ids {
+            if let Some(row) = state.rows.remove(id) {
+                cp.done(row);
+            }
+        }
+    }
+
+    /// Records an item as delivered, by its stable id.
+    pub fn item_done(&self, id: String) {
+        if let Some(cp) = &self.shared.checkpoint {
+            cp.item(id);
+        }
+    }
+
+    /// Records items as delivered and saves the caller's counters (JSON)
+    /// in one commit.
+    pub fn settle(&self, items: Vec<String>, counters: String) {
+        if let Some(cp) = &self.shared.checkpoint {
+            cp.settle(items, counters);
+        }
+    }
+
+    /// Saves the caller's counters (JSON) alongside the crawl.
+    pub fn save_counters(&self, json: String) {
+        if let Some(cp) = &self.shared.checkpoint {
+            cp.counters(json);
+        }
+    }
+
+    /// Waits until every checkpoint write so far is on disk.
+    pub fn flush(&self) {
+        if let Some(cp) = &self.shared.checkpoint {
+            cp.flush();
+        }
+    }
+
+    fn admit(&self, request: CrawlRequest, persist: Persist<'_>) -> Submitted {
         let Some(fp) = fingerprint("GET", &request.url) else {
             return Submitted::Invalid;
         };
@@ -310,7 +401,8 @@ impl Crawler {
             state.stats.skipped_traps += 1;
             return Submitted::Trap;
         }
-        if !state.seen.insert(fp) && !request.dont_filter {
+        let restored = matches!(persist, Persist::Restored(_));
+        if !state.seen.insert(fp) && !request.dont_filter && !restored {
             state.stats.duplicates += 1;
             return Submitted::Duplicate;
         }
@@ -326,8 +418,32 @@ impl Crawler {
             return Submitted::DomainFull;
         }
         let url = request.url.clone();
+        let saving = self.shared.checkpoint.as_ref().map(|cp| {
+            let row = match persist {
+                Persist::Restored(row) => row,
+                Persist::New(payload) => {
+                    let row = state.next_row;
+                    state.next_row += 1;
+                    cp.seen(fp);
+                    cp.request(Pending {
+                        row,
+                        url: request.url.clone(),
+                        priority: request.priority,
+                        headers: request.headers.clone(),
+                        dont_filter: request.dont_filter,
+                        depth: request.depth,
+                        payload: payload.to_string(),
+                    });
+                    row
+                }
+            };
+            (request.id, row)
+        });
         if !enqueue(settings, &mut state, request, &url, 0) {
             return Submitted::Invalid;
+        }
+        if let Some((id, row)) = saving {
+            state.rows.insert(id, row);
         }
         if let Some(h) = parsed.host_str().and_then(|h| state.hosts.get_mut(h)) {
             h.accepted += 1;
@@ -413,6 +529,12 @@ impl Shared {
         state.events.push_back(event);
         self.events.notify_waiters();
     }
+}
+
+/// Whether a submitted request is new to the checkpoint or read back from it.
+enum Persist<'a> {
+    New(&'a str),
+    Restored(i64),
 }
 
 /// What the scheduler decided to do with a host's next request.
@@ -796,6 +918,9 @@ async fn fetch(shared: Arc<Shared>, mut q: Queued, session: Fetcher) {
         (Ok(Hop::Redirect(next)), _) => {
             if let Some(fp) = fingerprint("GET", &next) {
                 state.seen.insert(fp);
+                if let Some(cp) = &shared.checkpoint {
+                    cp.seen(fp);
+                }
             }
             let id = q.request.id;
             q.attempts = 0;

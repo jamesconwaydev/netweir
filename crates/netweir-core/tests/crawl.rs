@@ -628,3 +628,63 @@ async fn traps_are_refused_at_the_door() {
     );
     drain(&c).await;
 }
+
+#[tokio::test]
+async fn a_checkpoint_remembers_what_was_left() {
+    let site = Site::start(vec![
+        ("/a", Page::html("a")),
+        ("/b", Page::html("b")),
+        ("/c", Page::html("c")),
+    ])
+    .await;
+    let dir = std::env::temp_dir().join(format!("netweir-crawl-cp-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let with_checkpoint = || CrawlSettings {
+        obey_robots: false,
+        obey_tdmrep: false,
+        checkpoint: Some(dir.join("crawl.sqlite3")),
+        ..settings()
+    };
+    {
+        let c = crawler(with_checkpoint());
+        assert!(c.saved().unwrap().pending.is_empty());
+        for (i, p) in ["/a", "/b", "/c"].iter().enumerate() {
+            let payload = format!(r#"{{"n":{i}}}"#);
+            assert_eq!(
+                c.submit_with(request(i as u64, site.url(p)), &payload),
+                Submitted::Queued
+            );
+        }
+        assert_eq!(fetched(&drain(&c).await), [0, 1, 2]);
+        // Only /a's page was dealt with before the "crash".
+        c.done(&[0]);
+        c.flush();
+    }
+    let c = crawler(with_checkpoint());
+    let saved = c.saved().unwrap();
+    let left: Vec<(&str, &str)> = saved
+        .pending
+        .iter()
+        .map(|p| (p.url.rsplit('/').next().unwrap(), p.payload.as_str()))
+        .collect();
+    assert_eq!(left, [("b", r#"{"n":1}"#), ("c", r#"{"n":2}"#)]);
+    assert_eq!(
+        c.submit(request(9, site.url("/a"))),
+        Submitted::Duplicate,
+        "what was seen stays seen"
+    );
+    for (i, p) in saved.pending.iter().enumerate() {
+        assert_eq!(
+            c.resubmit(request(10 + i as u64, p.url.clone()), p.row),
+            Submitted::Queued
+        );
+    }
+    assert_eq!(fetched(&drain(&c).await), [10, 11]);
+    c.done(&[10, 11]);
+    c.flush();
+    drop(c);
+    let c = crawler(with_checkpoint());
+    assert!(c.saved().unwrap().pending.is_empty());
+    drop(c);
+    std::fs::remove_dir_all(&dir).unwrap();
+}

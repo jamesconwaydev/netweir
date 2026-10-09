@@ -83,7 +83,20 @@ fn to_json(obj: &Bound<'_, PyAny>, depth: usize) -> PyResult<Value> {
 }
 
 fn open(path: &str) -> PyResult<BufWriter<File>> {
-    File::create(path)
+    open_for(path, false)
+}
+
+/// The file, emptied, or with `append` kept and added to.
+fn open_for(path: &str, append: bool) -> PyResult<BufWriter<File>> {
+    let mut options = std::fs::OpenOptions::new();
+    options.create(true);
+    if append {
+        options.append(true);
+    } else {
+        options.write(true).truncate(true);
+    }
+    options
+        .open(path)
         .map(BufWriter::new)
         .map_err(|e| PyValueError::new_err(format!("can't write {path}: {e}")))
 }
@@ -100,10 +113,12 @@ pub struct JsonlWriter {
 
 #[pymethods]
 impl JsonlWriter {
+    /// With `append`, items go after what the file already holds.
     #[new]
-    fn new(path: &str) -> PyResult<JsonlWriter> {
+    #[pyo3(signature = (path, append=false))]
+    fn new(path: &str, append: bool) -> PyResult<JsonlWriter> {
         Ok(JsonlWriter {
-            out: Mutex::new(Some(open(path)?)),
+            out: Mutex::new(Some(open_for(path, append)?)),
         })
     }
 
@@ -115,6 +130,15 @@ impl JsonlWriter {
             .ok_or_else(|| PyValueError::new_err("the writer is closed"))?;
         serde_json::to_writer(&mut *out, &value).map_err(|e| io_error(e.into()))?;
         out.write_all(b"\n").map_err(io_error)
+    }
+
+    /// Pushes what's buffered to the file and asks the OS to keep it.
+    fn flush(&self) -> PyResult<()> {
+        if let Some(out) = self.out.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+            out.flush().map_err(io_error)?;
+            out.get_ref().sync_data().map_err(io_error)?;
+        }
+        Ok(())
     }
 
     fn close(&self) -> PyResult<()> {
@@ -150,15 +174,18 @@ fn cell(value: &Value) -> String {
 
 #[pymethods]
 impl CsvWriter {
+    /// With `append`, rows go after what the file already holds, and a
+    /// file that isn't empty is taken to have its header.
     #[new]
-    #[pyo3(signature = (path, fields=None))]
-    fn new(path: &str, fields: Option<Vec<String>>) -> PyResult<CsvWriter> {
-        let out = csv::Writer::from_writer(open(path)?);
+    #[pyo3(signature = (path, fields=None, append=false))]
+    fn new(path: &str, fields: Option<Vec<String>>, append: bool) -> PyResult<CsvWriter> {
+        let has_header = append && std::fs::metadata(path).is_ok_and(|m| m.len() > 0);
+        let out = csv::Writer::from_writer(open_for(path, append)?);
         Ok(CsvWriter {
             state: Mutex::new(CsvState {
                 out: Some(out),
                 fields,
-                header_written: false,
+                header_written: has_header,
             }),
         })
     }
@@ -196,6 +223,16 @@ impl CsvWriter {
             .filter(|k| !fields.contains(k))
             .cloned()
             .collect())
+    }
+
+    /// Pushes what's buffered to the file and asks the OS to keep it.
+    fn flush(&self) -> PyResult<()> {
+        let mut guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(out) = guard.out.as_mut() {
+            out.flush().map_err(io_error)?;
+            out.get_ref().get_ref().sync_data().map_err(io_error)?;
+        }
+        Ok(())
     }
 
     fn close(&self) -> PyResult<()> {

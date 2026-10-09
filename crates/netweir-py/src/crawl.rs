@@ -106,6 +106,7 @@ enum Out {
     },
     Item {
         rule: usize,
+        url: String,
         values: Vec<Value>,
     },
     Ruled {
@@ -152,6 +153,8 @@ enum Out {
 
 struct Engine {
     core: CoreCrawler,
+    /// Requests whose events Python has but hasn't finished with.
+    unacked: Mutex<Vec<u64>>,
     /// One permit per core: how many rule pages are parsed at once.
     parsers: Arc<tokio::sync::Semaphore>,
     rules: Mutex<Arc<Vec<Arc<Rule>>>>,
@@ -190,7 +193,8 @@ impl Engine {
                 dont_filter: false,
                 depth,
             };
-            if self.core.submit(request) != Submitted::Queued {
+            let payload = format!(r#"{{"rule":{at}}}"#);
+            if self.core.submit_with(request, &payload) != Submitted::Queued {
                 self.tags().remove(&id);
             }
         }
@@ -289,6 +293,16 @@ impl Engine {
                 return Vec::new();
             }
             let rules = self.rules.lock().unwrap_or_else(|e| e.into_inner()).clone();
+            let ids: Vec<u64> = events
+                .iter()
+                .filter_map(|e| match e {
+                    Event::Fetched { id, .. }
+                    | Event::Failed { id, .. }
+                    | Event::Dropped { id, .. }
+                    | Event::Blocked { id, .. } => Some(*id),
+                    Event::Paused { .. } => None,
+                })
+                .collect();
             let mut out = Vec::new();
             let mut work = Vec::new();
             for event in events {
@@ -390,7 +404,11 @@ impl Engine {
                     });
                 }
                 if let (Some(values), Some(rule)) = (done.item, done.tag.rule) {
-                    out.push(Out::Item { rule, values });
+                    out.push(Out::Item {
+                        rule,
+                        url: done.tag.url.clone(),
+                        values,
+                    });
                 }
                 match (done.tag.rule, done.response) {
                     (Some(rule), Some(response)) => out.push(Out::Ruled {
@@ -409,7 +427,15 @@ impl Engine {
                     (Some(_), None) => {}
                 }
             }
-            if !out.is_empty() {
+            if out.is_empty() {
+                // Only rule pages, whose links are saved by now: done.
+                self.core.done(&ids);
+            } else {
+                // Done once Python says it has dealt with the batch.
+                self.unacked
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .extend(ids);
                 return out;
             }
         }
@@ -460,7 +486,7 @@ fn out_py<'py>(py: Python<'py>, engine: &Engine, event: Out) -> PyResult<Bound<'
         ),
         Out::Dropped { id, why } => tuple(py, vec![s("dropped")?, n(id)?, s(why)?]),
         Out::Handled { id } => tuple(py, vec![s("handled")?, n(id)?]),
-        Out::Item { rule, values } => {
+        Out::Item { rule, url, values } => {
             let rules = engine
                 .rules
                 .lock()
@@ -478,6 +504,7 @@ fn out_py<'py>(py: Python<'py>, engine: &Engine, event: Out) -> PyResult<Bound<'
                     n(rule as u64)?,
                     dict.into_any(),
                     invalid.into_pyobject(py)?.into_any(),
+                    s(&url)?,
                 ],
             )
         }
@@ -560,7 +587,7 @@ impl Crawler {
         throttle=true, start_delay=1.0, min_delay=0.0, max_delay=60.0, target_concurrency=1.0,
         max_depth=None, max_pages_per_domain=None,
         retries=3, backoff_base=1.0, backoff_max=60.0, proxies=None,
-        breaker_window=50, breaker_ratio=0.3, breaker_pause=300.0,
+        breaker_window=50, breaker_ratio=0.3, breaker_pause=300.0, checkpoint=None,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -587,6 +614,7 @@ impl Crawler {
         breaker_window: usize,
         breaker_ratio: f64,
         breaker_pause: f64,
+        checkpoint: Option<std::path::PathBuf>,
     ) -> PyResult<Crawler> {
         if !(0.0..=1.0).contains(&breaker_ratio) {
             return Err(PyValueError::new_err(
@@ -630,6 +658,7 @@ impl Crawler {
             breaker_window,
             breaker_ratio,
             breaker_pause: seconds("breaker_pause", breaker_pause)?,
+            checkpoint,
         };
         let options = fetch_options(profile, proxy, timeout, verify)?;
         // The scheduler runs on the shared runtime.
@@ -639,6 +668,7 @@ impl Crawler {
         Ok(Crawler {
             engine: Arc::new(Engine {
                 core,
+                unacked: Mutex::new(Vec::new()),
                 parsers: Arc::new(tokio::sync::Semaphore::new(
                     std::thread::available_parallelism().map_or(4, |n| n.get()),
                 )),
@@ -683,7 +713,7 @@ impl Crawler {
     /// With `apply_rules`, the rules take links from the page; then the page
     /// reaches Python only if `to_python`, and a "handled" event says so
     /// otherwise.
-    #[pyo3(signature = (id, url, priority=0, headers=None, dont_filter=false, apply_rules=false, to_python=true, depth=0))]
+    #[pyo3(signature = (id, url, priority=0, headers=None, dont_filter=false, apply_rules=false, to_python=true, depth=0, payload="{}", row=None))]
     #[allow(clippy::too_many_arguments)]
     fn submit(
         &self,
@@ -695,6 +725,8 @@ impl Crawler {
         apply_rules: bool,
         to_python: bool,
         depth: u32,
+        payload: &str,
+        row: Option<i64>,
     ) -> PyResult<&'static str> {
         if id >= RULE_IDS {
             return Err(PyValueError::new_err("request ids must be below 2**62"));
@@ -719,7 +751,10 @@ impl Crawler {
             dont_filter,
             depth,
         };
-        let outcome = self.engine.core.submit(request);
+        let outcome = match row {
+            Some(row) => self.engine.core.resubmit(request, row),
+            None => self.engine.core.submit_with(request, payload),
+        };
         if outcome != Submitted::Queued {
             self.engine.tags().remove(&id);
         }
@@ -740,7 +775,7 @@ impl Crawler {
     /// - ("dropped", id, "robots" | "tdm")
     /// - ("handled", id): dealt with by the rules in Rust
     /// - ("blocked", id, rule or None, url, vendor, kind, Response)
-    /// - ("item", rule, dict, [(field, text)] that would not convert)
+    /// - ("item", rule, dict, [(field, text, kind)] problems, url)
     /// - ("ruled", rule, url, Response, root Node, depth)
     /// - ("rule_failed", rule, url, FetchError)
     /// - ("rule_dropped", rule, url, reason)
@@ -761,6 +796,105 @@ impl Crawler {
                 Ok(list.into_any().unbind())
             })
         })
+    }
+
+    /// What the checkpoint held, after requests the rules made are queued
+    /// again: a dict with "pending" (Python's requests, as (row, url,
+    /// priority, headers, dont_filter, depth, payload)), "items" (ids of
+    /// items already delivered) and "counters" (JSON, or None). None
+    /// without a checkpoint. Call it once, after adding the rules.
+    fn resume<'py>(&self, py: Python<'py>) -> PyResult<Option<Bound<'py, PyDict>>> {
+        let Some(saved) = self.engine.core.saved() else {
+            return Ok(None);
+        };
+        let rules = self
+            .engine
+            .rules
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let mut python = Vec::new();
+        for p in saved.pending {
+            let rule = serde_json::from_str::<serde_json::Value>(&p.payload)
+                .ok()
+                .and_then(|v| v.get("rule").and_then(serde_json::Value::as_u64))
+                .map(|r| r as usize);
+            let Some(at) = rule.filter(|r| *r < rules.len()) else {
+                python.push((
+                    p.row,
+                    p.url,
+                    p.priority,
+                    p.headers,
+                    p.dont_filter,
+                    p.depth,
+                    p.payload,
+                ));
+                continue;
+            };
+            let rule = &rules[at];
+            let id = self.engine.next_id.fetch_add(1, Ordering::Relaxed);
+            self.engine.tags().insert(
+                id,
+                Tag {
+                    rule: Some(at),
+                    apply_rules: rule.follow,
+                    to_python: rule.to_python,
+                    url: p.url.clone(),
+                    depth: p.depth,
+                },
+            );
+            let request = CrawlRequest {
+                id,
+                url: p.url,
+                priority: p.priority,
+                headers: p.headers,
+                dont_filter: p.dont_filter,
+                depth: p.depth,
+            };
+            if self.engine.core.resubmit(request, p.row) != Submitted::Queued {
+                self.engine.tags().remove(&id);
+            }
+        }
+        let out = PyDict::new(py);
+        out.set_item("pending", python)?;
+        out.set_item("items", saved.items.into_iter().collect::<Vec<_>>())?;
+        out.set_item("counters", saved.counters)?;
+        Ok(Some(out))
+    }
+
+    /// Python has dealt with every event of the batches it has: their
+    /// requests are done, and a resumed crawl won't repeat them.
+    fn ack(&self) {
+        let ids = std::mem::take(
+            &mut *self
+                .engine
+                .unacked
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()),
+        );
+        self.engine.core.done(&ids);
+    }
+
+    /// Records an item as delivered, by its stable id.
+    fn item_done(&self, id: String) {
+        self.engine.core.item_done(id);
+    }
+
+    /// Records items as delivered and saves Python's state (JSON) in one
+    /// commit.
+    fn settle(&self, items: Vec<String>, state: String) {
+        self.engine.core.settle(items, state);
+    }
+
+    /// Saves Python's counters (JSON) in the checkpoint.
+    fn save_counters(&self, json: String) {
+        self.engine.core.save_counters(json);
+    }
+
+    /// Waits until every checkpoint write so far is on disk.
+    fn flush(&self, py: Python<'_>) {
+        let engine = self.engine.clone();
+        py.detach(move || engine.core.flush());
     }
 
     /// Counters so far.

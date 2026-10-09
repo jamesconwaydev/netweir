@@ -5,6 +5,7 @@
 //! and header order.
 
 pub mod canonical;
+pub mod checkpoint;
 pub mod classify;
 mod crawl;
 mod decode;

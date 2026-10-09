@@ -9,15 +9,18 @@ from __future__ import annotations
 
 import asyncio
 import dataclasses
+import hashlib
 import inspect
 import itertools
+import json
 import logging
+import os
 import time
 from collections.abc import AsyncIterator, Callable, Iterable
 from typing import Any
 
 from netweir._fetch import Page, _pairs
-from netweir._native import Crawler
+from netweir._native import Crawler, fingerprint
 from netweir._request import Request
 from netweir._rules import Follow, _warn_invalid
 
@@ -64,6 +67,11 @@ class Settings:
     breaker_window: int = 50
     breaker_ratio: float = 0.3
     breaker_pause: float = 300.0
+    #: A directory to keep the crawl's state in. Rerunning the same crawl
+    #: with the same directory resumes it: what was finished isn't fetched
+    #: again, and items carry an ``_id`` so none is written twice. Delete
+    #: the directory to start over.
+    checkpoint: str | None = None
     #: Stop the crawl at the first exception in a callback or pipeline.
     fail_fast: bool = False
 
@@ -113,7 +121,13 @@ class Settings:
             breaker_window=self.breaker_window,
             breaker_ratio=self.breaker_ratio,
             breaker_pause=self.breaker_pause,
+            checkpoint=self._checkpoint_file(),
         )
+
+    def _checkpoint_file(self) -> str | None:
+        if self.checkpoint is None:
+            return None
+        return os.path.join(self.checkpoint, "crawl.sqlite3")
 
 
 class Spider:
@@ -163,13 +177,36 @@ class Spider:
         pipelines = list(self.pipelines)
         if output is not None:
             pipelines.append(export.to_path(output) if isinstance(output, str) else output)
+        run = None
         try:
-            return await _Run(self, pipelines).go()
+            run = _Run(self, pipelines)
+            # None, or how long each output file was when its items were last
+            # recorded: a resumed run cuts it back to that, dropping anything
+            # half-written or not recorded (which the run makes again), and
+            # adds to it.
+            files = run.resume()
+            for stage in pipelines:
+                if not isinstance(stage, export._Exporter):
+                    continue
+                if isinstance(stage, export.parquet):
+                    # Written whole at the end; a resumed run adds a part.
+                    stage.start(append=files is not None)
+                    continue
+                size = (files or {}).get(os.path.abspath(stage.path))
+                if size is not None and os.path.exists(stage.path):
+                    with open(stage.path, "r+b") as f:
+                        f.truncate(size)
+                stage.start(append=size is not None)
+            stats = await run.go()
+            run.completed = True
+            return stats
         finally:
             for stage in pipelines:
                 close = getattr(stage, "close", None)
                 if callable(close):
                     close()
+            if run is not None:
+                run.finish()
 
 
 class _Run:
@@ -192,6 +229,15 @@ class _Run:
             )
         # parse runs alongside the rules only if the spider writes its own.
         self.has_parse = type(spider).parse is not Spider.parse
+        #: Items already delivered by an earlier run of this crawl, by _id.
+        self.delivered: set[str] = set()
+        self.saving = self.settings.checkpoint is not None
+        #: Ids of items delivered but not yet recorded as such.
+        self.unrecorded: list[str] = []
+        self.completed = False
+        #: Where items being handled come from, for their _id.
+        self.source = ""
+        self.position = 0
         self.warned: set[str] = set()
         #: Depth of requests the running callback yields.
         self.depth = 0
@@ -201,9 +247,65 @@ class _Run:
             "callback_errors": 0,
             "invalid_urls": 0,
             "pages_ignored": 0,
+            "items_already_written": 0,
         }
 
-    def submit(self, request: Request) -> None:
+    def resume(self) -> dict[str, int] | None:
+        """Queues what an earlier run of this crawl left unfinished, and
+        returns the output files' lengths as last recorded (None without a
+        checkpoint)."""
+        saved = self.engine.resume()
+        if saved is None:
+            return None
+        self.delivered = set(saved["items"])
+        for row, url, priority, headers, dont_filter, depth, payload in saved["pending"]:
+            data = json.loads(payload)
+            request = Request(
+                url,
+                callback=data.get("callback"),
+                priority=priority,
+                headers=headers,
+                meta=data.get("meta", {}),
+                dont_filter=dont_filter,
+                errback=data.get("errback"),
+                depth=depth,
+            )
+            self.submit(request, row=row)
+        if saved["pending"] or self.delivered:
+            log.info(
+                "resuming: %d requests left, %d items already written",
+                len(saved["pending"]),
+                len(self.delivered),
+            )
+        state = json.loads(saved["counters"]) if saved["counters"] else {}
+        return state.get("files", {})
+
+    def payload(self, request: Request) -> str:
+        """The request's own part, saved in the checkpoint as JSON:
+        callbacks by name, and meta."""
+        if not self.saving:
+            return "{}"
+        try:
+            meta = json.dumps(request.meta)
+        except TypeError as e:
+            raise TypeError(f"with a checkpoint, meta must be JSON: {e}") from None
+        callback = json.dumps(self.method_name(request.callback))
+        errback = json.dumps(self.method_name(request.errback))
+        return f'{{"callback": {callback}, "errback": {errback}, "meta": {meta}}}'
+
+    def method_name(self, fn: Callable[..., Any] | str | None) -> str | None:
+        if fn is None or isinstance(fn, str):
+            return fn
+        name = getattr(fn, "__name__", None)
+        if name is not None and getattr(self.spider, name, None) == fn:
+            return name
+        raise TypeError(
+            f"with a checkpoint, callbacks are saved by name, so {fn!r} must be a"
+            " method of the spider"
+        )
+
+    def submit(self, request: Request, row: int | None = None) -> None:
+        payload = self.payload(request) if row is None else "{}"
         rid = next(self.ids)
         # A request with no callback on a rules spider is the rules' to read.
         apply_rules = bool(self.rules) and request.callback is None
@@ -217,6 +319,8 @@ class _Run:
             apply_rules=apply_rules,
             to_python=to_python,
             depth=request.depth,
+            payload=payload,
+            row=row,
         )
         if outcome == "queued":
             self.waiting[rid] = request
@@ -250,6 +354,7 @@ class _Run:
                 break
             for event in events:
                 await self.dispatch(event)
+            self.settle()
         stats = {**self.engine.stats(), **self.counts}
         stats.pop("queued", None)
         stats.pop("in_flight", None)
@@ -260,12 +365,47 @@ class _Run:
         )
         return stats
 
+    def settle(self) -> None:
+        """Every event in the batch has been dealt with. Once the files its
+        items went to are on disk, record the items as delivered and the
+        requests as done, in that order, so a crash never loses an item:
+        at worst, a resume writes one again."""
+        if self.saving:
+            exporters = [s for s in self.pipelines if hasattr(s, "flush")]
+            if not all(stage.flush() for stage in exporters):
+                # Not on disk until closed (Parquet): nothing is final yet.
+                return
+            self.record()
+        self.engine.ack()
+
+    def record(self) -> None:
+        """Records the delivered items, and how long each output file is
+        with them in it, in one commit."""
+        files = {
+            os.path.abspath(stage.path): os.path.getsize(stage.path)
+            for stage in self.pipelines
+            if hasattr(stage, "flush") and os.path.exists(getattr(stage, "path", ""))
+        }
+        self.engine.settle(self.unrecorded, json.dumps({"files": files}))
+        self.unrecorded = []
+
+    def finish(self) -> None:
+        """After the exporters are closed: the items they hold are final.
+        The requests are done only if the crawl got to the end; one cut
+        short leaves its last batch to be fetched again."""
+        if self.saving:
+            self.record()
+        if self.completed:
+            self.engine.ack()
+        self.engine.flush()
+
     async def dispatch(self, event: tuple) -> None:
         kind = event[0]
         if kind == "item":
-            _, rule, item, invalid = event
+            _, rule, item, invalid, url = event
             item_class = self.rules[rule].extract
             _warn_invalid(invalid, self.warned)
+            self.source, self.position = url, 0
             await self.handle(item_class._finish(item, self.warned))
         elif kind == "ruled":
             _, rule, url, response, root, depth = event
@@ -329,6 +469,8 @@ class _Run:
         # What it yields is one link further from the start.
         source = args[0]
         self.depth = (source.depth if isinstance(source, (Page, Request)) else 0) + 1
+        self.source = source.url if isinstance(source, (Page, Request)) else url
+        self.position = 0
         try:
             fn = self.resolve(fn, default)
             result = fn(*args)
@@ -360,6 +502,18 @@ class _Run:
                 f"a callback produced a {type(out).__name__}: yield dicts, dataclasses or Requests"
             )
         item = out
+        item_id = None
+        if self.saving:
+            # Stable across runs: the page it came from and its place among
+            # that page's items.
+            key = f"{fingerprint(self.source) or self.source}:{self.position}"
+            self.position += 1
+            item_id = hashlib.sha256(key.encode()).hexdigest()[:24]
+            if item_id in self.delivered:
+                self.counts["items_already_written"] += 1
+                return
+            if isinstance(item, dict):
+                item.setdefault("_id", item_id)
         for stage in self.pipelines:
             item = stage(item)
             if inspect.isawaitable(item):
@@ -368,6 +522,9 @@ class _Run:
                 self.counts["items_dropped"] += 1
                 return
         self.counts["items"] += 1
+        if item_id is not None:
+            self.delivered.add(item_id)
+            self.unrecorded.append(item_id)
 
 
 #: Iterable, but one result rather than many.

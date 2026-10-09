@@ -64,9 +64,18 @@ fn parse(py: Python<'_>, html: &str, timeout: Option<f64>) -> PyResult<Node> {
     Ok(Node::root_of(Arc::new(doc)))
 }
 
+/// The crawl's identity for a GET of `url`, as hex: equal for the same
+/// page however its URL is written. None for anything but http(s).
+#[pyfunction]
+fn fingerprint(url: &str) -> Option<String> {
+    netweir_core::canonical::fingerprint("GET", url)
+        .map(|fp| fp.iter().map(|b| format!("{b:02x}")).collect())
+}
+
 #[pymodule]
 fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(parse, m)?)?;
+    m.add_function(wrap_pyfunction!(fingerprint, m)?)?;
     m.add_class::<Node>()?;
     m.add_class::<Selection>()?;
     m.add("SelectorError", m.py().get_type::<SelectorError>())?;
