@@ -187,36 +187,43 @@ class Spider:
         pipelines = list(self.pipelines)
         if output is not None:
             pipelines.append(export.to_path(output) if isinstance(output, str) else output)
-        run = None
+        # Nothing is opened or written until this has worked: a crawl that
+        # can't start leaves its output files as they were.
+        run = _Run(self, pipelines)
+        started: list[export._Exporter] = []
         try:
-            run = _Run(self, pipelines)
-            # None, or how long each output file was when its items were last
-            # recorded: a resumed run cuts it back to that, dropping anything
-            # half-written or not recorded (which the run makes again), and
-            # adds to it.
-            files = run.resume()
+            # None, or the state of the output files when items were last
+            # recorded: a resumed run cuts each file back to its recorded
+            # length, dropping anything half-written or not recorded (which
+            # the run makes again), and adds to it.
+            state = run.resume()
+            files = (state or {}).get("files", {})
             for stage in pipelines:
                 if not isinstance(stage, export._Exporter):
                     continue
                 if isinstance(stage, export.parquet):
                     # Written whole at the end; a resumed run adds a part.
-                    stage.start(append=files is not None)
-                    continue
-                size = (files or {}).get(os.path.abspath(stage.path))
-                if size is not None and os.path.exists(stage.path):
-                    with open(stage.path, "r+b") as f:
-                        f.truncate(size)
-                stage.start(append=size is not None)
+                    run.tidy_parts(stage)
+                    stage.hold = run.saving
+                    stage.start(append=state is not None)
+                else:
+                    size = files.get(os.path.abspath(stage.path))
+                    if size is not None and os.path.exists(stage.path):
+                        with open(stage.path, "r+b") as f:
+                            f.truncate(size)
+                    stage.start(append=size is not None)
+                started.append(stage)
             stats = await run.go()
             run.completed = True
             return stats
         finally:
             for stage in pipelines:
+                if isinstance(stage, export._Exporter) and not any(stage is s for s in started):
+                    continue
                 close = getattr(stage, "close", None)
                 if callable(close):
                     close()
-            if run is not None:
-                run.finish()
+            run.finish()
 
 
 class _Run:
@@ -244,6 +251,8 @@ class _Run:
         self.saving = self.settings.checkpoint is not None
         #: Ids of items delivered but not yet recorded as such.
         self.unrecorded: list[str] = []
+        #: Parquet parts whose items are on record, by absolute path.
+        self.parts: list[str] = []
         self.completed = False
         #: Where items being handled come from, for their _id.
         self.source = ""
@@ -278,7 +287,8 @@ class _Run:
         returns the output files' lengths as last recorded (None without a
         checkpoint)."""
         saved = self.engine.resume()
-        if saved is None:
+        if saved is None or not (saved["pending"] or saved["items"] or saved["counters"]):
+            # No checkpoint, or one this crawl has just created.
             return None
         self.delivered = set(saved["items"])
         for row, url, priority, headers, dont_filter, depth, payload in saved["pending"]:
@@ -301,7 +311,8 @@ class _Run:
                 len(self.delivered),
             )
         state = json.loads(saved["counters"]) if saved["counters"] else {}
-        return state.get("files", {})
+        self.parts = list(state.get("parts", []))
+        return state
 
     def payload(self, request: Request) -> str:
         """The request's own part, saved in the checkpoint as JSON:
@@ -364,20 +375,25 @@ class _Run:
         # page.css(track=...) in callbacks uses this crawl's store.
         token = _track._crawl.set(self.tracks)
         asking = _track._repairs.set(self.ask_repair if self.spider.repair else None)
+        reported = _track._crawl_reported.set(set())
         try:
             return await self.crawl()
         finally:
+            _track._crawl_reported.reset(reported)
             _track._repairs.reset(asking)
             _track._crawl.reset(token)
 
-    def ask_repair(self, site: str, name: str, kind: str, query: str, html: str, url: str):
+    def ask_repair(self, site: str, name: str, kind: str, query: str, html: Any, url: str):
+        """Queues a repair for after the crawl. ``html`` is the page, or a
+        function that gives it, called only for a repair not yet queued."""
         if self.spider.repair is None or (site, name) in self.repair_asked:
             return
         from netweir.repair import Job
 
         self.repair_asked.add((site, name))
         fingerprint = self.tracks[0].get(site, name)
-        self.repair_jobs.append(Job(site, name, kind, query, fingerprint, html, url))
+        page = html() if callable(html) else html
+        self.repair_jobs.append(Job(site, name, kind, query, fingerprint, page, url))
 
     async def run_repairs(self) -> None:
         """Asks for the repairs the crawl ran into, off the event loop."""
@@ -426,7 +442,9 @@ class _Run:
         requests as done, in that order, so a crash never loses an item:
         at worst, a resume writes one again."""
         if self.saving:
-            exporters = [s for s in self.pipelines if hasattr(s, "flush")]
+            from netweir import export
+
+            exporters = [s for s in self.pipelines if isinstance(s, export._Exporter)]
             if not all(stage.flush() for stage in exporters):
                 # Not on disk until closed (Parquet): nothing is final yet.
                 return
@@ -436,23 +454,55 @@ class _Run:
     def record(self) -> None:
         """Records the delivered items, and how long each output file is
         with them in it, in one commit."""
+        from netweir import export
+
         files = {
             os.path.abspath(stage.path): os.path.getsize(stage.path)
             for stage in self.pipelines
-            if hasattr(stage, "flush") and os.path.exists(getattr(stage, "path", ""))
+            if isinstance(stage, export._Exporter)
+            and not isinstance(stage, export.parquet)
+            and os.path.exists(stage.path)
         }
-        self.engine.settle(self.unrecorded, json.dumps({"files": files}))
+        parts = [
+            os.path.abspath(stage.pending)
+            for stage in self.pipelines
+            if isinstance(stage, export.parquet) and stage.pending is not None
+        ]
+        self.parts.extend(p for p in parts if p not in self.parts)
+        self.engine.settle(self.unrecorded, json.dumps({"files": files, "parts": self.parts}))
         self.unrecorded = []
+
+    def tidy_parts(self, stage: Any) -> None:
+        """Before a Parquet exporter starts: a part whose items were recorded
+        but which the process died before naming gets its name; any other
+        .partial file of this output, never recorded, is deleted (the run
+        makes its items again)."""
+        import glob
+
+        stem = stage.path[: -len(".parquet")] if stage.path.endswith(".parquet") else stage.path
+        for partial in glob.glob(glob.escape(stem) + "*.parquet.partial"):
+            final = partial[: -len(".partial")]
+            if os.path.abspath(final) in self.parts and not os.path.exists(final):
+                os.replace(partial, final)
+            else:
+                os.remove(partial)
 
     def finish(self) -> None:
         """After the exporters are closed: the items they hold are final.
         The requests are done only if the crawl got to the end; one cut
         short leaves its last batch to be fetched again."""
+        from netweir import export
+
         if self.saving:
             self.record()
         if self.completed:
             self.engine.ack()
         self.engine.flush()
+        # Only now, with their items on record, do Parquet parts get their
+        # real names.
+        for stage in self.pipelines:
+            if isinstance(stage, export.parquet):
+                stage.publish()
 
     async def dispatch(self, event: tuple) -> None:
         kind = event[0]
@@ -466,7 +516,9 @@ class _Run:
                 _track.report(field, site, what, score)
                 spec = item_class._fields[field.rsplit(".", 1)[1]]
                 self.ask_repair(site, spec.track, spec.kind, spec.query, html or "", url)
-            self.source, self.position = url, 0
+            # Its own namespace: the page's callback numbers its items from 0
+            # too.
+            self.source, self.position = f"rule{rule}:{url}", 0
             await self.handle(item_class._finish(item, self.warned))
         elif kind == "ruled":
             _, rule, url, response, root, depth = event
@@ -500,7 +552,7 @@ class _Run:
         elif kind == "paused":
             _, host, seconds = event
             log.warning(
-                "%s keeps blocking: pausing it for %.0f s (the circuit breaker)", host, seconds
+                "%s keeps blocking: pausing it for %g s (the circuit breaker)", host, seconds
             )
         else:
             _, rid, detail, *rest = event

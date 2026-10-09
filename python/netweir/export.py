@@ -89,7 +89,8 @@ class csv(_Exporter):  # noqa: N801
         return CsvWriter(self.path, self.fields, self._append)
 
     def __call__(self, item: Any) -> Any:
-        extra = set(self._write(item)) - self._warned
+        # A checkpoint's _id is only a column if fields= asks for it.
+        extra = set(self._write(item)) - self._warned - {"_id"}
         if extra:
             self._warned |= extra
             log.warning(
@@ -110,19 +111,44 @@ class parquet(_Exporter):  # noqa: N801
     column are left out; closing logs a warning for each.
     """
 
-    def _open(self) -> ParquetWriter:
+    #: Set by a crawl with a checkpoint: a closed file stays under its
+    #: .partial name until the crawl has recorded its items, then it calls
+    #: publish(). Otherwise closing publishes it.
+    hold: bool = False
+    #: The finished file's name once closed and not yet published.
+    pending: str | None = None
+
+    def _target(self) -> str:
+        """Where this run's file goes: the path, or with ``append`` and the
+        path taken, the next free part (books.1.parquet, books.2.parquet ...),
+        which readers such as pyarrow take together as one dataset."""
         path = self.path
         if self._append and os.path.exists(path) and os.path.getsize(path) > 0:
-            # A Parquet file can't be added to: a resumed run writes the
-            # next part beside it (books.1.parquet, books.2.parquet ...),
-            # which readers such as pyarrow take together as one dataset.
             stem = path[: -len(".parquet")] if path.endswith(".parquet") else path
             n = 1
             while os.path.exists(f"{stem}.{n}.parquet"):
                 n += 1
             path = f"{stem}.{n}.parquet"
             log.info("%s exists: this run's items go to %s", self.path, path)
-        return ParquetWriter(path)
+        return path
+
+    def _open(self) -> ParquetWriter:
+        # Written under a temporary name, so a file half-written when the
+        # process died is never mistaken for a finished one.
+        self._final = self._target()
+        return ParquetWriter(self._final + ".partial")
+
+    def close(self) -> None:
+        super().close()
+        self.pending = self._final
+        if not self.hold:
+            self.publish()
+
+    def publish(self) -> None:
+        """Gives the closed file its real name."""
+        if self.pending is not None:
+            os.replace(self.pending + ".partial", self.pending)
+            self.pending = None
 
     def flush(self) -> bool:
         return False

@@ -72,18 +72,26 @@ def tracked(node: Any, kind: str, query: str, name: str, site: str, url: str = "
         report(name, site, "lost", found.score, query)
     ask = _repairs.get()
     if broken and ask is not None:
-        ask(site, name, kind, query, node.html, url)
+        # The page is serialised only if this repair is new.
+        ask(site, name, kind, query, lambda: node.html, url)
     return found
 
 
-#: (site, name, what) already reported: once is enough to know.
+#: (site, name, what) already reported outside a crawl; each crawl keeps
+#: its own set, so every crawl says it once.
 _reported: set[tuple[str, str, str]] = set()
+_crawl_reported: contextvars.ContextVar[set | None] = contextvars.ContextVar(
+    "netweir_reported", default=None
+)
 
 
 def report(name: str, site: str, what: str, score: float | None, query: str = "") -> None:
-    if (site, name, what) in _reported:
+    reported = _crawl_reported.get()
+    if reported is None:
+        reported = _reported
+    if (site, name, what) in reported:
         return
-    _reported.add((site, name, what))
+    reported.add((site, name, what))
     where = f" on {site}" if site else ""
     shown = f" ({query!r} no longer matches)" if query else ""
     if what == "relocated":

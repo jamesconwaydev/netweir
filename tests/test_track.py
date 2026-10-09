@@ -134,3 +134,21 @@ def test_item_extract_tracks_in_callbacks_as_well():
     assert Product.extract(netweir.parse(page("class-renamed.before.html")))["price"] == "£24.99"
     after = Product.extract(netweir.parse(page("class-renamed.after.html")))
     assert after["price"] == "£24.99"
+
+
+def test_each_crawl_reports_tracking_again(base, caplog):
+    settings = netweir.Settings(throttle=False, start_delay=0, obey_robots=False, obey_tdmrep=False)
+
+    class Shop(netweir.Spider):
+        start_urls = [f"{base}/"]
+        rules = [netweir.Follow("a.p", extract=Product)]
+
+    Shop.settings = settings
+    SITE["version"] = "before"
+    Shop().run()
+    SITE["version"] = "after"
+    for _ in range(2):
+        caplog.clear()
+        with caplog.at_level(logging.WARNING, logger="netweir"):
+            Shop().run()
+        assert "Product.price" in caplog.text

@@ -191,3 +191,100 @@ def test_kill_9_at_random_points_loses_nothing_and_repeats_nothing(base, tmp_pat
     expected = sorted(f"{n}-{i}" for n in range(1, PAGES + 1) for i in range(PER_PAGE))
     assert names == expected, f"after {kills} kills"
     assert len({r["_id"] for r in rows}) == len(rows)
+
+
+def test_a_rule_with_extract_and_callback_keeps_both_items(base, tmp_path):
+    class Name(netweir.Item):
+        name = netweir.css("h1::text")
+
+    class Both(netweir.Spider):
+        start_urls = [f"{base}/page/1"]
+        rules = [netweir.Follow("a.item", extract=Name, callback="more")]
+
+        def more(self, page):
+            yield {"more": page.css("h1::text").get()}
+
+    spider = Both()
+    spider.settings = settings(tmp_path)
+    items = []
+    spider.pipelines = [lambda item: items.append(item) or item]
+    stats = spider.run()
+    assert stats["items_already_written"] == 0
+    assert sum("name" in i for i in items) == PER_PAGE
+    assert sum("more" in i for i in items) == PER_PAGE
+    assert len({i["_id"] for i in items}) == len(items)
+
+
+def test_a_crawl_that_cannot_start_leaves_the_output_alone(base, tmp_path):
+    import sqlite3
+
+    out = tmp_path / "items.jsonl"
+    out.write_text('{"kept": 1}\n', encoding="utf-8")
+    state = tmp_path / "state"
+    state.mkdir()
+    db = sqlite3.connect(state / "crawl.sqlite3")
+    db.execute("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+    db.execute("INSERT INTO meta VALUES ('format', '99')")
+    db.commit()
+    db.close()
+
+    class Any(netweir.Spider):
+        start_urls = [f"{base}/page/1"]
+
+    spider = Any()
+    spider.settings = settings(tmp_path)
+    with pytest.raises(ValueError, match="newer netweir"):
+        spider.run(output=str(out))
+    assert out.read_text(encoding="utf-8") == '{"kept": 1}\n'
+
+
+def test_parquet_parts_appear_only_once_recorded(base, tmp_path, monkeypatch):
+    pq = pytest.importorskip("pyarrow.parquet")
+    out = tmp_path / "items.parquet"
+    (tmp_path / "unrelated").mkdir()
+    out.write_bytes(b"")  # a stale file from before the checkpoint existed
+
+    class Items(netweir.Spider):
+        start_urls = [f"{base}/page/1"]
+
+        def parse(self, page):
+            yield {"url": page.url}
+            if nxt := page.css("a.next::attr(href)").get():
+                yield page.follow(nxt)
+
+    # The process dies after the file is closed, before it's recorded.
+    real_record = netweir._crawl._Run.record
+
+    def die(self):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(netweir._crawl._Run, "record", die)
+    spider = Items()
+    spider.settings = settings(tmp_path)
+    with pytest.raises(KeyboardInterrupt):
+        spider.run(output=str(out))
+    monkeypatch.setattr(netweir._crawl._Run, "record", real_record)
+    assert not list(tmp_path.glob("items.*.parquet")), "nothing unrecorded is published"
+
+    spider = Items()
+    spider.settings = settings(tmp_path)
+    spider.run(output=str(out))
+    parts = sorted(tmp_path.glob("items*.parquet"))
+    rows = sum(pq.read_table(p).num_rows for p in parts if p.stat().st_size)
+    assert rows == PAGES, f"{[(p.name, p.stat().st_size) for p in parts]}"
+    assert not list(tmp_path.glob("*.partial"))
+
+
+def test_csv_fields_dont_warn_about_the_checkpoint_id(base, tmp_path, caplog):
+    class Rows(netweir.Spider):
+        start_urls = [f"{base}/item/x"]
+
+        def parse(self, page):
+            yield {"name": page.css("h1::text").get()}
+
+    spider = Rows()
+    spider.settings = settings(tmp_path)
+    spider.pipelines = [netweir.export.csv(str(tmp_path / "rows.csv"), fields=["name"])]
+    with caplog.at_level("WARNING", logger="netweir"):
+        spider.run()
+    assert "_id" not in caplog.text

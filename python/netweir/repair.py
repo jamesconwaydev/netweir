@@ -16,6 +16,12 @@ is ever applied: changing the spider is yours to decide.
 Any model will do: ``complete`` is a function that takes the prompt and
 returns the reply. ``model`` is for the default, Anthropic's API (``pip
 install anthropic``, and ``ANTHROPIC_API_KEY`` set).
+
+What is sent: the page's HTML with scripts, styles and comments removed (up
+to 40,000 characters), its URL, the old selector and what the element used
+to look like. Pages can hold things you'd rather not send (form tokens,
+personal data); pass a ``complete`` that redacts them, or runs a local
+model, if that matters. The report file records the full URL.
 """
 
 from __future__ import annotations
@@ -53,9 +59,13 @@ class Proposal:
 
 
 def anthropic(
-    model: str = "claude-opus-5-5", max_tokens: int = 1024, client: Any = None
+    model: str = "claude-opus-5-5",
+    max_tokens: int = 1024,
+    client: Any = None,
+    timeout: float = 120.0,
 ) -> Callable[[str], str]:
-    """A ``complete`` function that asks Anthropic's API."""
+    """A ``complete`` function that asks Anthropic's API, giving up after
+    ``timeout`` seconds."""
     if client is None:
         try:
             from anthropic import Anthropic
@@ -70,6 +80,7 @@ def anthropic(
             model=model,
             max_tokens=max_tokens,
             messages=[{"role": "user", "content": prompt}],
+            timeout=timeout,
         )
         return "".join(b.text for b in message.content if getattr(b, "type", "") == "text")
 
