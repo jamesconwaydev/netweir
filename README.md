@@ -390,6 +390,9 @@ uv run maturin develop --uv
 uv run pytest
 ```
 
+uv installs the dependencies and maturin builds netweir, so after changing
+any Rust, rerun `uv run maturin develop --uv` before testing.
+
 ## Licence
 
 AGPL-3.0. If that doesn't work for your company, a commercial licence is

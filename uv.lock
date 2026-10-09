@@ -252,7 +252,7 @@ wheels = [
 
 [[package]]
 name = "netweir"
-source = { editable = "." }
+source = { virtual = "." }
 
 [package.dev-dependencies]
 bench = [

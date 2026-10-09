@@ -49,7 +49,10 @@ include = [
 ]
 
 [tool.uv]
-cache-keys = [{ file = "pyproject.toml" }, { file = "Cargo.toml" }, { file = "crates/**/*.rs" }, { file = "crates/**/*.c" }]
+# uv installs the dependencies; `maturin develop` builds and installs
+# netweir itself. If uv built it too, each `uv run` could swap the
+# extension maturin just built for an older one of its own.
+package = false
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
