@@ -97,16 +97,16 @@ def test_output_files_by_extension(base, tmp_path):
     spider.start_urls = [f"{base}/page/1"]
     out = tmp_path / "books.jsonl"
     spider.run(output=str(out))
-    rows = [json.loads(line) for line in out.read_text().splitlines()]
+    rows = [json.loads(line) for line in out.read_text(encoding="utf-8").splitlines()]
     assert len(rows) == 9 and rows[0] == {"title": "Book 1-0", "price": "£1.00"}
-    assert out.read_text().startswith('{"title":'), "keys keep the item's order"
+    assert out.read_text(encoding="utf-8").startswith('{"title":'), "keys keep the item's order"
 
     out = tmp_path / "books.csv"
     spider.run(output=str(out))
-    with out.open() as f:
+    with out.open(encoding="utf-8", newline="") as f:
         rows = list(csv.DictReader(f))
     assert rows[0] == {"title": "Book 1-0", "price": "£1.00"} and len(rows) == 9
-    assert out.read_text().startswith("title,price\n")
+    assert out.read_text(encoding="utf-8").startswith("title,price\n")
 
     with pytest.raises(ValueError, match="xml"):
         spider.run(output=str(tmp_path / "books.xml"))
@@ -329,7 +329,7 @@ def test_command_line(base, tmp_path):
         timeout=60,
     )
     assert done.returncode == 0, done.stderr
-    assert len(out.read_text().splitlines()) == 3
+    assert len(out.read_text(encoding="utf-8").splitlines()) == 3
     assert "fetched" in done.stderr
 
     bad = subprocess.run(
@@ -449,7 +449,9 @@ def test_exporters_on_the_class_survive_a_second_run(base, tmp_path):
     Twice().run()
     stats = Twice().run()
     assert stats["callback_errors"] == 0 and stats["items"] == 3
-    assert len(out.read_text().splitlines()) == 3, "the second run starts the file afresh"
+    assert len(out.read_text(encoding="utf-8").splitlines()) == 3, (
+        "the second run starts the file afresh"
+    )
 
 
 def test_odd_callback_results(base, caplog):
@@ -525,7 +527,7 @@ def test_command_line_spiders_can_use_dataclasses(base, tmp_path):
         timeout=60,
     )
     assert done.returncode == 0, done.stderr
-    assert json.loads(out.read_text()) == {"url": f"{base}/book/x"}
+    assert json.loads(out.read_text(encoding="utf-8")) == {"url": f"{base}/book/x"}
 
 
 @pytest.mark.parametrize(
