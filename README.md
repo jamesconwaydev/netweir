@@ -50,6 +50,10 @@ netweir gives up instead of hanging:
 netweir.parse(html, timeout=2.0)  # raises netweir.ParseTimeout
 ```
 
+The timeout bounds time, not memory. A small page built to abuse the HTML5
+spec's rules for misnested formatting tags can still make any spec-compliant
+parser allocate gigabytes; a cap on that comes with the crawler.
+
 ## Building
 
 You need Rust, a C compiler and [uv](https://docs.astral.sh/uv/).

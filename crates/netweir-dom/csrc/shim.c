@@ -61,9 +61,19 @@ const char *nw_char_data(lxb_dom_node_t *n, size_t *len) {
     return (const char *) cd->data.data;
 }
 
+/* NULL when the attribute is absent; "" when present without a value. */
 const char *nw_get_attr(lxb_dom_node_t *n, const char *name, size_t name_len, size_t *len) {
-    return (const char *) lxb_dom_element_get_attribute(
-        lxb_dom_interface_element(n), (const lxb_char_t *) name, name_len, len);
+    lxb_dom_attr_t *attr = lxb_dom_element_attr_by_name(
+        lxb_dom_interface_element(n), (const lxb_char_t *) name, name_len);
+    if (attr == NULL) {
+        return NULL;
+    }
+    const lxb_char_t *value = lxb_dom_attr_value(attr, len);
+    if (value == NULL) {
+        *len = 0;
+        return "";
+    }
+    return (const char *) value;
 }
 
 lxb_dom_attr_t *nw_first_attr(lxb_dom_node_t *n) {

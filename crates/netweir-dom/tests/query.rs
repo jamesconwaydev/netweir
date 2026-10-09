@@ -35,6 +35,37 @@ fn attributes() {
 }
 
 #[test]
+fn deep_text_of_nested_matches_is_returned_once() {
+    let doc = Document::parse("<div><div><p>hi</p></div><p>x</p></div><div>y</div>");
+    let q = Query::new("div ::text").unwrap();
+    assert_eq!(q.strings(doc.root()), ["hi", "x", "y"]);
+}
+
+#[test]
+fn deep_text_of_a_deep_tree_is_linear() {
+    let html = "<div>".repeat(20_000) + "x";
+    let doc = Document::parse(&html);
+    let start = std::time::Instant::now();
+    assert_eq!(Query::new("div ::text").unwrap().strings(doc.root()), ["x"]);
+    assert!(
+        start.elapsed() < std::time::Duration::from_secs(2),
+        "took {:?}",
+        start.elapsed()
+    );
+}
+
+#[test]
+fn valueless_attributes_come_back_empty() {
+    let doc = Document::parse("<input disabled><input>");
+    assert_eq!(
+        Query::new("input::attr(disabled)")
+            .unwrap()
+            .strings(doc.root()),
+        [""]
+    );
+}
+
+#[test]
 fn plain_selector_gives_text_content() {
     assert_eq!(strings(".sold .price"), ["£3.75"]);
 }
@@ -110,6 +141,11 @@ fn bad_queries_are_errors_not_panics() {
         "a::attr(",
         "a::attr()",
         "a::attr(href",
+        "a::attr(href)::text",
+        "a::text::text",
+        "a::attr(href))",
+        "a::attr(a b)",
+        "a::attr(::text)",
         "p >",
         "##x",
         "!!",

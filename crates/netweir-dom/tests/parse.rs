@@ -53,6 +53,18 @@ fn reads_attributes() {
 }
 
 #[test]
+fn boolean_attributes_read_as_empty_not_missing() {
+    let doc = Document::parse("<input disabled>");
+    let input = doc
+        .root()
+        .descendants()
+        .find(|n| n.tag() == Some("input"))
+        .unwrap();
+    assert_eq!(input.attr("disabled"), Some(""));
+    assert_eq!(input.attr("checked"), None);
+}
+
+#[test]
 fn walks_parents_and_children() {
     let doc = Document::parse("<ul><li>a</li><li>b</li></ul>");
     let ul = doc

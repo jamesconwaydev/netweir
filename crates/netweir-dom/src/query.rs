@@ -1,7 +1,8 @@
+use std::collections::HashSet;
 use std::ffi::c_void;
 use std::fmt;
 
-use crate::document::{Node, NodeKind};
+use crate::document::{Node, NodeId, NodeKind};
 use crate::ffi::{self, RawNode, RawSelectorList};
 
 /// What a query returns for each matched element.
@@ -106,8 +107,12 @@ impl Query {
     /// The query's results as strings: text, attribute values, or for a plain
     /// selector, the text content of each match.
     pub fn strings(&self, scope: Node<'_>) -> Vec<String> {
+        let mut matches = self.select(scope);
+        if self.output == (Output::Text { deep: true }) {
+            matches = outermost(matches);
+        }
         let mut out = Vec::new();
-        for node in self.select(scope) {
+        for node in matches {
             match &self.output {
                 Output::Nodes => out.push(node.text()),
                 Output::Attr(name) => out.extend(node.attr(name).map(str::to_string)),
@@ -146,6 +151,26 @@ impl fmt::Debug for Query {
     }
 }
 
+/// Drops matches that sit inside an earlier match, so `div ::text` on nested
+/// `<div>`s returns each text node once, as Scrapy does. Each match walks up
+/// only until it meets another match or the root.
+fn outermost(matches: Vec<Node<'_>>) -> Vec<Node<'_>> {
+    let matched: HashSet<NodeId> = matches.iter().map(Node::id).collect();
+    matches
+        .into_iter()
+        .filter(|m| {
+            let mut up = m.parent();
+            while let Some(p) = up {
+                if matched.contains(&p.id()) {
+                    return false;
+                }
+                up = p.parent();
+            }
+            true
+        })
+        .collect()
+}
+
 /// Splits `a::attr(href)` into `("a", Attr("href"))`. `None` means a
 /// malformed `::attr(...)`.
 fn split_output(css: &str) -> Option<(&str, Output)> {
@@ -156,7 +181,8 @@ fn split_output(css: &str) -> Option<(&str, Output)> {
     }
     if let Some(start) = css.rfind("::attr(") {
         let name = css[start + "::attr(".len()..].strip_suffix(')')?.trim();
-        if name.is_empty() {
+        let bad = |c: char| c.is_whitespace() || "()\"'>/=:,[]".contains(c);
+        if name.is_empty() || name.contains(bad) {
             return None;
         }
         return Some((&css[..start], Output::Attr(name.to_string())));

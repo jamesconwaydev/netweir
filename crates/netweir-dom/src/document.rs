@@ -35,41 +35,12 @@ impl Document {
     /// fetching pages it does not control should parse with a budget.
     pub fn parse_within(html: &str, budget: Duration) -> Result<Document, ParseTimeout> {
         // ponytail: the budget is checked between 16 KB chunks, so a parse can
-        // overrun it by the time one chunk takes. Fine for a guard against
-        // hostile pages; a hard deadline would need a hook inside lexbor.
-        const CHUNK: usize = 16 * 1024;
-        let start = Instant::now();
-        let raw = unsafe { ffi::nw_chunk_begin() };
-        // lexbor only fails when it cannot allocate. Rust aborts on allocation
-        // failure, so netweir treats lexbor's the same way.
-        assert!(!raw.is_null(), "lexbor failed to allocate a document");
-        let doc = Document {
-            raw,
-            select_lock: Mutex::new(()),
-        };
-        let mut rest = html;
-        while !rest.is_empty() {
-            if start.elapsed() > budget {
-                return Err(ParseTimeout {
-                    budget,
-                    parsed: html.len() - rest.len(),
-                });
-            }
-            let mut cut = rest.len().min(CHUNK);
-            while !rest.is_char_boundary(cut) {
-                cut += 1;
-            }
-            let (chunk, tail) = rest.split_at(cut);
-            let status = unsafe { ffi::nw_chunk(doc.raw, chunk.as_ptr().cast(), chunk.len()) };
-            assert_eq!(status, 0, "lexbor failed to allocate while parsing");
-            rest = tail;
-        }
-        assert_eq!(
-            unsafe { ffi::nw_chunk_end(doc.raw) },
-            0,
-            "lexbor failed to allocate while parsing"
-        );
-        Ok(doc)
+        // overrun it by the time one chunk takes. It bounds time, not memory:
+        // a crafted page of distinct formatting tags makes the HTML5 adoption
+        // agency clone thousands of elements per paragraph (64 KB reached
+        // 6.7 GB in a test). A node cap checked between chunks comes with the
+        // crawler.
+        parse_in_chunks(html, budget, 16 * 1024)
     }
 
     /// The document node. Its children are the doctype and `<html>`.
@@ -102,6 +73,41 @@ impl fmt::Debug for Document {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("Document")
     }
+}
+
+fn parse_in_chunks(html: &str, budget: Duration, chunk: usize) -> Result<Document, ParseTimeout> {
+    let start = Instant::now();
+    let raw = unsafe { ffi::nw_chunk_begin() };
+    // lexbor only fails when it cannot allocate. Rust aborts on allocation
+    // failure, so netweir treats lexbor's the same way.
+    assert!(!raw.is_null(), "lexbor failed to allocate a document");
+    let doc = Document {
+        raw,
+        select_lock: Mutex::new(()),
+    };
+    let mut rest = html;
+    while !rest.is_empty() {
+        if start.elapsed() > budget {
+            return Err(ParseTimeout {
+                budget,
+                parsed: html.len() - rest.len(),
+            });
+        }
+        let mut cut = rest.len().min(chunk);
+        while !rest.is_char_boundary(cut) {
+            cut += 1;
+        }
+        let (head, tail) = rest.split_at(cut);
+        let status = unsafe { ffi::nw_chunk(doc.raw, head.as_ptr().cast(), head.len()) };
+        assert_eq!(status, 0, "lexbor failed to allocate while parsing");
+        rest = tail;
+    }
+    assert_eq!(
+        unsafe { ffi::nw_chunk_end(doc.raw) },
+        0,
+        "lexbor failed to allocate while parsing"
+    );
+    Ok(doc)
 }
 
 /// Returned by [`Document::parse_within`] when parsing ran out of time.
@@ -265,5 +271,30 @@ impl fmt::Debug for Node<'_> {
             NodeKind::Text => write!(f, "{:?}", self.data().unwrap_or("")),
             kind => write!(f, "{kind:?}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn shape(doc: &Document) -> Vec<String> {
+        doc.root()
+            .descendants()
+            .map(|n| format!("{:?}{:?}", n, n.attrs()))
+            .collect()
+    }
+
+    #[test]
+    fn tiny_chunks_build_the_same_tree_as_one_chunk() {
+        // 7-byte chunks split tags, entities, attribute values and multi-byte
+        // characters at every offset.
+        let html = "<!doctype html><p class=\"a b\">é€😀 &amp; &eacute;</p>\
+                    <script>if (a < b) {}</script><textarea>x<y</textarea>\
+                    <table>t<tr><td>c</table><svg><path d=\"M0 0\"/></svg>"
+            .repeat(50);
+        let one = parse_in_chunks(&html, Duration::MAX, usize::MAX).unwrap();
+        let small = parse_in_chunks(&html, Duration::MAX, 7).unwrap();
+        assert_eq!(shape(&one), shape(&small));
     }
 }
