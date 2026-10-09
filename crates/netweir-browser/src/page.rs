@@ -268,7 +268,17 @@ impl Page {
             changed: Notify::new(),
         });
         let watched = shared.clone();
+        let login = Login {
+            conn: conn.clone(),
+            session: session.clone(),
+            credentials: browser.proxy_login.clone(),
+        };
         let handler: Handler = Arc::new(move |method, params| {
+            match method {
+                "Fetch.authRequired" => return login.answer(params),
+                "Fetch.requestPaused" => return login.release(params),
+                _ => {}
+            }
             watched
                 .state
                 .lock()
@@ -294,6 +304,18 @@ impl Page {
             page.call("Page.setLifecycleEventsEnabled", json!({"enabled": true}))
                 .await?;
             page.call("Network.enable", json!({})).await?;
+            if browser.proxy_login.is_some() {
+                // To answer the proxy's challenges. Chrome won't handle
+                // them without pausing requests too, so each one is
+                // released as it comes: a round trip per request, only for
+                // a proxy with a login. Page script can't see the Fetch
+                // domain.
+                page.call(
+                    "Fetch.enable",
+                    json!({"handleAuthRequests": true, "patterns": [{"urlPattern": "*"}]}),
+                )
+                .await?;
+            }
             if let Some(identity) = &browser.identity {
                 page.call(
                     "Network.setUserAgentOverride",
@@ -755,6 +777,42 @@ impl Page {
             Ok(_) | Err(Error::Closed) | Err(Error::Protocol { .. }) => Ok(()),
             Err(e) => Err(e),
         }
+    }
+}
+
+/// Answers a page's authentication challenges: a proxy's with the
+/// proxy's login, a site's by leaving it to Chrome. A wrong login isn't
+/// given again: Chrome stops asking after it's refused.
+struct Login {
+    conn: crate::conn::Connection,
+    session: String,
+    credentials: Option<(String, String)>,
+}
+
+impl Login {
+    fn answer(&self, params: &Value) {
+        let response = match &self.credentials {
+            Some((username, password)) if params["authChallenge"]["source"] == "Proxy" => {
+                json!({"response": "ProvideCredentials", "username": username, "password": password})
+            }
+            _ => json!({"response": "Default"}),
+        };
+        self.conn.send(
+            &self.session,
+            "Fetch.continueWithAuth",
+            json!({"requestId": str_of(params, "requestId"), "authChallengeResponse": response}),
+        );
+    }
+}
+
+impl Login {
+    /// Lets a request Fetch paused go on unchanged.
+    fn release(&self, params: &Value) {
+        self.conn.send(
+            &self.session,
+            "Fetch.continueRequest",
+            json!({"requestId": str_of(params, "requestId")}),
+        );
     }
 }
 

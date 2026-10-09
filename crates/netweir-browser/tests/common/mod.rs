@@ -125,3 +125,55 @@ pub async fn browser() -> Option<netweir_browser::Browser> {
         .unwrap(),
     )
 }
+
+/// An HTTP proxy that wants `user:secret` and answers every request itself
+/// with a page naming the URL it was asked for.
+pub struct Proxy {
+    pub url: String,
+}
+
+pub fn proxy() -> Proxy {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            std::thread::spawn(move || {
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).unwrap_or(0) == 0 {
+                        return;
+                    }
+                    let target = line.split(' ').nth(1).unwrap_or("").to_string();
+                    let mut authorised = false;
+                    loop {
+                        let mut h = String::new();
+                        if reader.read_line(&mut h).is_err() || h.trim().is_empty() {
+                            break;
+                        }
+                        // "user:secret", base64-encoded.
+                        if h.to_ascii_lowercase().starts_with("proxy-authorization:")
+                            && h.contains("dXNlcjpzZWNyZXQ=")
+                        {
+                            authorised = true;
+                        }
+                    }
+                    let reply = if authorised {
+                        let body = format!("<p id=via>via proxy: {target}</p>");
+                        format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\n\r\n{body}",
+                            body.len()
+                        )
+                    } else {
+                        "HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic realm=\"test\"\r\nContent-Length: 0\r\n\r\n".to_string()
+                    };
+                    if stream.write_all(reply.as_bytes()).is_err() {
+                        return;
+                    }
+                }
+            });
+        }
+    });
+    Proxy { url }
+}

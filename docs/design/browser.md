@@ -32,12 +32,13 @@ In this design:
   detect, no automation flags, no headless tells in the user agent
 - Crawl integration: per-request browser fetches and browser escalation on
   the recovery ladder, with cookie hand-back (milestone 9)
-- Firefox over WebDriver BiDi (milestone 10)
+- Chrome's remaining gaps: proxies that need a login, installing a
+  pinned Chrome for Testing, and connecting to a browser that's already
+  running (milestone 10)
 
 Not in this design: request interception and routing, tracing, PDF,
-downloading Chrome for Testing builds (the driver uses an installed
-Chrome or a path), connecting to a browser over a WebSocket (the hosted
-service will need it), Safari (no BiDi), and Camoufox (a third protocol).
+Safari (no BiDi), Camoufox (a third protocol), and Firefox for now (see
+below).
 
 ## Architecture
 
@@ -212,10 +213,8 @@ they own. Closing the browser closes every page.
   is scheduled like any other, so robots.txt, per-host limits and delays
   apply, and it counts against the host's concurrency while it runs.
 - Chrome is started the first time a request needs it, through the
-  crawl's `proxy`, and closed when the crawl ends. A proxy with
-  credentials can't be used yet (Chrome asks for them through the Fetch
-  domain's `authRequired` event, which the driver doesn't answer), so
-  browser requests then fail with an error saying so.
+  crawl's `proxy` (its login answered as milestone 10 describes), and
+  closed when the crawl ends.
 - A rendered page's `Response` has `version` `"browser"`, the document's
   status and headers, and the HTML as UTF-8, with the content type saying
   so and the original `content-encoding` and `content-length` dropped.
@@ -238,11 +237,44 @@ the cookie was issued to, so the new session uses the HTTP profile that
 matches the installed Chrome's major version, and the crawl logs one
 warning when there is none.
 
-## Firefox (milestone 10)
+## Chrome's gaps (milestone 10)
 
-Firefox has dropped CDP; its remote protocol is WebDriver BiDi. The page
-model above talks to a backend trait, implemented for CDP first and then
-for BiDi, so `netweir.browser(engine="firefox")` gives the same `Page`.
+**Proxies with a login.** Chrome takes no credentials on
+`--proxy-server`. It's given the proxy without them, and each page enables
+the Fetch domain for authentication only, answering `Fetch.authRequired`
+for a proxy challenge with the credentials and leaving a site's own
+challenge to Chrome. Page script can't see the Fetch domain. The answer is
+sent from the reader thread without waiting for a reply, since the request
+is held until it arrives. `netweir.browser(proxy=...)` takes the proxy, and
+a crawl's browser requests use the crawl's `proxy`, credentials and all.
+
+**Installing Chrome.** `netweir install chrome` downloads the Chrome for
+Testing build whose major version matches netweir's newest Chrome
+profile, so a crawl's cookie hand-back always has a matching profile. The
+build is listed in Google's `latest-versions-per-milestone-with-downloads`
+JSON, downloaded with netweir's own HTTP client and unpacked into
+`~/.netweir/chrome/<version>/` (`$NETWEIR_HOME` moves it). Finding Chrome
+looks there after `$NETWEIR_CHROME` and before the system installs, newest
+version first. `--headless-shell` installs `chrome-headless-shell`
+instead, which is lighter but easier to tell from a real browser.
+
+**Connecting to a running browser.** `netweir.browser(connect=url)` drives
+a Chrome that's already running, or anything else that speaks CDP, over
+a WebSocket: a `ws://` URL as Chrome prints it, or an `http://host:port`
+whose `/json/version` names one. Nothing is launched, so there's no
+profile to remove; closing the Browser closes the pages it opened and
+disconnects, leaving the browser running.
+
+## Firefox, later
+
+Firefox has dropped CDP; its remote protocol is WebDriver BiDi. Under
+BiDi, Firefox reports `navigator.webdriver` as true, and no setting turns
+that off: it follows whether the remote agent is running. Hiding it from
+page script would mean overriding a browser property in JavaScript, which
+detection looks for in its own right. So a Firefox driver would render
+pages but give itself away to every bot check, and netweir leaves it out
+until a patched build (such as Camoufox, which needs a third protocol) is
+in scope.
 
 ## Testing
 
@@ -272,4 +304,5 @@ evaluate, screenshots and cookies; the Python API; the stealth tests; docs.
 **M9, crawl integration.** Browser requests, escalation on the recovery
 ladder, cookie hand-back, the page pool and its settings and stats.
 
-**M10, Firefox.** The backend trait and a BiDi backend.
+**M10, Chrome's gaps.** Proxy logins, `netweir install chrome`, and
+connecting to a running browser.

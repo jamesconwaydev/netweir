@@ -23,7 +23,9 @@ class browser:
 
     Without ``executable``, it uses ``$NETWEIR_CHROME``, then the usual
     install paths for Chrome, Chrome for Testing and Chromium. ``timeout``
-    (seconds) is the default limit for navigations and actions.
+    (seconds) is the default limit for navigations and actions. ``proxy``
+    (``http://``, ``https://`` or ``socks5://``, with a login if it needs
+    one) carries everything Chrome fetches.
     """
 
     def __init__(
@@ -33,12 +35,14 @@ class browser:
         headless: bool = True,
         args: Sequence[str] = (),
         timeout: float = 30.0,
+        proxy: str | None = None,
     ):
         self._options: dict[str, Any] = {
             "executable": None if executable is None else os.fspath(executable),
             "headless": headless,
             "args": list(args),
             "timeout": timeout,
+            "proxy": proxy,
         }
         self._browser: Browser | None = None
 

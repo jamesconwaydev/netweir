@@ -49,6 +49,27 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
 
+class Proxy(BaseHTTPRequestHandler):
+    """Wants the login user:secret, and answers every request itself."""
+
+    def log_message(self, *args):
+        pass
+
+    def do_GET(self):
+        if self.headers.get("Proxy-Authorization") != "Basic dXNlcjpzZWNyZXQ=":
+            self.send_response(407)
+            self.send_header("Proxy-Authenticate", 'Basic realm="test"')
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+        body = f"<p id=via>{self.path}</p>".encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+
 @pytest.fixture(scope="module")
 def base():
     server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
@@ -171,3 +192,23 @@ async def test_the_browser_can_be_awaited_or_used_as_a_context_manager():
     assert not any(
         m in b.methods_sent() for m in ("Runtime.enable", "Console.enable", "Log.enable")
     )
+
+
+async def test_a_proxy_with_a_login_carries_the_pages():
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Proxy)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        try:
+            b = await netweir.browser(proxy=f"http://user:secret@127.0.0.1:{server.server_port}")
+        except netweir.BrowserError as e:
+            if "no Chrome found" in str(e) and not os.environ.get("NETWEIR_REQUIRE_CHROME"):
+                pytest.skip(str(e))
+            raise
+        async with b:
+            page = await b.new_page()
+            # Not a loopback address, which Chrome would fetch directly.
+            response = await page.goto("http://shop.test/item")
+            assert response.status == 200
+            assert (await page.parse()).css("#via::text").get() == "http://shop.test/item"
+    finally:
+        server.shutdown()

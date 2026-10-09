@@ -71,13 +71,14 @@ fn seconds(name: &str, value: Option<f64>) -> PyResult<Option<Duration>> {
 
 /// Starts Chrome. Resolves to a Browser.
 #[pyfunction]
-#[pyo3(signature = (executable=None, headless=true, args=Vec::new(), timeout=30.0))]
+#[pyo3(signature = (executable=None, headless=true, args=Vec::new(), timeout=30.0, proxy=None))]
 pub(crate) fn launch(
     py: Python<'_>,
     executable: Option<PathBuf>,
     headless: bool,
     args: Vec<String>,
     timeout: f64,
+    proxy: Option<String>,
 ) -> PyResult<Bound<'_, PyAny>> {
     let timeout = seconds("timeout", Some(timeout))?.expect("checked above");
     let options = LaunchOptions {
@@ -85,6 +86,7 @@ pub(crate) fn launch(
         headless,
         args,
         timeout,
+        proxy,
     };
     pyo3_async_runtimes::tokio::future_into_py(py, async move {
         let inner = CoreBrowser::launch(options).await.map_err(raise)?;

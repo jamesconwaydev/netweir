@@ -111,6 +111,22 @@ impl Connection {
         rx.await.unwrap_or(Err(Error::Closed))
     }
 
+    /// Sends without waiting for the reply, for the reader thread, which
+    /// can't wait: answering a request Chrome is holding, say.
+    pub(crate) fn send(&self, session: &str, method: &str, params: Value) {
+        let id = self.shared.next_id.fetch_add(1, Ordering::Relaxed);
+        let mut message = json!({"id": id, "method": method, "params": params});
+        if !session.is_empty() {
+            message["sessionId"] = Value::from(session);
+        }
+        let mut bytes = serde_json::to_vec(&message).expect("a JSON value serialises");
+        bytes.push(0);
+        self.shared.lock().sent.insert(method.to_string());
+        if let Some(out) = &*self.shared.out.lock().unwrap_or_else(|e| e.into_inner()) {
+            let _ = out.send(bytes);
+        }
+    }
+
     pub(crate) fn on(&self, session: &str, handler: Handler) {
         let mut state = self.shared.lock();
         if state.closed {

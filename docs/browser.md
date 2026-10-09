@@ -31,6 +31,7 @@ and Chromium in their usual places. Its options:
 | `headless` | `True` | `False` opens a window |
 | `args` | `()` | more Chrome command-line switches |
 | `timeout` | `30.0` | the default limit, in seconds, for navigations and actions |
+| `proxy` | `None` | an `http://`, `https://` or `socks5://` proxy for everything Chrome fetches; a username and password in it are given when the proxy asks |
 
 Use it with `async with`, or `await` it and call `await browser.close()`
 yourself. Each browser gets a fresh profile, deleted when it closes. A
@@ -166,11 +167,10 @@ Two settings make Chrome step in on its own:
 Chrome is started once per crawl, the first time it's needed. If it can't
 start, or dies partway, browser requests fail for the rest of the crawl.
 
-Chrome goes through the crawl's `proxy`, so the cookies it earns come from
-the address the HTTP client uses. It can't use a proxy that asks for a
-username and password yet; with one, browser requests fail and say so. Nor
-does it move through `proxies` as a blocked HTTP session does: it and the
-session it hands its cookies to both use `proxy`.
+Chrome goes through the crawl's `proxy`, login included, so the cookies it
+earns come from the address the HTTP client uses. It doesn't move through
+`proxies` as a blocked HTTP session does: it and the session it hands its
+cookies to both use `proxy`.
 
 The stats count `browser_fetches`, pages Chrome fetched, and
 `browser_unblocked`, blocked requests it got through. Each hand-back counts

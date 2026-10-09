@@ -409,6 +409,7 @@ def launch(
     headless: bool = True,
     args: list[str] = ...,
     timeout: float = 30.0,
+    proxy: str | None = None,
 ) -> Awaitable[Browser]: ...
 
 class Browser:

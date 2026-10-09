@@ -1294,7 +1294,7 @@ async fn render(
     cookies: bool,
     permit: OwnedSemaphorePermit,
 ) -> Result<Rendered, FetchError> {
-    let launch = browser_launch(&shared)?;
+    let launch = browser_launch(&shared);
     let browser = shared
         .browser
         .get_or_init(|| async move { Browser::launch(launch).await.map_err(|e| e.to_string()) })
@@ -1371,23 +1371,15 @@ async fn render(
     Ok((response, live, cookies, latency))
 }
 
-/// How to start Chrome for this crawl: through the crawl's proxy, so the
-/// cookies Chrome earns come from the address the HTTP client uses.
-fn browser_launch(shared: &Shared) -> Result<LaunchOptions, FetchError> {
+/// How to start Chrome for this crawl: through the crawl's proxy, login
+/// and all, so the cookies Chrome earns come from the address the HTTP
+/// client uses.
+fn browser_launch(shared: &Shared) -> LaunchOptions {
     let mut launch = shared.settings.browser_launch.clone();
-    if let Some(proxy) = &shared.options.proxy {
-        let parsed =
-            Url::parse(proxy).map_err(|e| FetchError::invalid(format!("proxy {proxy}: {e}")))?;
-        // ponytail: Chrome asks for proxy credentials through the Fetch
-        // domain's authRequired event, which netweir doesn't answer yet.
-        if !parsed.username().is_empty() || parsed.password().is_some() {
-            return Err(FetchError::invalid(
-                "Chrome can't use a proxy that needs a username and password yet",
-            ));
-        }
-        launch.args.push(format!("--proxy-server={proxy}"));
+    if launch.proxy.is_none() {
+        launch.proxy = shared.options.proxy.clone();
     }
-    Ok(launch)
+    launch
 }
 
 /// A Response for a page Chrome rendered: the document's status and
