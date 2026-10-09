@@ -31,8 +31,43 @@ int nw_chunk(lxb_html_document_t *doc, const char *html, size_t len) {
     return lxb_html_document_parse_chunk(doc, (const lxb_char_t *) html, len) == LXB_STATUS_OK ? 0 : -1;
 }
 
+/*
+ * lexbor parses a <template>'s contents into a separate fragment, so they are
+ * not the template's children and no walk, selector or index sees them. lxml
+ * and Beautiful Soup show them as children, which is what scrapers expect, so
+ * they are moved under the template once parsing ends. The serializer writes
+ * the (now empty) fragment and then the children, so HTML output is unchanged.
+ */
+static void nw_adopt_templates(lxb_dom_node_t *root) {
+    lxb_dom_node_t *n = root;
+    while (n != NULL) {
+        if (lxb_html_tree_node_is(n, LXB_TAG_TEMPLATE)) {
+            lxb_html_template_element_t *t = lxb_html_interface_template(n);
+            if (t->content != NULL) {
+                lxb_dom_node_t *c;
+                while ((c = t->content->node.first_child) != NULL) {
+                    lxb_dom_node_remove(c);
+                    lxb_dom_node_insert_child(n, c);
+                }
+            }
+        }
+        if (n->first_child != NULL) {
+            n = n->first_child;
+            continue;
+        }
+        while (n != root && n->next == NULL) {
+            n = n->parent;
+        }
+        n = n == root ? NULL : n->next;
+    }
+}
+
 int nw_chunk_end(lxb_html_document_t *doc) {
-    return lxb_html_document_parse_chunk_end(doc) == LXB_STATUS_OK ? 0 : -1;
+    if (lxb_html_document_parse_chunk_end(doc) != LXB_STATUS_OK) {
+        return -1;
+    }
+    nw_adopt_templates(lxb_dom_interface_node(doc));
+    return 0;
 }
 
 void nw_destroy(lxb_html_document_t *doc) {

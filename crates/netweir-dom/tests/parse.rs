@@ -239,5 +239,34 @@ fn readable_text_leaves_out_code() {
         .unwrap();
     assert_eq!(style.readable_text_pieces(), ["p{}"]);
     // XPath's string value still includes everything.
-    assert_eq!(div.text(), "avar xp{}bn");
+    assert_eq!(div.text(), "avar xp{}btn");
+}
+
+#[test]
+fn template_contents_are_the_templates_children() {
+    let html =
+        "<div>a<template><p class=x>in</p>tx<template><i>deep</i></template></template>b</div>";
+    let doc = Document::parse(html);
+    let template = doc
+        .root()
+        .descendants()
+        .find(|n| n.tag() == Some("template"))
+        .unwrap();
+    let tags: Vec<_> = template
+        .children()
+        .map(|c| c.tag().unwrap_or("#text"))
+        .collect();
+    assert_eq!(tags, ["p", "#text", "template"]);
+    assert_eq!(
+        doc.root()
+            .descendants()
+            .filter(|n| n.tag() == Some("i"))
+            .count(),
+        1
+    );
+    // Serialised once, not twice.
+    assert_eq!(
+        template.html(),
+        "<template><p class=\"x\">in</p>tx<template><i>deep</i></template></template>"
+    );
 }
