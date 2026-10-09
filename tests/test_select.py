@@ -140,3 +140,49 @@ def test_threads_share_xpath_and_css(page):
     for t in threads:
         t.join()
     assert errors == []
+
+
+def test_threads_build_a_fresh_documents_indexes_together():
+    for _ in range(20):
+        doc = netweir.parse(PAGE)
+        start = threading.Barrier(8)
+        results = []
+
+        def work(doc=doc, start=start, results=results):
+            start.wait()
+            results.append((len(doc.xpath("//article")), doc.xpath("id('main')/h1/text()").get()))
+
+        threads = [threading.Thread(target=work) for _ in range(8)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        assert results == [(3, "All products")] * 8
+
+
+def test_re_honours_compiled_flags_like_parsel():
+    doc = netweir.parse("<pre>line1\nline2</pre><p>A1 b2</p>")
+    pre = doc.css("pre::text")
+    assert pre.re(re.compile(r"line1.line2", re.S)) == ["line1\nline2"]
+    assert pre.re(re.compile(r"^line\d$", re.M)) == ["line1", "line2"]
+    assert pre.re(re.compile(r"line \d  # a number", re.X)) == ["line1", "line2"]
+    assert doc.css("p::text").re(re.compile(r"[a-z]\d", re.I)) == ["A1", "b2"]
+    # Python-only syntax works, because Python's re does the matching.
+    assert doc.css("p::text").re(r"(?<=A)\d") == ["1"]
+
+
+def test_re_extract_group_and_entities_like_parsel():
+    doc = netweir.parse("<p>1.0 2.5 3.7</p><a title='say \"hi\" &amp; &lt;go&gt;'>x</a>")
+    assert doc.css("p::text").re(r"(?P<extract>\d)\.(\d)") == ["1"]
+    assert doc.css("p::text").re(r"(\d)\.(\d)") == ["1", "0", "2", "5", "3", "7"]
+    html = doc.css("a").re(r"title=\"(.*?)\">")
+    assert html == ['say "hi" &amp; &lt;go>']
+    assert doc.css("a").re(r"title=\"(.*?)\">", replace_entities=False) == [
+        "say &quot;hi&quot; &amp; &lt;go&gt;"
+    ]
+
+
+def test_defaults_can_be_anything_like_parsel(page):
+    assert page.css("nothing::text").get(default=0) == 0
+    assert page.css("nothing::text").re_first(r"\d", default=0) == 0
+    assert page.css("nothing").extract_first(default=[]) == []

@@ -153,6 +153,17 @@ fn xpath_entries(
     .map_err(XPathError::new_err)
 }
 
+/// Beautiful Soup's `limit`: None or 0 for no limit.
+fn bs4_limit(limit: Option<i64>) -> PyResult<Option<usize>> {
+    match limit {
+        None | Some(0) => Ok(None),
+        Some(n) if n > 0 => Ok(Some(n as usize)),
+        Some(n) => Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "limit must be 0 (no limit) or more, not {n}"
+        ))),
+    }
+}
+
 #[derive(Clone, Copy)]
 enum Direction {
     Descendants,
@@ -167,15 +178,39 @@ enum Direction {
 impl Node {
     fn criteria(
         name: Option<&Bound<'_, PyAny>>,
-        attrs: Option<&Bound<'_, PyDict>>,
+        attrs: Option<&Bound<'_, PyAny>>,
         string: Option<&Bound<'_, PyAny>>,
         class_: Option<&Bound<'_, PyAny>>,
         kwargs: Option<&Bound<'_, PyDict>>,
     ) -> PyResult<Criteria> {
         let mut filters = Vec::new();
-        for dict in [attrs, kwargs].into_iter().flatten() {
+        let mut string = string.cloned();
+        // `attrs` that isn't a dict is a class filter, as in Beautiful Soup.
+        let attrs = match attrs.filter(|a| !a.is_none()) {
+            Some(a) => match a.cast::<PyDict>() {
+                Ok(d) => Some(d.clone()),
+                Err(_) => {
+                    filters.push(("class".to_string(), Filter::from_py(Some(a))?));
+                    None
+                }
+            },
+            None => None,
+        };
+        for dict in [attrs.as_ref(), kwargs].into_iter().flatten() {
             for (k, v) in dict.iter() {
-                filters.push((k.extract::<String>()?, Filter::from_py(Some(&v))?));
+                let key = k.extract::<String>()?;
+                // `text` is Beautiful Soup's old name for `string`.
+                if key == "text" && string.is_none() {
+                    string = Some(v);
+                    continue;
+                }
+                // None for an attribute means it must be absent.
+                let filter = if v.is_none() {
+                    Filter::Present(false)
+                } else {
+                    Filter::from_py(Some(&v))?
+                };
+                filters.push((key, filter));
             }
         }
         if let Some(c) = class_ {
@@ -184,7 +219,7 @@ impl Node {
         Ok(Criteria {
             name: Filter::from_py(name)?,
             attrs: filters,
-            string: Filter::from_py(string)?,
+            string: Filter::from_py(string.as_ref())?,
         })
     }
 
@@ -243,7 +278,7 @@ macro_rules! finders {
                     &self,
                     py: Python<'_>,
                     name: Option<&Bound<'_, PyAny>>,
-                    attrs: Option<&Bound<'_, PyDict>>,
+                    attrs: Option<&Bound<'_, PyAny>>,
                     string: Option<&Bound<'_, PyAny>>,
                     class_: Option<&Bound<'_, PyAny>>,
                     kwargs: Option<&Bound<'_, PyDict>>,
@@ -258,14 +293,14 @@ macro_rules! finders {
                     &self,
                     py: Python<'_>,
                     name: Option<&Bound<'_, PyAny>>,
-                    attrs: Option<&Bound<'_, PyDict>>,
+                    attrs: Option<&Bound<'_, PyAny>>,
                     string: Option<&Bound<'_, PyAny>>,
-                    limit: Option<usize>,
+                    limit: Option<i64>,
                     class_: Option<&Bound<'_, PyAny>>,
                     kwargs: Option<&Bound<'_, PyDict>>,
                 ) -> PyResult<Vec<Node>> {
                     let criteria = Node::criteria(name, attrs, string, class_, kwargs)?;
-                    self.search(py, &criteria, $dir, limit)
+                    self.search(py, &criteria, $dir, bs4_limit(limit)?)
                 }
             )*
         }
@@ -317,7 +352,7 @@ impl Node {
         &self,
         py: Python<'_>,
         name: Option<&Bound<'_, PyAny>>,
-        attrs: Option<&Bound<'_, PyDict>>,
+        attrs: Option<&Bound<'_, PyAny>>,
         recursive: bool,
         string: Option<&Bound<'_, PyAny>>,
         class_: Option<&Bound<'_, PyAny>>,
@@ -342,10 +377,10 @@ impl Node {
         &self,
         py: Python<'_>,
         name: Option<&Bound<'_, PyAny>>,
-        attrs: Option<&Bound<'_, PyDict>>,
+        attrs: Option<&Bound<'_, PyAny>>,
         recursive: bool,
         string: Option<&Bound<'_, PyAny>>,
-        limit: Option<usize>,
+        limit: Option<i64>,
         class_: Option<&Bound<'_, PyAny>>,
         kwargs: Option<&Bound<'_, PyDict>>,
     ) -> PyResult<Vec<Node>> {
@@ -355,7 +390,7 @@ impl Node {
         } else {
             Direction::Children
         };
-        self.search(py, &criteria, direction, limit)
+        self.search(py, &criteria, direction, bs4_limit(limit)?)
     }
 
     /// Elements matching a CSS selector, as a list.
@@ -607,38 +642,25 @@ impl Selection {
                 .unbind(),
         })
     }
-
-    /// The pattern of a str or compiled regex, with Python's IGNORECASE
-    /// flag carried over.
-    fn regex(pattern: &Bound<'_, PyAny>) -> PyResult<regex::Regex> {
-        let (source, ignore_case) = if let Ok(s) = pattern.cast::<PyString>() {
-            (s.to_string(), false)
-        } else {
-            let source: String = pattern.getattr("pattern")?.extract()?;
-            let flags: i64 = pattern.getattr("flags")?.extract()?;
-            // re.IGNORECASE is 2.
-            (source, flags & 2 != 0)
-        };
-        regex::RegexBuilder::new(&source)
-            .case_insensitive(ignore_case)
-            .build()
-            .map_err(|e| {
-                pyo3::exceptions::PyValueError::new_err(format!("bad regular expression: {e}"))
-            })
-    }
 }
 
 #[pymethods]
 impl Selection {
     /// The first result as a string, or `default` if there are none.
     #[pyo3(signature = (default=None))]
-    fn get(&self, py: Python<'_>, default: Option<String>) -> Option<String> {
-        py.detach(|| self.entries.first().map(|e| self.string_of(e)))
-            .or(default)
+    fn get(&self, py: Python<'_>, default: Option<Py<PyAny>>) -> PyResult<Py<PyAny>> {
+        match self.entries.first() {
+            Some(e) => Ok(PyString::new(py, &self.string_of(e)).into_any().unbind()),
+            None => Ok(default.unwrap_or_else(|| py.None())),
+        }
     }
 
     /// Every result as a string.
     fn getall(&self, py: Python<'_>) -> Vec<String> {
+        // Releasing the GIL costs more than serialising a few nodes.
+        if self.entries.len() < 16 {
+            return self.entries.iter().map(|e| self.string_of(e)).collect();
+        }
         py.detach(|| self.entries.iter().map(|e| self.string_of(e)).collect())
     }
 
@@ -649,7 +671,7 @@ impl Selection {
 
     /// parsel's older name for `get`.
     #[pyo3(signature = (default=None))]
-    fn extract_first(&self, py: Python<'_>, default: Option<String>) -> Option<String> {
+    fn extract_first(&self, py: Python<'_>, default: Option<Py<PyAny>>) -> PyResult<Py<PyAny>> {
         self.get(py, default)
     }
 
@@ -678,36 +700,37 @@ impl Selection {
     }
 
     /// Every match of `pattern` in every result, as parsel does it: whole
-    /// matches, or the groups when the pattern has them.
-    fn re(&self, py: Python<'_>, pattern: &Bound<'_, PyAny>) -> PyResult<Vec<String>> {
-        let re = Selection::regex(pattern)?;
-        let strings = self.getall(py);
-        let mut out = Vec::new();
-        for s in &strings {
-            for caps in re.captures_iter(s) {
-                if caps.len() == 1 {
-                    out.push(caps[0].to_string());
-                } else {
-                    out.extend(
-                        caps.iter()
-                            .skip(1)
-                            .map(|g| g.map_or("", |m| m.as_str()).to_string()),
-                    );
-                }
-            }
-        }
-        Ok(out)
+    /// matches, the groups when the pattern has them, or only the first
+    /// match's `extract` group. Entities other than `&lt;` and `&amp;` are
+    /// decoded unless `replace_entities` is false.
+    #[pyo3(signature = (pattern, replace_entities=true))]
+    fn re<'py>(
+        &self,
+        py: Python<'py>,
+        pattern: &Bound<'py, PyAny>,
+        replace_entities: bool,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        py.import("netweir._regex")?.getattr("extract")?.call1((
+            pattern,
+            self.getall(py),
+            replace_entities,
+        ))
     }
 
     /// The first `re()` match, or `default`.
-    #[pyo3(signature = (pattern, default=None))]
+    #[pyo3(signature = (pattern, default=None, replace_entities=true))]
     fn re_first(
         &self,
         py: Python<'_>,
         pattern: &Bound<'_, PyAny>,
-        default: Option<String>,
-    ) -> PyResult<Option<String>> {
-        Ok(self.re(py, pattern)?.into_iter().next().or(default))
+        default: Option<Py<PyAny>>,
+        replace_entities: bool,
+    ) -> PyResult<Py<PyAny>> {
+        let all = self.re(py, pattern, replace_entities)?;
+        match all.try_iter()?.next() {
+            Some(first) => Ok(first?.unbind()),
+            None => Ok(default.unwrap_or_else(|| py.None())),
+        }
     }
 
     /// The first element's attributes; empty if there is none.

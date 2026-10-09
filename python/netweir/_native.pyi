@@ -1,6 +1,8 @@
 import re
 from collections.abc import Callable, Iterator
-from typing import Literal, overload
+from typing import Literal, TypeVar, overload
+
+_D = TypeVar("_D")
 
 class SelectorError(ValueError): ...
 class XPathError(ValueError): ...
@@ -25,7 +27,7 @@ class Node:
     def find(
         self,
         name: Filter = None,
-        attrs: dict[str, Filter] | None = None,
+        attrs: dict[str, Filter] | Filter = None,
         recursive: bool = True,
         string: Filter = None,
         class_: Filter = None,
@@ -34,7 +36,7 @@ class Node:
     def find_all(
         self,
         name: Filter = None,
-        attrs: dict[str, Filter] | None = None,
+        attrs: dict[str, Filter] | Filter = None,
         recursive: bool = True,
         string: Filter = None,
         limit: int | None = None,
@@ -44,7 +46,7 @@ class Node:
     def find_parent(
         self,
         name: Filter = None,
-        attrs: dict[str, Filter] | None = None,
+        attrs: dict[str, Filter] | Filter = None,
         string: Filter = None,
         class_: Filter = None,
         **kwargs: Filter,
@@ -52,7 +54,7 @@ class Node:
     def find_parents(
         self,
         name: Filter = None,
-        attrs: dict[str, Filter] | None = None,
+        attrs: dict[str, Filter] | Filter = None,
         string: Filter = None,
         limit: int | None = None,
         class_: Filter = None,
@@ -61,7 +63,7 @@ class Node:
     def find_next_sibling(
         self,
         name: Filter = None,
-        attrs: dict[str, Filter] | None = None,
+        attrs: dict[str, Filter] | Filter = None,
         string: Filter = None,
         class_: Filter = None,
         **kwargs: Filter,
@@ -69,7 +71,7 @@ class Node:
     def find_next_siblings(
         self,
         name: Filter = None,
-        attrs: dict[str, Filter] | None = None,
+        attrs: dict[str, Filter] | Filter = None,
         string: Filter = None,
         limit: int | None = None,
         class_: Filter = None,
@@ -78,7 +80,7 @@ class Node:
     def find_previous_sibling(
         self,
         name: Filter = None,
-        attrs: dict[str, Filter] | None = None,
+        attrs: dict[str, Filter] | Filter = None,
         string: Filter = None,
         class_: Filter = None,
         **kwargs: Filter,
@@ -86,7 +88,7 @@ class Node:
     def find_previous_siblings(
         self,
         name: Filter = None,
-        attrs: dict[str, Filter] | None = None,
+        attrs: dict[str, Filter] | Filter = None,
         string: Filter = None,
         limit: int | None = None,
         class_: Filter = None,
@@ -95,7 +97,7 @@ class Node:
     def find_next(
         self,
         name: Filter = None,
-        attrs: dict[str, Filter] | None = None,
+        attrs: dict[str, Filter] | Filter = None,
         string: Filter = None,
         class_: Filter = None,
         **kwargs: Filter,
@@ -103,7 +105,7 @@ class Node:
     def find_all_next(
         self,
         name: Filter = None,
-        attrs: dict[str, Filter] | None = None,
+        attrs: dict[str, Filter] | Filter = None,
         string: Filter = None,
         limit: int | None = None,
         class_: Filter = None,
@@ -112,7 +114,7 @@ class Node:
     def find_previous(
         self,
         name: Filter = None,
-        attrs: dict[str, Filter] | None = None,
+        attrs: dict[str, Filter] | Filter = None,
         string: Filter = None,
         class_: Filter = None,
         **kwargs: Filter,
@@ -120,7 +122,7 @@ class Node:
     def find_all_previous(
         self,
         name: Filter = None,
-        attrs: dict[str, Filter] | None = None,
+        attrs: dict[str, Filter] | Filter = None,
         string: Filter = None,
         limit: int | None = None,
         class_: Filter = None,
@@ -181,16 +183,24 @@ class Selection:
     @overload
     def get(self) -> str | None: ...
     @overload
-    def get(self, default: str) -> str: ...
+    def get(self, default: _D) -> str | _D: ...
     def getall(self) -> list[str]: ...
     def extract(self) -> list[str]: ...
-    def extract_first(self, default: str | None = None) -> str | None: ...
+    @overload
+    def extract_first(self) -> str | None: ...
+    @overload
+    def extract_first(self, default: _D) -> str | _D: ...
     def css(self, query: str) -> Selection: ...
     def xpath(self, query: str, **variables: str | int | float | bool) -> Selection: ...
-    def re(self, pattern: str | re.Pattern[str]) -> list[str]: ...
+    def re(self, pattern: str | re.Pattern[str], replace_entities: bool = True) -> list[str]: ...
+    @overload
     def re_first(
-        self, pattern: str | re.Pattern[str], default: str | None = None
+        self, pattern: str | re.Pattern[str], *, replace_entities: bool = True
     ) -> str | None: ...
+    @overload
+    def re_first(
+        self, pattern: str | re.Pattern[str], default: _D, replace_entities: bool = True
+    ) -> str | _D: ...
     @property
     def attrib(self) -> dict[str, str]: ...
     def __len__(self) -> int: ...

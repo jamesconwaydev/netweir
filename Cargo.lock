@@ -978,7 +978,6 @@ dependencies = [
  "netweir-dom",
  "pyo3",
  "pyo3-async-runtimes",
- "regex",
  "tokio",
 ]
 

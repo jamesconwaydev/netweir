@@ -165,3 +165,38 @@ def test_text_leaves_out_scripts_and_styles_like_beautiful_soup():
     assert p.text == "Hi there"
     assert root.find("style").get_text() == "p{}"
     assert p.xpath("string()").get() == "Hi track()p{}there"
+
+
+def test_text_is_beautiful_soups_old_name_for_string(soup):
+    assert [str(n) for n in soup.find_all(text="Elsie")] == ["Elsie"]
+    assert soup.find("a", text="Lacie")["id"] == "link2"
+
+
+def test_none_for_an_attribute_means_absent(soup):
+    with_id = [n.name for n in soup.find_all("a", id=True)]
+    assert len(with_id) == 3
+    assert soup.find_all("a", id=None) == []
+    assert [n.name for n in soup.find_all("p", attrs={"id": None})] == ["p", "p", "p"]
+
+
+def test_limit_zero_means_no_limit(soup):
+    assert len(soup.find_all("a", limit=0)) == 3
+    with pytest.raises(ValueError):
+        soup.find_all("a", limit=-1)
+
+
+def test_multi_valued_attributes_match_any_token():
+    doc = netweir.parse(
+        '<a rel="nofollow noopener">1</a><a rel="next">2</a><table><tr><td headers="h1 h2">3</td></tr></table>'
+    )
+    assert [a.string for a in doc.find_all(rel="nofollow")] == ["1"]
+    assert [a.string for a in doc.find_all(rel="nofollow noopener")] == ["1"]
+    assert [t.string for t in doc.find_all(headers="h2")] == ["3"]
+
+
+def test_attrs_as_a_string_means_class(soup):
+    assert ids(soup.find_all("a", "brother")) == ["link3"]
+
+
+def test_lists_can_mix_strings_and_patterns(soup):
+    assert [n.name for n in soup.find_all([re.compile("^ti"), "b"])] == ["title", "b"]

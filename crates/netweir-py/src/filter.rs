@@ -15,6 +15,8 @@ pub(crate) enum Filter {
     OneOf(Vec<String>),
     /// A compiled pattern (anything with `.search`): it must find a match.
     Pattern(Py<PyAny>),
+    /// A list mixing strings and patterns: any one of them must match.
+    AnyOf(Vec<Filter>),
     /// A function: it must return something true.
     Function(Py<PyAny>),
 }
@@ -35,18 +37,26 @@ impl Filter {
             || obj.is_instance_of::<PySet>()
             || obj.is_instance_of::<PyFrozenSet>()
         {
-            let mut items = Vec::new();
+            let mut strings = Vec::new();
+            let mut others = Vec::new();
             for item in obj.try_iter()? {
                 let item = item?;
-                let s = item.cast::<PyString>().map_err(|_| {
-                    PyTypeError::new_err(format!(
-                        "a list filter holds strings, not {}",
+                if let Ok(s) = item.cast::<PyString>() {
+                    strings.push(s.to_string());
+                } else if item.hasattr("search")? {
+                    others.push(Filter::Pattern(item.unbind()));
+                } else {
+                    return Err(PyTypeError::new_err(format!(
+                        "a list filter holds strings and compiled regexes, not {}",
                         type_name(&item)
-                    ))
-                })?;
-                items.push(s.to_string());
+                    )));
+                }
             }
-            return Ok(Filter::OneOf(items));
+            if others.is_empty() {
+                return Ok(Filter::OneOf(strings));
+            }
+            others.push(Filter::OneOf(strings));
+            return Ok(Filter::AnyOf(others));
         }
         if obj.hasattr("search")? {
             return Ok(Filter::Pattern(obj.clone().unbind()));
@@ -76,14 +86,25 @@ impl Filter {
                 None => false,
             },
             Filter::Function(f) => f.bind(py).call1((value,))?.is_truthy()?,
+            Filter::AnyOf(filters) => {
+                for f in filters {
+                    if f.matches_value(py, value)? {
+                        return Ok(true);
+                    }
+                }
+                false
+            }
         })
     }
 
-    /// The class attribute matches if the filter matches any one class or
-    /// the whole value, as in Beautiful Soup.
-    fn matches_class(&self, py: Python<'_>, value: Option<&str>) -> PyResult<bool> {
-        if let (Some(v), Filter::OneOf(_) | Filter::Pattern(_) | Filter::Function(_)) =
-            (value, self)
+    /// A multi-valued attribute (class, rel, ...) matches if the filter
+    /// matches any one of its values or the whole value, as in Beautiful
+    /// Soup.
+    fn matches_tokens(&self, py: Python<'_>, value: Option<&str>) -> PyResult<bool> {
+        if let (
+            Some(v),
+            Filter::OneOf(_) | Filter::Pattern(_) | Filter::Function(_) | Filter::AnyOf(_),
+        ) = (value, self)
         {
             for class in v.split_ascii_whitespace() {
                 if self.matches_value(py, Some(class))? {
@@ -101,6 +122,17 @@ fn type_name(obj: &Bound<'_, PyAny>) -> String {
         .map(|n| n.to_string())
         .unwrap_or_else(|_| "that".into())
 }
+
+/// Attributes Beautiful Soup splits into a list of values.
+const MULTI_VALUED: [&str; 7] = [
+    "class",
+    "rel",
+    "rev",
+    "accept-charset",
+    "headers",
+    "accesskey",
+    "dropzone",
+];
 
 /// Everything a `find*` call filters on.
 pub(crate) struct Criteria {
@@ -140,8 +172,8 @@ impl Criteria {
         }
         for (attr, filter) in &self.attrs {
             let value = node.attr(attr);
-            let ok = if attr == "class" {
-                filter.matches_class(py, value)?
+            let ok = if MULTI_VALUED.contains(&attr.as_str()) {
+                filter.matches_tokens(py, value)?
             } else {
                 filter.matches_value(py, value)?
             };
