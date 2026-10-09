@@ -41,7 +41,7 @@ impl Node {
         Node { doc, id }
     }
 
-    fn get(&self) -> netweir_dom::Node<'_> {
+    pub(crate) fn get(&self) -> netweir_dom::Node<'_> {
         // SAFETY: `id` was taken from a node of `doc`, which this Node keeps alive.
         unsafe { self.doc.node(self.id) }
     }

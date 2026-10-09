@@ -19,6 +19,7 @@ from typing import Any
 from netweir._fetch import Page, _pairs
 from netweir._native import Crawler
 from netweir._request import Request
+from netweir._rules import Follow, _warn_invalid
 
 log = logging.getLogger("netweir")
 
@@ -87,6 +88,9 @@ class Spider:
 
     name: str | None = None
     start_urls: list[str] = []
+    #: Link rules (``netweir.Follow``), run in Rust. A spider made only of
+    #: rules and Items runs no Python per page.
+    rules: list[Follow] = []
     settings: Settings = Settings()
     #: Callables applied to every item in order, sync or async. Each returns
     #: the item (changed or not), or None to drop it.
@@ -129,12 +133,34 @@ class _Run:
         self.engine = self.settings._engine()
         self.ids = itertools.count()
         self.waiting: dict[int, Request] = {}
+        self.rules = list(spider.rules)
+        for rule in self.rules:
+            self.engine.add_rule(
+                rule.kind,
+                rule.query,
+                rule.extract._spec if rule.extract is not None else None,
+                follow=rule.follow,
+                to_python=rule.callback is not None,
+                priority=rule.priority,
+            )
+        # parse runs alongside the rules only if the spider writes its own.
+        self.has_parse = type(spider).parse is not Spider.parse
+        self.warned: set[str] = set()
         self.counts = {"items": 0, "items_dropped": 0, "callback_errors": 0, "invalid_urls": 0}
 
     def submit(self, request: Request) -> None:
         rid = next(self.ids)
+        # A request with no callback on a rules spider is the rules' to read.
+        apply_rules = bool(self.rules) and request.callback is None
+        to_python = not apply_rules or self.has_parse
         outcome = self.engine.submit(
-            rid, request.url, request.priority, _pairs(request.headers), request.dont_filter
+            rid,
+            request.url,
+            request.priority,
+            _pairs(request.headers),
+            request.dont_filter,
+            apply_rules=apply_rules,
+            to_python=to_python,
         )
         if outcome == "queued":
             self.waiting[rid] = request
@@ -166,24 +192,8 @@ class _Run:
             events = await self.engine.next(256)
             if not events:
                 break
-            for kind, rid, detail in events:
-                request = self.waiting.pop(rid)
-                if kind == "fetched":
-                    page = Page(detail, request)
-                    await self.run_callback(request.callback, "parse", (page,), request.url)
-                elif kind == "failed":
-                    if request.errback is None:
-                        log.warning("%s: %s", request.url, detail)
-                    else:
-                        await self.run_callback(
-                            request.errback, None, (request, detail), request.url
-                        )
-                else:
-                    log.info(
-                        "skipped %s: %s",
-                        request.url,
-                        "robots.txt" if detail == "robots" else "TDM reserved",
-                    )
+            for event in events:
+                await self.dispatch(event)
         stats = {**self.engine.stats(), **self.counts}
         stats.pop("queued", None)
         stats.pop("in_flight", None)
@@ -193,6 +203,44 @@ class _Run:
             ", ".join(f"{k} {v}" for k, v in stats.items()),
         )
         return stats
+
+    async def dispatch(self, event: tuple) -> None:
+        kind = event[0]
+        if kind == "item":
+            _, rule, item, invalid = event
+            item_class = self.rules[rule].extract
+            _warn_invalid(invalid, self.warned)
+            await self.handle(item_class._finish(item, self.warned))
+        elif kind == "ruled":
+            _, rule, url, response, root = event
+            callback = self.rules[rule].callback
+            request = Request(url, callback=callback)
+            page = Page(response, request, root)
+            await self.run_callback(callback, None, (page,), url)
+        elif kind == "rule_failed":
+            _, _, url, error = event
+            log.warning("%s: %s", url, error)
+        elif kind == "rule_dropped":
+            _, _, url, why = event
+            log.info("skipped %s: %s", url, _why(why))
+        elif kind == "page_error":
+            _, url, message = event
+            log.warning("%s: %s", url, message)
+        elif kind == "handled":
+            self.waiting.pop(event[1])
+        else:
+            _, rid, detail, *rest = event
+            request = self.waiting.pop(rid)
+            if kind == "fetched":
+                page = Page(detail, request, rest[0])
+                await self.run_callback(request.callback, "parse", (page,), request.url)
+            elif kind == "failed":
+                if request.errback is None:
+                    log.warning("%s: %s", request.url, detail)
+                else:
+                    await self.run_callback(request.errback, None, (request, detail), request.url)
+            else:
+                log.info("skipped %s: %s", request.url, _why(detail))
 
     async def run_callback(
         self, fn: Callable[..., Any] | str | None, default: str | None, args: tuple, url: str
@@ -242,3 +290,7 @@ class _Run:
 _NOT_MANY = (dict, str, bytes, bytearray)
 #: Never an item.
 _NOT_ITEMS = (str, bytes, bytearray, int, float, bool, set, frozenset)
+
+
+def _why(reason: str) -> str:
+    return "robots.txt" if reason == "robots" else "TDM reserved"

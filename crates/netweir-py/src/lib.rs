@@ -6,6 +6,7 @@ mod export;
 mod fetch;
 mod filter;
 mod node;
+mod rules;
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -74,5 +75,6 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     fetch::register(m)?;
     crawl::register(m)?;
     export::register(m)?;
+    rules::register(m)?;
     Ok(())
 }

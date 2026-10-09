@@ -1,15 +1,27 @@
 //! The crawl engine from Python: submit requests, await batches of events.
+//!
+//! Pages reached through declarative rules never reach Python: they are
+//! parsed here, on blocking threads, their links are queued and their items
+//! extracted, and Python receives only the finished items.
 
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use netweir_core::{
-    CrawlRequest, CrawlSettings, Crawler as CoreCrawler, DropReason, Event, Submitted,
+    CrawlRequest, CrawlSettings, Crawler as CoreCrawler, DropReason, Event, FetchError, Submitted,
 };
+use netweir_dom::extract::{self, Value};
+use netweir_dom::{Document, Query};
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
-use pyo3::types::{PyDict, PyTuple};
+use pyo3::types::{PyDict, PyList, PyTuple};
+use url::Url;
 
 use crate::fetch::{Response, fetch_error_value, fetch_options};
+use crate::node::Node;
+use crate::rules::{ItemSpec, Rule, selector};
 
 fn seconds(name: &str, value: f64) -> PyResult<Duration> {
     Duration::try_from_secs_f64(value).map_err(|_| {
@@ -17,12 +29,384 @@ fn seconds(name: &str, value: f64) -> PyResult<Duration> {
     })
 }
 
+/// Ids from here up belong to requests the rules made; Python's count from 0.
+const RULE_IDS: u64 = 1 << 62;
+
+/// How long one rule page may take to parse before it is given up on.
+// ponytail: fixed budget; make it a setting if real pages need longer.
+const PARSE_BUDGET: Duration = Duration::from_secs(10);
+
+/// What to do with a request's page besides returning it.
+#[derive(Clone)]
+struct Tag {
+    /// The rule that led here; None for a request Python submitted.
+    rule: Option<usize>,
+    /// Take links from the page with every rule.
+    apply_rules: bool,
+    /// Give the page to Python.
+    to_python: bool,
+    url: String,
+}
+
+/// What became of a page that needed Rust work.
+struct Processed {
+    id: u64,
+    tag: Tag,
+    response: netweir_core::Response,
+    root: Option<Arc<Document>>,
+    links: Vec<(String, usize)>,
+    item: Option<Vec<Value>>,
+    error: Option<String>,
+}
+
+/// One event for Python, built under the GIL at the end of a batch.
+enum Out {
+    Fetched {
+        id: u64,
+        response: netweir_core::Response,
+        root: Option<Arc<Document>>,
+    },
+    Failed {
+        id: u64,
+        error: FetchError,
+    },
+    Dropped {
+        id: u64,
+        why: &'static str,
+    },
+    /// Python's request was dealt with entirely in Rust.
+    Handled {
+        id: u64,
+    },
+    Item {
+        rule: usize,
+        values: Vec<Value>,
+    },
+    Ruled {
+        rule: usize,
+        url: String,
+        response: netweir_core::Response,
+        root: Option<Arc<Document>>,
+    },
+    RuleFailed {
+        rule: usize,
+        url: String,
+        error: FetchError,
+    },
+    RuleDropped {
+        rule: usize,
+        url: String,
+        why: &'static str,
+    },
+    PageError {
+        url: String,
+        message: String,
+    },
+}
+
+struct Engine {
+    core: CoreCrawler,
+    rules: Mutex<Arc<Vec<Arc<Rule>>>>,
+    tags: Mutex<HashMap<u64, Tag>>,
+    next_id: AtomicU64,
+    base: Query,
+}
+
+impl Engine {
+    fn tags(&self) -> std::sync::MutexGuard<'_, HashMap<u64, Tag>> {
+        self.tags.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Queues the links a rule page gave, tagged with the rule that found
+    /// each.
+    fn submit_links(&self, rules: &[Arc<Rule>], links: Vec<(String, usize)>) {
+        for (url, at) in links {
+            let rule = &rules[at];
+            let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+            // Tagged first: the page could come back before submit returns.
+            self.tags().insert(
+                id,
+                Tag {
+                    rule: Some(at),
+                    apply_rules: rule.follow,
+                    to_python: rule.to_python,
+                    url: url.clone(),
+                },
+            );
+            let request = CrawlRequest {
+                id,
+                url,
+                priority: rule.priority,
+                headers: Vec::new(),
+                dont_filter: false,
+            };
+            if self.core.submit(request) != Submitted::Queued {
+                self.tags().remove(&id);
+            }
+        }
+    }
+
+    /// Parses a page and runs the rules on it. Runs on a blocking thread.
+    fn process(
+        &self,
+        rules: &[Arc<Rule>],
+        id: u64,
+        tag: Tag,
+        response: netweir_core::Response,
+    ) -> Processed {
+        let mut done = Processed {
+            id,
+            tag,
+            response,
+            root: None,
+            links: Vec::new(),
+            item: None,
+            error: None,
+        };
+        let doc = match Document::parse_within(&done.response.text(), PARSE_BUDGET) {
+            Ok(doc) => doc,
+            Err(e) => {
+                done.error = Some(e.to_string());
+                return done;
+            }
+        };
+        let root = doc.root();
+        if done.tag.apply_rules {
+            match self.links(rules, &done.response.url, root) {
+                Ok(links) => done.links = links,
+                Err(e) => done.error = Some(e),
+            }
+        }
+        if let Some(item) = done.tag.rule.and_then(|r| rules[r].item.as_ref()) {
+            done.item = Some(item.extract(root));
+        }
+        if done.tag.to_python {
+            done.root = Some(Arc::new(doc));
+        }
+        done
+    }
+
+    /// Every rule's links on the page, made absolute against its
+    /// `<base href>` and URL, as a browser resolves them.
+    fn links(
+        &self,
+        rules: &[Arc<Rule>],
+        page_url: &str,
+        root: netweir_dom::Node<'_>,
+    ) -> Result<Vec<(String, usize)>, String> {
+        let Ok(page) = Url::parse(page_url) else {
+            return Ok(Vec::new());
+        };
+        let base = self
+            .base
+            .strings(root)
+            .into_iter()
+            .next()
+            .and_then(|b| page.join(b.trim()).ok())
+            .unwrap_or(page);
+        let mut out = Vec::new();
+        for (at, rule) in rules.iter().enumerate() {
+            for href in extract::links(&rule.selector, root)? {
+                if let Ok(url) = base.join(href.trim()) {
+                    out.push((url.into(), at));
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// The next batch of events Python needs to see. Pages that only rules
+    /// care about are handled on the way, so an empty batch still means the
+    /// crawl is over.
+    async fn next(self: Arc<Self>, max: usize) -> Vec<Out> {
+        loop {
+            let events = self.core.next_owned(max).await;
+            if events.is_empty() {
+                return Vec::new();
+            }
+            let rules = self.rules.lock().unwrap_or_else(|e| e.into_inner()).clone();
+            let mut out = Vec::new();
+            let mut work = Vec::new();
+            for event in events {
+                match event {
+                    Event::Fetched { id, response } => match self.tags().remove(&id) {
+                        None => out.push(Out::Fetched {
+                            id,
+                            response,
+                            root: None,
+                        }),
+                        Some(tag) => {
+                            let (engine, rules) = (self.clone(), rules.clone());
+                            work.push(tokio::task::spawn_blocking(move || {
+                                engine.process(&rules, id, tag, response)
+                            }));
+                        }
+                    },
+                    Event::Failed { id, error } => match self.tags().remove(&id) {
+                        Some(Tag {
+                            rule: Some(rule),
+                            url,
+                            ..
+                        }) => out.push(Out::RuleFailed { rule, url, error }),
+                        _ => out.push(Out::Failed { id, error }),
+                    },
+                    Event::Dropped { id, reason } => {
+                        let why = match reason {
+                            DropReason::Robots => "robots",
+                            DropReason::TdmReserved => "tdm",
+                        };
+                        match self.tags().remove(&id) {
+                            Some(Tag {
+                                rule: Some(rule),
+                                url,
+                                ..
+                            }) => out.push(Out::RuleDropped { rule, url, why }),
+                            _ => out.push(Out::Dropped { id, why }),
+                        }
+                    }
+                }
+            }
+            for job in work {
+                let done = match job.await {
+                    Ok(done) => done,
+                    Err(e) => {
+                        out.push(Out::PageError {
+                            url: String::new(),
+                            message: format!("processing a page failed: {e}"),
+                        });
+                        continue;
+                    }
+                };
+                self.submit_links(&rules, done.links);
+                if let Some(message) = done.error {
+                    out.push(Out::PageError {
+                        url: done.tag.url.clone(),
+                        message,
+                    });
+                }
+                if let (Some(values), Some(rule)) = (done.item, done.tag.rule) {
+                    out.push(Out::Item { rule, values });
+                }
+                match (done.tag.rule, done.tag.to_python) {
+                    (Some(rule), true) => out.push(Out::Ruled {
+                        rule,
+                        url: done.tag.url,
+                        response: done.response,
+                        root: done.root,
+                    }),
+                    (None, true) => out.push(Out::Fetched {
+                        id: done.id,
+                        response: done.response,
+                        root: done.root,
+                    }),
+                    (None, false) => out.push(Out::Handled { id: done.id }),
+                    (Some(_), false) => {}
+                }
+            }
+            if !out.is_empty() {
+                return out;
+            }
+        }
+    }
+}
+
 /// One crawl: per-host queues, robots.txt and TDMRep checks, throttling and
 /// deduplication, all in Rust. Python submits requests by id and awaits
 /// `next()` for what happened to them.
 #[pyclass(frozen, module = "netweir")]
 pub struct Crawler {
-    inner: CoreCrawler,
+    engine: Arc<Engine>,
+}
+
+fn tuple<'py>(py: Python<'py>, items: Vec<Bound<'py, PyAny>>) -> PyResult<Bound<'py, PyAny>> {
+    Ok(PyTuple::new(py, items)?.into_any())
+}
+
+fn root_py<'py>(py: Python<'py>, root: Option<Arc<Document>>) -> PyResult<Bound<'py, PyAny>> {
+    Ok(match root {
+        Some(doc) => Py::new(py, Node::root_of(doc))?.into_bound(py).into_any(),
+        None => py.None().into_bound(py),
+    })
+}
+
+fn out_py<'py>(py: Python<'py>, engine: &Engine, event: Out) -> PyResult<Bound<'py, PyAny>> {
+    let s = |v: &str| -> PyResult<Bound<'py, PyAny>> { Ok(v.into_pyobject(py)?.into_any()) };
+    let n = |v: u64| -> PyResult<Bound<'py, PyAny>> { Ok(v.into_pyobject(py)?.into_any()) };
+    let response = |r| -> PyResult<Bound<'py, PyAny>> {
+        Ok(Py::new(py, Response::from(r))?.into_bound(py).into_any())
+    };
+    match event {
+        Out::Fetched {
+            id,
+            response: r,
+            root,
+        } => tuple(
+            py,
+            vec![s("fetched")?, n(id)?, response(r)?, root_py(py, root)?],
+        ),
+        Out::Failed { id, error } => tuple(
+            py,
+            vec![
+                s("failed")?,
+                n(id)?,
+                fetch_error_value(py, &error)?.into_bound(py),
+            ],
+        ),
+        Out::Dropped { id, why } => tuple(py, vec![s("dropped")?, n(id)?, s(why)?]),
+        Out::Handled { id } => tuple(py, vec![s("handled")?, n(id)?]),
+        Out::Item { rule, values } => {
+            let rules = engine
+                .rules
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone();
+            let item = rules[rule]
+                .item
+                .as_ref()
+                .expect("an item event has an item spec");
+            let (dict, invalid) = item.to_python(py, values)?;
+            tuple(
+                py,
+                vec![
+                    s("item")?,
+                    n(rule as u64)?,
+                    dict.into_any(),
+                    invalid.into_pyobject(py)?.into_any(),
+                ],
+            )
+        }
+        Out::Ruled {
+            rule,
+            url,
+            response: r,
+            root,
+        } => tuple(
+            py,
+            vec![
+                s("ruled")?,
+                n(rule as u64)?,
+                s(&url)?,
+                response(r)?,
+                root_py(py, root)?,
+            ],
+        ),
+        Out::RuleFailed { rule, url, error } => tuple(
+            py,
+            vec![
+                s("rule_failed")?,
+                n(rule as u64)?,
+                s(&url)?,
+                fetch_error_value(py, &error)?.into_bound(py),
+            ],
+        ),
+        Out::RuleDropped { rule, url, why } => tuple(
+            py,
+            vec![s("rule_dropped")?, n(rule as u64)?, s(&url)?, s(why)?],
+        ),
+        Out::PageError { url, message } => {
+            tuple(py, vec![s("page_error")?, s(&url)?, s(&message)?])
+        }
+    }
 }
 
 #[pymethods]
@@ -82,13 +466,53 @@ impl Crawler {
         let options = fetch_options(profile, proxy, timeout, verify)?;
         // The scheduler runs on the shared runtime.
         let _runtime = pyo3_async_runtimes::tokio::get_runtime().enter();
-        let inner =
+        let core =
             CoreCrawler::new(options, settings).map_err(|e| PyValueError::new_err(e.message))?;
-        Ok(Crawler { inner })
+        Ok(Crawler {
+            engine: Arc::new(Engine {
+                core,
+                rules: Mutex::new(Arc::new(Vec::new())),
+                tags: Mutex::new(HashMap::new()),
+                next_id: AtomicU64::new(RULE_IDS),
+                base: Query::new("base[href]::attr(href)").expect("a valid selector"),
+            }),
+        })
+    }
+
+    /// Adds a link rule and returns its number. `kind` is "css" or "xpath";
+    /// `item` is extracted from the pages it leads to; `follow` applies the
+    /// rules to those pages too; `to_python` hands them to Python as
+    /// "ruled" events.
+    #[pyo3(signature = (kind, query, item=None, follow=true, to_python=false, priority=0))]
+    fn add_rule(
+        &self,
+        kind: &str,
+        query: &str,
+        item: Option<&ItemSpec>,
+        follow: bool,
+        to_python: bool,
+        priority: i32,
+    ) -> PyResult<usize> {
+        let rule = Rule {
+            selector: selector(kind, query)?,
+            item: item.map(|i| i.inner.clone()),
+            follow,
+            to_python,
+            priority,
+        };
+        let mut rules = self.engine.rules.lock().unwrap_or_else(|e| e.into_inner());
+        let mut next = rules.as_ref().clone();
+        next.push(Arc::new(rule));
+        *rules = Arc::new(next);
+        Ok(rules.len() - 1)
     }
 
     /// Queues a request. Returns "queued", "duplicate" or "invalid".
-    #[pyo3(signature = (id, url, priority=0, headers=None, dont_filter=false))]
+    /// With `apply_rules`, the rules take links from the page; then the page
+    /// reaches Python only if `to_python`, and a "handled" event says so
+    /// otherwise.
+    #[pyo3(signature = (id, url, priority=0, headers=None, dont_filter=false, apply_rules=false, to_python=true))]
+    #[allow(clippy::too_many_arguments)]
     fn submit(
         &self,
         id: u64,
@@ -96,7 +520,23 @@ impl Crawler {
         priority: i32,
         headers: Option<Vec<(String, String)>>,
         dont_filter: bool,
-    ) -> &'static str {
+        apply_rules: bool,
+        to_python: bool,
+    ) -> PyResult<&'static str> {
+        if id >= RULE_IDS {
+            return Err(PyValueError::new_err("request ids must be below 2**62"));
+        }
+        if apply_rules {
+            self.engine.tags().insert(
+                id,
+                Tag {
+                    rule: None,
+                    apply_rules,
+                    to_python,
+                    url: url.clone(),
+                },
+            );
+        }
         let request = CrawlRequest {
             id,
             url,
@@ -104,69 +544,42 @@ impl Crawler {
             headers: headers.unwrap_or_default(),
             dont_filter,
         };
-        match self.inner.submit(request) {
+        let outcome = self.engine.core.submit(request);
+        if outcome != Submitted::Queued {
+            self.engine.tags().remove(&id);
+        }
+        Ok(match outcome {
             Submitted::Queued => "queued",
             Submitted::Duplicate => "duplicate",
             Submitted::Invalid => "invalid",
-        }
+        })
     }
 
-    /// Awaits up to `max` events as (kind, id, detail) tuples: ("fetched",
-    /// id, Response), ("failed", id, FetchError) or ("dropped", id,
-    /// "robots" | "tdm"). An empty list means the crawl is finished.
+    /// Awaits up to `max` events, as tuples: ("fetched", id, Response,
+    /// root Node or None), ("failed", id, FetchError), ("dropped", id,
+    /// "robots" | "tdm"), ("handled", id), ("item", rule, dict, [(field,
+    /// text)] that would not convert), ("ruled", rule, url, Response, root
+    /// Node), ("rule_failed", rule, url, FetchError), ("rule_dropped", rule,
+    /// url, reason) or ("page_error", url, message). An empty list means the
+    /// crawl is finished.
     #[pyo3(signature = (max=256))]
     fn next<'py>(&self, py: Python<'py>, max: usize) -> PyResult<Bound<'py, PyAny>> {
-        // The future owns a handle to the engine, so it doesn't borrow self.
-        let pending = self.inner.next_owned(max);
+        let engine = self.engine.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            let events = pending.await;
+            let events = engine.clone().next(max).await;
             Python::attach(|py| -> PyResult<Py<PyAny>> {
-                let mut out = Vec::with_capacity(events.len());
+                let list = PyList::empty(py);
                 for event in events {
-                    let item: Bound<'_, PyTuple> = match event {
-                        Event::Fetched { id, response } => PyTuple::new(
-                            py,
-                            [
-                                ("fetched").into_pyobject(py)?.into_any(),
-                                id.into_pyobject(py)?.into_any(),
-                                Py::new(py, Response::from(response))?
-                                    .into_bound(py)
-                                    .into_any(),
-                            ],
-                        )?,
-                        Event::Failed { id, error } => PyTuple::new(
-                            py,
-                            [
-                                ("failed").into_pyobject(py)?.into_any(),
-                                id.into_pyobject(py)?.into_any(),
-                                fetch_error_value(py, &error)?.into_bound(py),
-                            ],
-                        )?,
-                        Event::Dropped { id, reason } => {
-                            let why = match reason {
-                                DropReason::Robots => "robots",
-                                DropReason::TdmReserved => "tdm",
-                            };
-                            PyTuple::new(
-                                py,
-                                [
-                                    ("dropped").into_pyobject(py)?.into_any(),
-                                    id.into_pyobject(py)?.into_any(),
-                                    why.into_pyobject(py)?.into_any(),
-                                ],
-                            )?
-                        }
-                    };
-                    out.push(item);
+                    list.append(out_py(py, &engine, event)?)?;
                 }
-                Ok(pyo3::types::PyList::new(py, out)?.into_any().unbind())
+                Ok(list.into_any().unbind())
             })
         })
     }
 
     /// Counters so far.
     fn stats<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
-        let s = self.inner.stats();
+        let s = self.engine.core.stats();
         let d = PyDict::new(py);
         d.set_item("queued", s.queued)?;
         d.set_item("in_flight", s.in_flight)?;

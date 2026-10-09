@@ -23,9 +23,12 @@ class Page:
 
     __slots__ = ("_base", "_response", "_root", "request")
 
-    def __init__(self, response: Response, request: Request | None = None):
+    def __init__(
+        self, response: Response, request: Request | None = None, root: Node | None = None
+    ):
         self._response = response
-        self._root: Node | None = None
+        #: Parsed on first use, unless the crawl engine already parsed it.
+        self._root: Node | None = root
         self._base: str | None = None
         #: In a crawl, the Request this page answers.
         self.request = request

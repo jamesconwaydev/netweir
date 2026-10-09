@@ -255,6 +255,15 @@ class Crawler:
         max_delay: float = 60.0,
         target_concurrency: float = 1.0,
     ) -> None: ...
+    def add_rule(
+        self,
+        kind: Literal["css", "xpath"],
+        query: str,
+        item: ItemSpec | None = None,
+        follow: bool = True,
+        to_python: bool = False,
+        priority: int = 0,
+    ) -> int: ...
     def submit(
         self,
         id: int,
@@ -262,15 +271,42 @@ class Crawler:
         priority: int = 0,
         headers: list[tuple[str, str]] | None = None,
         dont_filter: bool = False,
+        apply_rules: bool = False,
+        to_python: bool = True,
     ) -> Literal["queued", "duplicate", "invalid"]: ...
     async def next(
         self, max: int = 256
     ) -> list[
-        tuple[Literal["fetched"], int, Response]
+        tuple[Literal["fetched"], int, Response, Node | None]
         | tuple[Literal["failed"], int, FetchError]
         | tuple[Literal["dropped"], int, Literal["robots", "tdm"]]
+        | tuple[Literal["handled"], int]
+        | tuple[Literal["item"], int, dict[str, Any], list[tuple[str, str]]]
+        | tuple[Literal["ruled"], int, str, Response, Node | None]
+        | tuple[Literal["rule_failed"], int, str, FetchError]
+        | tuple[Literal["rule_dropped"], int, str, Literal["robots", "tdm"]]
+        | tuple[Literal["page_error"], str, str]
     ]: ...
     def stats(self) -> dict[str, int]: ...
+
+class ItemSpec:
+    def __init__(
+        self,
+        name: str,
+        fields: list[
+            tuple[
+                str,
+                Literal["css", "xpath"],
+                str,
+                str | None,
+                bool,
+                bool,
+                Literal["text", "int", "float", "bool"],
+                object,
+            ]
+        ],
+    ) -> None: ...
+    def extract(self, node: Node) -> tuple[dict[str, Any], list[tuple[str, str]]]: ...
 
 class JsonlWriter:
     def __init__(self, path: str) -> None: ...
