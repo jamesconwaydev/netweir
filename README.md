@@ -335,6 +335,11 @@ The timeout bounds time, not memory. A small page built to abuse the HTML5
 spec's rules for misnested formatting tags can still make any spec-compliant
 parser allocate gigabytes; a cap on that comes with the crawler.
 
+## Documentation
+
+[docs/](docs/README.md) has a getting-started guide, a page for each part of
+netweir and every setting with its default.
+
 ## Building
 
 You need Rust, a C compiler, CMake and [uv](https://docs.astral.sh/uv/).
