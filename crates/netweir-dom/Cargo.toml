@@ -1,0 +1,12 @@
+[package]
+name = "netweir-dom"
+description = "HTML parsing and CSS queries for netweir, built on lexbor"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+links = "lexbor"
+
+[build-dependencies]
+cc = "1"
