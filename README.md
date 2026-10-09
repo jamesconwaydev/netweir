@@ -30,10 +30,12 @@ Working today:
 - CSS queries with Scrapy's `::text` and `::attr()`, all of XPath 1.0, and
   Beautiful Soup's `find_all` family, each faster than the library you'd
   otherwise use for it.
+- Crawling: spiders, robots.txt, per-site throttling, and items written
+  to JSON Lines, CSV or Parquet.
 
-Coming next, in order: crawling with spiders, robots.txt and throttling; declarative spiders that run entirely
-in Rust; self-healing selectors, block recovery and crash-safe resume; then
-a browser driver. The design is in [docs/design/v0.1.md](docs/design/v0.1.md).
+Coming next, in order: declarative spiders that run entirely in Rust;
+self-healing selectors, block recovery and crash-safe resume; then a
+browser driver. The design is in [docs/design/v0.1.md](docs/design/v0.1.md).
 
 ## Quick look
 
@@ -84,6 +86,58 @@ holding a quote comes out as `&quot;` where lxml would switch to single
 quotes; the elements and their order are the same. And attribute values are
 plain strings: `node["class"]` is `"star-rating Three"`, not Beautiful
 Soup's list. Filters still match one class out of several, as you'd expect.
+
+## Crawling a site
+
+A spider is a class with a `parse` method. It yields what it found and
+the links worth following:
+
+```python
+import netweir
+
+
+class Books(netweir.Spider):
+    start_urls = ["https://books.toscrape.com/"]
+
+    async def parse(self, page):
+        for book in page.css("article.product_pod"):
+            yield {
+                "title": book.css("h3 a::attr(title)").get(),
+                "price": book.css(".price_color::text").get(),
+                "url": page.urljoin(book.css("h3 a::attr(href)").get()),
+            }
+        if next_page := page.css("li.next a::attr(href)").get():
+            yield page.follow(next_page)
+```
+
+Run it from the shell, and the file extension picks the format:
+
+```
+netweir crawl books.py -o books.jsonl
+```
+
+That run fetched all 50 pages and wrote 1,000 books in 18 seconds, most of
+it spent waiting on purpose. Out of the box netweir reads each site's
+robots.txt and stays out of what it disallows, skips pages whose owners
+reserve text and data mining rights (TDMRep), and spaces its requests to
+each site by how quickly the site answers, backing off when it gets a 429.
+A page linked three different ways, or with `utm_` tags on the end, is
+fetched once.
+
+All of that is a setting when you need it to be:
+
+```python
+class Books(netweir.Spider):
+    settings = netweir.Settings(concurrency=128, per_domain=4, throttle=False)
+    pipelines = [drop_out_of_stock, netweir.export.parquet("books.parquet")]
+```
+
+A pipeline is any function, sync or async, that gets each item and returns
+it, changes it, or returns `None` to drop it. If you know Scrapy, the rest
+will look familiar: `Request` with `callback`, `errback`, `meta` and
+`priority`; `page.follow_all()`; `-s concurrency=16` on the command line.
+A callback that raises is logged with the URL and counted, and the crawl
+carries on unless you set `fail_fast=True`.
 
 ## Looking like a browser
 
@@ -190,5 +244,6 @@ uv run pytest
 AGPL-3.0. If that doesn't work for your company, a commercial licence is
 available. See NOTICE for the licences of what netweir bundles.
 
-Please use it the way you'd want your own site scraped. netweir obeys
-robots.txt once crawling lands; until then, that's on you.
+Please use it the way you'd want your own site scraped. Crawls obey
+robots.txt and TDMRep unless you switch that off, and netweir tells you when
+you have. A one-off `netweir.get()` checks neither; that's on you.
