@@ -5,5 +5,7 @@
 
 mod document;
 mod ffi;
+mod query;
 
 pub use document::{Document, Node, NodeId, NodeKind, ParseTimeout};
+pub use query::{Output, Query, QueryError};
