@@ -82,6 +82,43 @@ defines several; `-q` shows only warnings and errors. A mistake on the
 command line (an unknown setting, a bad value, a path that can't be
 written) exits with status 2 and one line saying why.
 
+## Callbacks in worker processes
+
+The engine fetches and parses in Rust, but a spider's callbacks take turns
+in one Python process. If yours do real work (heavy parsing, a model,
+decoding images), they hold the whole crawl to one core. Spread them over
+several:
+
+```python
+class Shop(netweir.Spider):
+    settings = netweir.Settings(workers=4)
+```
+
+or `-s workers=4` from the shell. The engine, your pipelines, exporters
+and the checkpoint stay in the main process; only callbacks move. You get
+the same items, with the same ids, as with one process, and a checkpointed
+crawl resumes the same way. `bench/workers.py` runs a spider whose
+callbacks do 10 ms of work each: four workers finish it 3.1 times faster
+than one, on a 12-core laptop.
+
+What changes:
+
+- Each worker builds its own spider from its class, so the class must be
+  defined at module level, or in the file you gave `netweir crawl`. A
+  script that runs a crawl with workers needs the usual
+  `if __name__ == "__main__":` guard, as anything using multiprocessing
+  does.
+- Attributes a callback sets on the spider stay in that worker. To count
+  or collect across pages, yield items and do it in a pipeline.
+- Callbacks are passed between processes by name, so they must be
+  methods of the spider (the same rule as a checkpoint).
+- Callbacks of browser requests run in the main process, where their live
+  `page.browser` is.
+
+Errors, warnings and tracked selectors work as they do in one process: a
+callback's exception is logged and counted (or stops the crawl, with
+`fail_fast`), and a relocated selector is reported once per crawl.
+
 ## Being polite
 
 By default netweir reads each site's robots.txt (RFC 9309) and stays out of

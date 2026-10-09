@@ -83,9 +83,18 @@ _reported: set[tuple[str, str, str]] = set()
 _crawl_reported: contextvars.ContextVar[set | None] = contextvars.ContextVar(
     "netweir_reported", default=None
 )
+#: In a worker process, where reports go instead of the log: to the main
+#: process, which says each once for the whole crawl.
+_report_sink: contextvars.ContextVar[Any] = contextvars.ContextVar(
+    "netweir_report_sink", default=None
+)
 
 
 def report(name: str, site: str, what: str, score: float | None, query: str = "") -> None:
+    sink = _report_sink.get()
+    if sink is not None:
+        sink((name, site, what, score, query))
+        return
     reported = _crawl_reported.get()
     if reported is None:
         reported = _reported

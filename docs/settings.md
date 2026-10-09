@@ -67,3 +67,4 @@ ignored. Times are in seconds.
 | `checkpoint` | `None` | a directory to keep the crawl's state in, so it resumes after a crash |
 | `track_threshold` | `0.75` | how similar an element must be to count as a tracked selector's element |
 | `fail_fast` | `False` | stop the crawl at the first exception in a callback or pipeline |
+| `workers` | `1` | processes to run callbacks in; see [Crawling](crawling.md#callbacks-in-worker-processes) |

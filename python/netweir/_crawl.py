@@ -78,6 +78,11 @@ class Settings:
     track_threshold: float = 0.75
     #: Stop the crawl at the first exception in a callback or pipeline.
     fail_fast: bool = False
+    #: Processes to run callbacks in. With more than one, the spider class
+    #: must be importable (defined at module level, or in the file given to
+    #: ``netweir crawl``), and callbacks run in worker processes while the
+    #: engine, pipelines and checkpoint stay in this one.
+    workers: int = 1
     #: Which requests are fetched in Chrome: "off" (only those that ask
     #: with ``browser=True``), "on_block" (also any still blocked after its
     #: retries, once) or "always".
@@ -110,6 +115,8 @@ class Settings:
             raise ValueError(f'browser must be "off", "on_block" or "always", not {self.browser!r}')
         if self.browser_pages < 1:
             raise ValueError("browser_pages must be at least 1")
+        if self.workers < 1:
+            raise ValueError("workers must be at least 1")
         # A list is fine to pass; stored as a tuple, as Settings is frozen.
         object.__setattr__(self, "proxies", tuple(self.proxies))
 
@@ -245,6 +252,8 @@ class _Run:
         self.pipelines = pipelines
         self.settings = spider.settings
         self.engine = self.settings._engine()
+        #: Worker processes for callbacks, with Settings.workers > 1.
+        self.pool: Any = None
         self.ids = itertools.count()
         self.waiting: dict[int, Request] = {}
         self.rules = list(spider.rules)
@@ -430,6 +439,11 @@ class _Run:
         started = time.monotonic()
         if not self.settings.obey_robots:
             log.warning("obey_robots is off: robots.txt is not being checked")
+        if self.settings.workers > 1:
+            from netweir import _workers
+
+            state = self.settings._checkpoint_file()
+            self.pool = _workers.Pool(self.spider, self.settings, state or _track.default_path())
         start = self.spider.start()
         if inspect.isasyncgen(start):
             async for request in start:
@@ -437,13 +451,21 @@ class _Run:
         else:
             for request in start:
                 self.submit(request)
-        while True:
-            events = await self.engine.next(256)
-            if not events:
-                break
-            for event in events:
-                await self.dispatch(event)
-            self.settle()
+        try:
+            while True:
+                events = await self.engine.next(256)
+                if not events:
+                    break
+                # With workers, the batch's callbacks all start now; their
+                # results are dealt with below, in the batch's order.
+                jobs = [self.send(event) for event in events]
+                for event, job in zip(events, jobs, strict=True):
+                    await self.dispatch(event, job)
+                self.settle()
+        finally:
+            if self.pool is not None:
+                self.pool.close()
+                self.pool = None
         await self.run_repairs()
         stats = {**self.engine.stats(), **self.counts}
         stats.pop("queued", None)
@@ -529,7 +551,36 @@ class _Run:
             if isinstance(stage, export.parquet):
                 stage.publish()
 
-    async def dispatch(self, event: tuple) -> None:
+    def send(self, event: tuple) -> Any:
+        """Starts the event's callback in a worker, if there are workers
+        and it's a page's callback that can run in one. The pending result,
+        or None."""
+        if self.pool is None or event[0] not in ("fetched", "ruled"):
+            return None
+        if event[0] == "fetched":
+            _, rid, response, _root, live = event
+            if live is not None:
+                return None  # a live Chrome page can't leave this process
+            request = self.waiting.get(rid)
+            if request is None:
+                return None
+            callback, default = request.callback, "parse"
+        else:
+            _, rule, url, response, _root, depth = event
+            callback, default = self.rules[rule].callback, None
+            request = Request(url, callback=callback, depth=depth)
+        try:
+            name = self.method_name(callback) or default
+            sent = dataclasses.replace(
+                request, callback=name, errback=self.method_name(request.errback)
+            )
+        except TypeError:
+            return None  # run here, where the error is reported as usual
+        if name is None:
+            return None
+        return self.pool.submit(name, response, sent)
+
+    async def dispatch(self, event: tuple, job: Any = None) -> None:
         kind = event[0]
         if kind == "item":
             _, rule, item, invalid, url, notes, html = event
@@ -549,6 +600,9 @@ class _Run:
             _, rule, url, response, root, depth = event
             callback = self.rules[rule].callback
             request = Request(url, callback=callback, depth=depth)
+            if job is not None:
+                await self.collect(job, callback, request, response.url)
+                return
             page = Page(response, request, root)
             await self.run_callback(callback, None, (page,), url)
         elif kind == "rule_failed":
@@ -584,7 +638,9 @@ class _Run:
         else:
             _, rid, detail, *rest = event
             request = self.waiting.pop(rid)
-            if kind == "fetched":
+            if kind == "fetched" and job is not None:
+                await self.collect(job, request.callback or "parse", request, detail.url)
+            elif kind == "fetched":
                 page = Page(detail, request, rest[0])
                 page.browser = rest[1]
                 if page.outcome == "payment_required":
@@ -635,6 +691,35 @@ class _Run:
             if self.settings.fail_fast:
                 raise
             log.exception("error in %s for %s", name, url)
+
+    async def collect(self, job: Any, fn: Any, request: Request, page_url: str) -> None:
+        """A worker's results for one page, dealt with as run_callback deals
+        with a callback's: same depth, same item ids, same counts."""
+        name = fn if isinstance(fn, str) else getattr(fn, "__name__", "parse")
+        self.depth = request.depth + 1
+        self.source = page_url
+        self.position = 0
+        try:
+            outputs, reports, repairs, error = await job
+        except Exception as e:  # noqa: BLE001 - a worker that died
+            outputs, reports, repairs, error = [], [], [], (e, "")
+        for report in reports:
+            _track.report(*report)
+        for repair in repairs:
+            self.ask_repair(*repair)
+        try:
+            for out in outputs:
+                await self.handle(out)
+            if error is not None:
+                raise error[0]
+        except Exception as e:
+            self.counts["callback_errors"] += 1
+            if self.settings.fail_fast:
+                raise
+            if error is not None and e is error[0] and error[1]:
+                log.error("error in %s for %s (in a worker)\n%s", name, request.url, error[1])
+            else:
+                log.exception("error in %s for %s", name, request.url)
 
     async def handle(self, out: Any) -> None:
         if out is None:

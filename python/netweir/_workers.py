@@ -1,0 +1,213 @@
+"""Callbacks in worker processes: ``Settings(workers=N)``.
+
+The main process keeps the engine, the checkpoint and the pipelines; a
+worker builds its own spider, runs one page's callback to the end and
+sends back everything it yielded. See docs/design/workers.md.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import importlib
+import importlib.util
+import inspect
+import logging
+import logging.handlers
+import multiprocessing
+import multiprocessing.connection
+import os
+import pickle
+import sys
+import threading
+import traceback
+from collections.abc import Iterable
+from concurrent.futures import ProcessPoolExecutor
+from typing import Any
+
+from netweir import _track
+from netweir._native import TrackStore
+from netweir._request import Request
+
+#: The spider this worker runs callbacks for.
+_spider: Any = None
+
+
+def spec_of(spider: Any) -> tuple[str, ...]:
+    """Where a worker finds the spider's class: a module, or the file
+    `netweir crawl` loaded it from."""
+    cls = type(spider)
+    if "<locals>" in cls.__qualname__:
+        raise TypeError(
+            f"with workers, the spider class {cls.__name__} must be defined at module level,"
+            " so worker processes can import it"
+        )
+    module = sys.modules.get(cls.__module__)
+    path = getattr(module, "__file__", None)
+    if cls.__module__.startswith("netweir_spider_") and path:
+        return ("file", path, cls.__module__, cls.__qualname__)
+    if cls.__module__ == "__main__":
+        # A spawned worker imports the main script as __mp_main__.
+        return ("module", "__mp_main__", cls.__qualname__)
+    return ("module", cls.__module__, cls.__qualname__)
+
+
+def _load(spec: tuple[str, ...]) -> type:
+    if spec[0] == "file":
+        _, path, name, qualname = spec
+        module = sys.modules.get(name)
+        if module is None:
+            loader = importlib.util.spec_from_file_location(name, path)
+            if loader is None or loader.loader is None:
+                raise ImportError(f"can't load {path}")
+            module = importlib.util.module_from_spec(loader)
+            sys.modules[name] = module
+            loader.loader.exec_module(module)
+    else:
+        _, name, qualname = spec
+        module = importlib.import_module(name)
+    found: Any = module
+    for part in qualname.split("."):
+        found = getattr(found, part)
+    return found
+
+
+def _start(
+    spec: tuple[str, ...],
+    settings: Any,
+    logs: Any,
+    level: int,
+    track_path: str,
+    threshold: float,
+) -> None:
+    """Sets a worker up: its logging goes to the main process, and it has
+    its own spider and the crawl's track store."""
+    # A main process killed outright (a crash, kill -9) can't shut its
+    # workers down: each watches it and goes with it.
+    parent = multiprocessing.parent_process()
+    if parent is not None:
+        threading.Thread(target=_outlive_not, args=(parent.sentinel,), daemon=True).start()
+    root = logging.getLogger()
+    root.handlers[:] = [logging.handlers.QueueHandler(logs)]
+    root.setLevel(level)
+    global _spider
+    _spider = _load(spec)()
+    _spider.settings = settings
+    _track._crawl.set((TrackStore(track_path), threshold))
+
+
+def _outlive_not(sentinel: Any) -> None:
+    multiprocessing.connection.wait([sentinel])
+    os._exit(1)
+
+
+def run(name: str, response: Any, request: Request) -> tuple:
+    """Runs the spider's callback `name` on a page, to the end. Returns
+    what it yielded (callbacks by name), what tracked selectors had to
+    report, the repairs they asked for, and the error it ended with, if
+    any: (exception, traceback text)."""
+    from netweir._fetch import Page
+
+    outputs: list[Any] = []
+    reports: list[tuple] = []
+    repairs: list[tuple] = []
+
+    def ask(site, field, kind, query, html, url):
+        repairs.append((site, field, kind, query, html() if callable(html) else html, url))
+
+    told = _track._report_sink.set(reports.append)
+    asking = _track._repairs.set(ask)
+    error = None
+    try:
+        result = getattr(_spider, name)(Page(response, request))
+        if inspect.isasyncgen(result):
+            asyncio.run(_drain(result, outputs))
+        else:
+            if inspect.isawaitable(result):
+                result = asyncio.run(_wait(result))
+            if result is not None:
+                many = isinstance(result, Iterable) and not isinstance(
+                    result, (dict, str, bytes, bytearray)
+                )
+                for out in result if many else [result]:
+                    outputs.append(out)
+    except Exception as e:  # noqa: BLE001 - the main process decides
+        error = (e, traceback.format_exc())
+    finally:
+        _track._repairs.reset(asking)
+        _track._report_sink.reset(told)
+    try:
+        outputs = [_portable(out) for out in outputs]
+        pickle.dumps(outputs)
+    except Exception as e:  # noqa: BLE001
+        outputs = []
+        error = (
+            TypeError(f"what {name} yielded can't go back to the main process: {e}"),
+            traceback.format_exc(),
+        )
+    if error is not None:
+        try:
+            pickle.dumps(error[0])
+        except Exception:  # noqa: BLE001 - not every exception pickles
+            error = (RuntimeError(repr(error[0])), error[1])
+    return outputs, reports, repairs, error
+
+
+async def _drain(results: Any, into: list[Any]) -> None:
+    async for out in results:
+        into.append(out)
+
+
+async def _wait(awaitable: Any) -> Any:
+    return await awaitable
+
+
+def _portable(out: Any) -> Any:
+    """A Request whose callbacks are this worker's spider's methods, by
+    name, as they must be to mean the same in the main process."""
+    if isinstance(out, Request):
+        out.callback = _name_of(out.callback)
+        out.errback = _name_of(out.errback)
+    return out
+
+
+def _name_of(fn: Any) -> str | None:
+    if fn is None or isinstance(fn, str):
+        return fn
+    name = getattr(fn, "__name__", None)
+    if name is not None and getattr(_spider, name, None) == fn:
+        return name
+    raise TypeError(
+        f"with workers, callbacks are passed by name, so {fn!r} must be a method of the spider"
+    )
+
+
+class Pool:
+    """The worker processes of one crawl, and their logging."""
+
+    def __init__(self, spider: Any, settings: Any, track_path: str):
+        spec = spec_of(spider)
+        context = multiprocessing.get_context("spawn")
+        self._logs = context.Queue()
+        self._listener = logging.handlers.QueueListener(self._logs, _Forward())
+        self._listener.start()
+        level = logging.getLogger("netweir").getEffectiveLevel()
+        self._executor = ProcessPoolExecutor(
+            max_workers=settings.workers,
+            mp_context=context,
+            initializer=_start,
+            initargs=(spec, settings, self._logs, level, track_path, settings.track_threshold),
+        )
+
+    def submit(self, name: str, response: Any, request: Request) -> asyncio.Future:
+        return asyncio.wrap_future(self._executor.submit(run, name, response, request))
+
+    def close(self) -> None:
+        self._executor.shutdown(wait=True, cancel_futures=True)
+        self._listener.stop()
+
+
+class _Forward(logging.Handler):
+    """Hands a worker's log records to the main process's loggers."""
+
+    def emit(self, record: logging.LogRecord) -> None:
+        logging.getLogger(record.name).handle(record)

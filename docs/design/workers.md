@@ -34,8 +34,10 @@ awaited, an async generator iterated) and sends back everything it
 yielded, in order. The main process then handles every page's results
 in the batch's own order, exactly as with one process: items through the
 pipelines with the same ids, requests submitted with the same depths.
-So `workers=4` writes the same output as `workers=1`, in the same order,
-and a checkpointed crawl resumes the same way.
+So `workers=4` writes the same items, with the same ids, as `workers=1`,
+and a checkpointed crawl resumes the same way. (Pages finish fetching in
+a different order from run to run either way, so the order of items in
+a file was never fixed.)
 
 A page goes to a worker as its response's parts (URL, status, version,
 headers, body) and its request; the worker builds the `Page` again and

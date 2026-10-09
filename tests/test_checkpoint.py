@@ -190,8 +190,10 @@ SPIDER = textwrap.dedent(
 )
 
 
-@pytest.mark.parametrize("output", ["items.jsonl", "items.csv"])
-def test_kill_9_at_random_points_loses_nothing_and_repeats_nothing(base, tmp_path, output):
+@pytest.mark.parametrize(
+    ("output", "workers"), [("items.jsonl", 1), ("items.csv", 1), ("items.jsonl", 2)]
+)
+def test_kill_9_at_random_points_loses_nothing_and_repeats_nothing(base, tmp_path, output, workers):
     script = tmp_path / "spider.py"
     script.write_text(SPIDER.format(base=base), encoding="utf-8")
     out = tmp_path / output
@@ -199,7 +201,7 @@ def test_kill_9_at_random_points_loses_nothing_and_repeats_nothing(base, tmp_pat
         sys.executable, "-m", "netweir", "crawl", str(script), "-q", "-o", str(out),
         "-s", "throttle=false", "-s", "start_delay=0", "-s", "obey_robots=false",
         "-s", "obey_tdmrep=false", "-s", "per_domain=1", "-s", "concurrency=1",
-        "-s", f"checkpoint={tmp_path / 'state'}",
+        "-s", f"checkpoint={tmp_path / 'state'}", "-s", f"workers={workers}",
     ]  # fmt: skip
     rng = random.Random(1234)
     kills = 0
