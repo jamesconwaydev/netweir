@@ -8,6 +8,7 @@
 //! with a relative `Location`.
 
 use std::io;
+use std::path::Path;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -62,10 +63,30 @@ impl Server {
         Server::bind(port, &[b"http/1.1"]).await
     }
 
+    /// Like `start_on` or `start_http1`, but with the certificate in
+    /// `dir` (see [`lasting_certificate`]), for a browser that has to be
+    /// told to trust it once rather than every run.
+    pub async fn start_trusted(port: u16, http1: bool, dir: &Path) -> io::Result<Server> {
+        let alpn: &[&[u8]] = if http1 {
+            &[b"http/1.1"]
+        } else {
+            &[b"h2", b"http/1.1"]
+        };
+        Server::bind_with(port, alpn, Some(lasting_certificate(dir)?)).await
+    }
+
     async fn bind(port: u16, alpn: &[&[u8]]) -> io::Result<Server> {
+        Server::bind_with(port, alpn, None).await
+    }
+
+    async fn bind_with(
+        port: u16,
+        alpn: &[&[u8]],
+        certificate: Option<(Vec<u8>, Vec<u8>)>,
+    ) -> io::Result<Server> {
         let listener = TcpListener::bind(("127.0.0.1", port)).await?;
         let port = listener.local_addr()?.port();
-        let acceptor = TlsAcceptor::from(Arc::new(tls_config(alpn)));
+        let acceptor = TlsAcceptor::from(Arc::new(tls_config(alpn, certificate)));
         let (tx, captures) = mpsc::unbounded_channel();
         let connections = Arc::new(AtomicU64::new(0));
         tokio::spawn(async move {
@@ -88,17 +109,73 @@ impl Server {
     }
 }
 
-fn tls_config(alpn: &[&[u8]]) -> rustls::ServerConfig {
+/// A certificate for `localhost` and `127.0.0.1` kept in `dir`, made the
+/// first time: `cert.pem` to trust, and the DER the server loads. It's
+/// valid for a year and marked for TLS servers, which macOS requires
+/// before it will trust one. Returns (certificate, key) as DER.
+pub fn lasting_certificate(dir: &Path) -> io::Result<(Vec<u8>, Vec<u8>)> {
+    let (cert_path, key_path) = (dir.join("cert.der"), dir.join("key.der"));
+    if let (Ok(cert), Ok(key)) = (std::fs::read(&cert_path), std::fs::read(&key_path)) {
+        return Ok((cert, key));
+    }
+    let failed = |e: rcgen::Error| io::Error::other(e.to_string());
     let names = vec!["localhost".to_string(), "127.0.0.1".to_string()];
-    let cert = rcgen::generate_simple_self_signed(names).expect("self-signed cert");
-    let key = rustls::pki_types::PrivateKeyDer::Pkcs8(cert.signing_key.serialize_der().into());
+    let mut params = rcgen::CertificateParams::new(names).map_err(failed)?;
+    let (year, month, day) = today();
+    params.not_before = rcgen::date_time_ymd(year, month, day);
+    params.not_after = rcgen::date_time_ymd(year + 1, month, day.min(28));
+    params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ServerAuth];
+    params
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, "netweir capture (localhost)");
+    let key = rcgen::KeyPair::generate().map_err(failed)?;
+    let cert = params.self_signed(&key).map_err(failed)?;
+    std::fs::create_dir_all(dir)?;
+    std::fs::write(dir.join("cert.pem"), cert.pem())?;
+    std::fs::write(&cert_path, cert.der())?;
+    std::fs::write(&key_path, key.serialize_der())?;
+    // The key is nobody else's business, test certificate or not.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600))?;
+    }
+    Ok((cert.der().to_vec(), key.serialize_der()))
+}
+
+/// Today's date, (year, month, day), in UTC.
+fn today() -> (i32, u8, u8) {
+    let days = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs() / 86_400) as i64;
+    // Days since 1970-01-01 to a civil date (Howard Hinnant's algorithm).
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe + era * 400 + i64::from(month <= 2);
+    (year as i32, month as u8, day as u8)
+}
+
+fn tls_config(alpn: &[&[u8]], certificate: Option<(Vec<u8>, Vec<u8>)>) -> rustls::ServerConfig {
+    let (cert_der, key_der) = certificate.unwrap_or_else(|| {
+        let names = vec!["localhost".to_string(), "127.0.0.1".to_string()];
+        let made = rcgen::generate_simple_self_signed(names).expect("self-signed cert");
+        (made.cert.der().to_vec(), made.signing_key.serialize_der())
+    });
+    let cert = rustls::pki_types::CertificateDer::from(cert_der);
+    let key = rustls::pki_types::PrivateKeyDer::Pkcs8(key_der.into());
     let mut config = rustls::ServerConfig::builder_with_provider(Arc::new(
         rustls::crypto::ring::default_provider(),
     ))
     .with_safe_default_protocol_versions()
     .expect("protocol versions")
     .with_no_client_auth()
-    .with_single_cert(vec![cert.cert.der().clone()], key)
+    .with_single_cert(vec![cert], key)
     .expect("certificate");
     config.alpn_protocols = alpn.iter().map(|p| p.to_vec()).collect();
     config
@@ -306,5 +383,30 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for Replay<S> {
     }
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
+
+#[cfg(test)]
+mod lasting {
+    use super::*;
+
+    #[test]
+    fn the_lasting_certificate_is_made_once_and_kept() {
+        let dir = std::env::temp_dir().join(format!("netweir-capture-cert-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let first = lasting_certificate(&dir).unwrap();
+        assert!(dir.join("cert.pem").is_file());
+        assert_eq!(
+            lasting_certificate(&dir).unwrap(),
+            first,
+            "kept, not made again"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn today_is_a_real_date() {
+        let (year, month, day) = today();
+        assert!(year >= 2026 && (1..=12).contains(&month) && (1..=31).contains(&day));
     }
 }
