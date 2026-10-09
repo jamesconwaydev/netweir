@@ -1,0 +1,127 @@
+#![allow(dead_code)]
+
+use std::path::PathBuf;
+
+/// The Chrome to test with, or None (and a note) when there isn't one, so
+/// the browser tests skip on machines without Chrome. CI sets
+/// NETWEIR_REQUIRE_CHROME to make that a failure instead.
+pub fn chrome() -> Option<PathBuf> {
+    match netweir_browser::find_chrome() {
+        Ok(path) => Some(path),
+        Err(e) if std::env::var_os("NETWEIR_REQUIRE_CHROME").is_some() => panic!("{e}"),
+        Err(e) => {
+            eprintln!("skipped: {e}");
+            None
+        }
+    }
+}
+
+use std::io::{BufRead, BufReader, Write};
+use std::net::TcpListener;
+use std::sync::{Arc, Mutex};
+
+pub struct Reply {
+    pub status: u16,
+    pub headers: Vec<(&'static str, String)>,
+    pub body: String,
+}
+
+pub fn html(body: &str) -> Reply {
+    Reply {
+        status: 200,
+        headers: vec![("Content-Type", "text/html; charset=utf-8".into())],
+        body: body.to_string(),
+    }
+}
+
+/// Each request's path and headers.
+pub type Seen = Arc<Mutex<Vec<(String, Vec<(String, String)>)>>>;
+
+/// A local HTTP/1.1 server for the given paths; anything else is a 404.
+/// Records each request's path and headers.
+pub struct Server {
+    pub url: String,
+    pub seen: Seen,
+}
+
+impl Server {
+    pub fn headers_for(&self, path: &str) -> Vec<(String, String)> {
+        self.seen
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|(p, _)| p == path)
+            .map(|(_, h)| h.clone())
+            .unwrap_or_default()
+    }
+}
+
+pub fn serve(routes: Vec<(&'static str, Reply)>) -> Server {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+    let routes = Arc::new(routes);
+    let seen: Seen = Arc::new(Mutex::new(Vec::new()));
+    let log = seen.clone();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            let routes = routes.clone();
+            let log = log.clone();
+            std::thread::spawn(move || {
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut line = String::new();
+                if reader.read_line(&mut line).is_err() {
+                    return;
+                }
+                let path = line.split(' ').nth(1).unwrap_or("/").to_string();
+                let mut headers = Vec::new();
+                loop {
+                    let mut h = String::new();
+                    if reader.read_line(&mut h).is_err() || h.trim().is_empty() {
+                        break;
+                    }
+                    if let Some((k, v)) = h.trim_end().split_once(':') {
+                        headers.push((k.trim().to_ascii_lowercase(), v.trim().to_string()));
+                    }
+                }
+                log.lock().unwrap().push((path.clone(), headers));
+                let missing = Reply {
+                    status: 404,
+                    headers: vec![("Content-Type", "text/html".into())],
+                    body: "<p>not here</p>".into(),
+                };
+                let reply = routes
+                    .iter()
+                    .find(|(p, _)| *p == path)
+                    .map(|(_, r)| r)
+                    .unwrap_or(&missing);
+                let mut out = format!(
+                    "HTTP/1.1 {} X\r\nContent-Length: {}\r\nConnection: close\r\n",
+                    reply.status,
+                    reply.body.len()
+                );
+                for (k, v) in &reply.headers {
+                    out.push_str(&format!("{k}: {v}\r\n"));
+                }
+                out.push_str("\r\n");
+                out.push_str(&reply.body);
+                let _ = stream.write_all(out.as_bytes());
+            });
+        }
+    });
+    Server { url, seen }
+}
+
+/// A headless browser for a test, or None when there's no Chrome.
+pub async fn browser() -> Option<netweir_browser::Browser> {
+    let executable = chrome()?;
+    Some(
+        netweir_browser::Browser::launch(netweir_browser::LaunchOptions {
+            executable: Some(executable),
+            timeout: std::time::Duration::from_secs(10),
+            ..Default::default()
+        })
+        .await
+        .unwrap(),
+    )
+}

@@ -26,6 +26,10 @@ crate = "netweir-core"
 allow = ["AGPL-3.0-only"]
 
 [[licenses.exceptions]]
+crate = "netweir-browser"
+allow = ["AGPL-3.0-only"]
+
+[[licenses.exceptions]]
 crate = "netweir-fingerprint"
 allow = ["AGPL-3.0-only"]
 

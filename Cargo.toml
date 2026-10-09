@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/netweir-dom", "crates/netweir-core", "crates/netweir-fingerprint", "crates/netweir-py"]
+members = ["crates/netweir-dom", "crates/netweir-core", "crates/netweir-browser", "crates/netweir-fingerprint", "crates/netweir-py"]
 
 [workspace.package]
 version = "0.1.0"

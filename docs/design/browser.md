@@ -221,10 +221,12 @@ for BiDi, so `netweir.browser(engine="firefox")` gives the same `Page`.
 ## Testing
 
 - A detection page served by the test server checks, from page script,
-  everything listed under the stealth rules: `navigator.webdriver`,
-  `Headless` in the user agent, the client hints, and the console getter
-  trick that catches `Runtime.enable`. The test fails if any of them
-  trips.
+  what the stealth rules promise: `navigator.webdriver`, `Headless` in the
+  user agent of the page and of a worker, and that the client hints,
+  high-entropy ones included, are there and agree; the server checks the
+  request headers too. The console trick that used to reveal
+  `Runtime.enable` (a getter on a logged error's stack) no longer fires in
+  Chrome 154, so that rule rests on the next test.
 - The protocol client records every method it sends in tests; a test
   drives a full session (navigate, click, fill, evaluate, screenshot) and
   asserts none of the forbidden methods went out.
