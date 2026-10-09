@@ -23,13 +23,21 @@ const BUILT_IN: &[(&str, &str)] = &[
         "firefox-156-macos",
         include_str!("../../../profiles/firefox-156-macos.toml"),
     ),
+    (
+        "safari-27-macos",
+        include_str!("../../../profiles/safari-27-macos.toml"),
+    ),
 ];
 
 /// What `profile="chrome"` means today.
 pub const DEFAULT: &str = "chrome-154-macos";
 
 /// The newest profile of each browser, by its short name.
-const LATEST: &[(&str, &str)] = &[("chrome", DEFAULT), ("firefox", "firefox-156-macos")];
+const LATEST: &[(&str, &str)] = &[
+    ("chrome", DEFAULT),
+    ("firefox", "firefox-156-macos"),
+    ("safari", "safari-27-macos"),
+];
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -48,6 +56,14 @@ pub struct Profile {
     /// orders them differently; empty means the same as `headers`.
     #[serde(default)]
     pub redirect_header_order: Vec<String>,
+    /// Among cookies of equal path length, the newest goes first (Safari);
+    /// otherwise the oldest, as Chrome and Firefox send them.
+    #[serde(default)]
+    pub cookies_newest_first: bool,
+    /// Once an https origin has answered over HTTP/1.1, later connections
+    /// to it offer only `http/1.1` in ALPN (Safari).
+    #[serde(default)]
+    pub remembers_http1: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]

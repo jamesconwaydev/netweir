@@ -15,7 +15,7 @@ ignored. Times are in seconds.
 
 | Setting | Default | Does |
 |---|---|---|
-| `profile` | `"chrome"` | the browser every request looks like: `"chrome"` or `"firefox"` (the newest of each), or a version such as `"firefox-156-macos"` |
+| `profile` | `"chrome"` | the browser every request looks like: `"chrome"`, `"firefox"` or `"safari"` (the newest of each), or a version such as `"safari-27-macos"` |
 | `proxy` | `None` | an `http://`, `https://` or `socks5://` proxy for every request |
 | `proxies` | `()` | proxies a site moves through each time it blocks a session |
 | `timeout` | `30.0` | the limit for one whole request |

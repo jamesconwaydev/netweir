@@ -22,9 +22,9 @@ of those words will mean when it is:
 
 Working today:
 
-- Fetching that is indistinguishable from Chrome 154 or Firefox 156 on the
-  wire, over HTTP/2 and HTTP/1.1, with cookies and redirects. Below: how that's
-  proved, and the one known exception.
+- Fetching that is indistinguishable from Chrome 154, Firefox 156 or
+  Safari 27 on the wire, over HTTP/2 and HTTP/1.1, with cookies and
+  redirects. Below: how that's proved, and the one known exception.
 - A parser that keeps pace with selectolax, the one to beat in Python, and
   pulls data out of the page faster.
 - CSS queries with Scrapy's `::text` and `::attr()`, all of XPath 1.0, and
@@ -46,7 +46,7 @@ Working today:
   cookies it earns back to the fast HTTP client. `netweir install chrome`
   fetches the Chrome it's tuned for.
 
-Coming next: a Safari profile and the 0.1 release. Firefox in the driver
+Coming next: the 0.1 release. Firefox in the driver
 waits for a Firefox that doesn't announce it's automated. The designs are
 in [docs/design/](docs/design/).
 
@@ -263,6 +263,11 @@ Firefox 156 is there too: `netweir.get(url, profile="firefox")`, or
 `profile="firefox"` in a spider's settings. Firefox sends its TLS extensions
 in a fixed order, with no GREASE, and the same test checks that order
 against a recording of the real browser, as well as everything above.
+
+So is Safari 27, as `profile="safari"`. It has two habits of its own, and
+netweir copies both. Two cookies with the same path go out newest first.
+And once a site has answered over HTTP/1.1, Safari stops offering it
+HTTP/2 on new connections, so netweir does the same.
 
 One known difference: Chrome sends a `priority` header only over HTTP/2,
 and netweir can't tell a server lacks HTTP/2 until it has answered once. So

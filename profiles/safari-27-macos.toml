@@ -1,0 +1,116 @@
+# Safari 27 on macOS, as a top-level navigation.
+#
+# Written from profiles/safari-27-macos.capture.json and
+# safari-27-macos.http1.capture.json, which the capture tool recorded from
+# Safari 27.0 over HTTP/2 and HTTP/1.1, driven through safaridriver through
+# the same four navigations as the other profiles: a page that sets a
+# cookie, a revisit, a cross-site redirect and a same-site redirect.
+# netweir-core's fingerprint test replays them and fails if any request
+# differs, extension order included.
+
+name = "safari-27-macos"
+
+# Sent on every request, in this order and with this capitalisation, unless
+# the caller overrides one. Safari sends Priority over HTTP/1.1 as well as
+# HTTP/2, no Upgrade-Insecure-Requests, and Connection last.
+headers = [
+    ["Host", ""],
+    ["Sec-Fetch-Dest", "document"],
+    ["User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/27.0 Safari/605.1.15"],
+    ["Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"],
+    ["Sec-Fetch-Site", "none"],
+    ["Sec-Fetch-Mode", "navigate"],
+    ["Accept-Language", "en-US,en;q=0.9"],
+    ["Priority", "u=0, i"],
+    ["Accept-Encoding", "gzip, deflate, br, zstd"],
+    ["Cookie", ""],
+    ["Connection", "keep-alive"],
+]
+
+# Safari sends cookies of equal path length newest first, and once an origin
+# has answered over HTTP/1.1, offers it only http/1.1 from then on.
+cookies_newest_first = true
+remembers_http1 = true
+
+# After a redirect, Safari puts Accept first and Sec-Fetch-Dest later.
+redirect_header_order = [
+    "Host",
+    "Accept",
+    "Sec-Fetch-Site",
+    "Sec-Fetch-Mode",
+    "User-Agent",
+    "Accept-Language",
+    "Sec-Fetch-Dest",
+    "Priority",
+    "Accept-Encoding",
+    "Cookie",
+    "Connection",
+]
+
+[tls]
+ciphers = [
+    "TLS_AES_256_GCM_SHA384",
+    "TLS_CHACHA20_POLY1305_SHA256",
+    "TLS_AES_128_GCM_SHA256",
+    "ECDHE-ECDSA-AES256-GCM-SHA384",
+    "ECDHE-ECDSA-AES128-GCM-SHA256",
+    "ECDHE-ECDSA-CHACHA20-POLY1305",
+    "ECDHE-RSA-AES256-GCM-SHA384",
+    "ECDHE-RSA-AES128-GCM-SHA256",
+    "ECDHE-RSA-CHACHA20-POLY1305",
+    "ECDHE-ECDSA-AES256-SHA",
+    "ECDHE-ECDSA-AES128-SHA",
+    "ECDHE-RSA-AES256-SHA",
+    "ECDHE-RSA-AES128-SHA",
+    "AES256-GCM-SHA384",
+    "AES128-GCM-SHA256",
+    "AES256-SHA",
+    "AES128-SHA",
+    "ECDHE-ECDSA-DES-CBC3-SHA",
+    "ECDHE-RSA-DES-CBC3-SHA",
+    "DES-CBC3-SHA",
+]
+# Safari puts AES-256 before ChaCha20 and AES-128.
+preserve_tls13_cipher_order = true
+groups = ["X25519MLKEM768", "X25519", "P-256", "P-384", "P-521"]
+key_shares = ["X25519MLKEM768", "X25519"]
+# rsa_pss_rsae_sha384 twice, as Safari sends it.
+signature_algorithms = [
+    "ecdsa_secp256r1_sha256",
+    "rsa_pss_rsae_sha256",
+    "rsa_pkcs1_sha256",
+    "ecdsa_secp384r1_sha384",
+    "rsa_pss_rsae_sha384",
+    "rsa_pss_rsae_sha384",
+    "rsa_pkcs1_sha384",
+    "rsa_pss_rsae_sha512",
+    "rsa_pkcs1_sha512",
+    "rsa_pkcs1_sha1",
+]
+alpn = ["h2", "http/1.1"]
+alps = []
+alps_new_codepoint = false
+certificate_compression = ["zlib"]
+# GREASE in the ciphers, extensions, groups and versions, but not the
+# signature algorithms; and the extensions in this fixed order (server_name,
+# extended_master_secret, renegotiation_info, supported_groups,
+# ec_point_formats, ALPN, status_request, signature_algorithms,
+# signed_certificate_timestamp, key_share, psk_key_exchange_modes,
+# supported_versions, compress_certificate), between a GREASE extension
+# first and another last. No session ticket extension.
+grease = true
+grease_signature_algorithms = false
+permute_extensions = false
+extension_order = [0, 23, 65281, 10, 11, 16, 5, 13, 18, 51, 45, 43, 27]
+ech_grease = false
+ocsp_stapling = true
+signed_certificate_timestamps = true
+session_ticket = false
+pre_shared_key = true
+
+[http2]
+# (setting id, value) in the order Safari sends them; 9 is
+# SETTINGS_NO_RFC7540_PRIORITIES.
+settings = [[2, 0], [3, 100], [4, 2097152], [9, 1]]
+window_update = 10420225
+pseudo_header_order = ["method", "scheme", "authority", "path"]
