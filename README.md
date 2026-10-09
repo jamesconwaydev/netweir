@@ -38,11 +38,12 @@ Working today:
   resume after a crash, and selectors that find their element again after
   a redesign.
 - A Chrome driver for pages that need JavaScript: click, type and wait
-  like Playwright, then read the page with netweir's selectors.
+  like Playwright, then read the page with netweir's selectors. In a
+  crawl, it can take over a request a site keeps blocking, and hand the
+  cookies it earns back to the fast HTTP client.
 
-Coming next, in order: a Safari profile and the 0.1 release; a browser
-that steps in when a crawl gets blocked; then Firefox in the driver. The
-designs are in [docs/design/](docs/design/).
+Coming next, in order: a Safari profile and the 0.1 release, then Firefox
+in the driver. The designs are in [docs/design/](docs/design/).
 
 ## Quick look
 
@@ -198,9 +199,11 @@ challenge that comes back as a 403 isn't mistaken for a page. A blocked
 request is tried again with a new session (an empty cookie jar, and the next
 of your `proxies` if you gave several), and the site is slowed down. A
 server error is retried with backoff, a 429's Retry-After is honoured, and a
-site that keeps blocking is paused for a while instead of hammered. If a
-request is still blocked after all that, your spider's `on_block(request,
-page)` hears about it. Outside a crawl, `netweir.get` raises
+site that keeps blocking is paused for a while instead of hammered. With
+`browser="on_block"`, a request still blocked after all that gets one go in
+Chrome, which waits for the challenge to pass and then hands its cookies to
+the HTTP client, so the rest of the site doesn't need Chrome. If even that
+fails, your spider's `on_block(request, page)` hears about it. Outside a crawl, `netweir.get` raises
 `netweir.Blocked`, naming the vendor.
 
 **The crawl dies.** Give it somewhere to keep its state and run it again

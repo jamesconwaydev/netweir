@@ -425,3 +425,38 @@ async fn an_endless_timeout_is_capped_not_a_panic() {
         .unwrap();
     browser.close().await.unwrap();
 }
+
+#[tokio::test]
+async fn wait_for_navigation_follows_a_script_that_moves_the_page_on() {
+    let Some(browser) = browser().await else {
+        return;
+    };
+    let server = serve(vec![
+        (
+            "/",
+            html("<script>setTimeout(() => location.href = '/next', 300)</script>"),
+        ),
+        ("/next", html("<title>next</title>")),
+    ]);
+    let page = browser.new_page().await.unwrap();
+    let first = page
+        .goto(&format!("{}/", server.url), WaitUntil::Load, None)
+        .await
+        .unwrap();
+    assert_eq!(first.url, format!("{}/", server.url));
+    let next = page
+        .wait_for_navigation(WaitUntil::Load, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        (next.status, next.url.clone()),
+        (200, format!("{}/next", server.url))
+    );
+    assert_eq!(page.response(), next);
+    let err = page
+        .wait_for_navigation(WaitUntil::Load, SHORT)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, Error::Timeout(_)), "{err}");
+    browser.close().await.unwrap();
+}

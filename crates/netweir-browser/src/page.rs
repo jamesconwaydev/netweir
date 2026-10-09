@@ -209,6 +209,18 @@ impl State {
         }
     }
 
+    /// Whether a document committed after `loader`'s has reached `event`.
+    fn reached_after(&self, loader: &str, event: &str) -> bool {
+        let Some(at) = self.committed.iter().position(|l| l == loader) else {
+            return false;
+        };
+        self.committed[at + 1..].iter().any(|l| {
+            self.events
+                .get(l)
+                .is_some_and(|e| e.iter().any(|n| n == event))
+        })
+    }
+
     /// Whether `loader`'s navigation, or one that replaced it, has reached
     /// `event`.
     fn reached(&self, loader: &str, event: &str) -> bool {
@@ -392,6 +404,30 @@ impl Page {
         )
         .await?;
         Ok(self.response_for(Some(&loader)))
+    }
+
+    /// The response of the document the page shows now.
+    pub fn response(&self) -> Response {
+        self.response_for(None)
+    }
+
+    /// Waits for the page's next navigation, one that starts after this
+    /// call (a script's redirect, a form, a challenge passing), to reach
+    /// `wait`. Returns its response.
+    pub async fn wait_for_navigation(
+        &self,
+        wait: WaitUntil,
+        timeout: Option<Duration>,
+    ) -> Result<Response> {
+        let current = self.state().loader.clone();
+        let event = wait.event();
+        self.until(
+            || format!("{event} of a navigation away from {}", self.url()),
+            self.timeout(timeout),
+            |s| s.reached_after(&current, event),
+        )
+        .await?;
+        Ok(self.response_for(None))
     }
 
     fn response_for(&self, loader: Option<&str>) -> Response {

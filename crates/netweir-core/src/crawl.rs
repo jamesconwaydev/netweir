@@ -7,13 +7,15 @@ use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use tokio::sync::Notify;
+use netweir_browser::{Browser, Cookie, LaunchOptions, WaitUntil};
+use tokio::sync::{Notify, OnceCell, OwnedSemaphorePermit, Semaphore};
 use url::Url;
 
 use crate::canonical::{Fingerprint, fingerprint};
 use crate::checkpoint::{Checkpoint, Pending, Saved};
 use crate::classify::{BlockKind, Outcome, classify};
 use crate::fetch::{FetchError, FetchErrorKind, FetchOptions, Fetcher, Hop, Response};
+use crate::profile::Profile;
 use crate::robots::Robots;
 use crate::tdmrep::{self, Reservation, TdmFile};
 use crate::traps;
@@ -58,6 +60,24 @@ pub struct CrawlSettings {
     pub breaker_pause: Duration,
     /// A file to keep the crawl's state in, so it resumes after a crash.
     pub checkpoint: Option<std::path::PathBuf>,
+    /// Which requests go through Chrome rather than the HTTP client.
+    pub browser: BrowserMode,
+    /// Chrome pages open at once.
+    pub browser_pages: usize,
+    /// How Chrome is started, the first time a request needs it.
+    pub browser_launch: LaunchOptions,
+}
+
+/// Which requests a crawl fetches in Chrome.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum BrowserMode {
+    /// Only those that ask for it.
+    #[default]
+    Off,
+    /// Those that ask, and any still blocked after its retries, once.
+    OnBlock,
+    /// Every request.
+    Always,
 }
 
 impl Default for CrawlSettings {
@@ -83,6 +103,9 @@ impl Default for CrawlSettings {
             breaker_ratio: 0.3,
             breaker_pause: Duration::from_secs(300),
             checkpoint: None,
+            browser: BrowserMode::Off,
+            browser_pages: 4,
+            browser_launch: LaunchOptions::default(),
         }
     }
 }
@@ -99,6 +122,8 @@ pub struct CrawlRequest {
     pub dont_filter: bool,
     /// Links followed to get here from a start page (which is 0).
     pub depth: u32,
+    /// Fetch it in Chrome.
+    pub browser: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -129,6 +154,8 @@ pub enum Event {
     Fetched {
         id: u64,
         response: Response,
+        /// For a request fetched in Chrome, the page, still open.
+        page: Option<LivePage>,
     },
     Failed {
         id: u64,
@@ -150,6 +177,56 @@ pub enum Event {
         host: String,
         pause: Duration,
     },
+    /// Something the caller should hear about, once.
+    Warning {
+        message: String,
+    },
+}
+
+/// A page still open in Chrome after a browser fetch. Closing it, or
+/// dropping the last clone, closes the page and frees its place among
+/// `browser_pages`.
+#[derive(Clone)]
+pub struct LivePage {
+    inner: Arc<Live>,
+}
+
+struct Live {
+    page: netweir_browser::Page,
+    permit: Mutex<Option<OwnedSemaphorePermit>>,
+    runtime: tokio::runtime::Handle,
+}
+
+impl LivePage {
+    pub fn page(&self) -> &netweir_browser::Page {
+        &self.inner.page
+    }
+
+    pub async fn close(&self) {
+        let _ = self.inner.page.close().await;
+        self.inner
+            .permit
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
+    }
+}
+
+impl Drop for Live {
+    fn drop(&mut self) {
+        if !self.page.is_closed() {
+            let page = self.page.clone();
+            self.runtime.spawn(async move {
+                let _ = page.close().await;
+            });
+        }
+    }
+}
+
+impl std::fmt::Debug for LivePage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "LivePage({})", self.inner.page.url())
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -173,6 +250,10 @@ pub struct Stats {
     pub throttled: u64,
     pub sessions_replaced: u64,
     pub breaker_trips: u64,
+    /// Pages fetched in Chrome.
+    pub browser_fetches: u64,
+    /// Requests blocked over HTTP that Chrome got through.
+    pub browser_unblocked: u64,
 }
 
 /// A crawl in progress. Dropping it stops the scheduler; fetches already
@@ -196,6 +277,11 @@ struct Shared {
     schedule: Notify,
     /// Woken when an event arrives or the crawl may have finished.
     events: Notify,
+    /// Chrome, started the first time a request needs it.
+    browser: OnceCell<Result<Browser, String>>,
+    /// Places for open Chrome pages.
+    pages: Arc<Semaphore>,
+    runtime: tokio::runtime::Handle,
 }
 
 #[derive(Default)]
@@ -217,6 +303,8 @@ struct State {
     gate_fetches: usize,
     stats: Stats,
     closed: bool,
+    /// Whether the crawl was told no HTTP profile matches its Chrome.
+    warned_profile: bool,
 }
 
 struct Host {
@@ -265,6 +353,11 @@ struct Queued {
     hops: usize,
     /// Tries already made.
     attempts: u32,
+    /// Fetch it in Chrome.
+    in_browser: bool,
+    /// Blocked over HTTP and sent to Chrome: what the block was, for
+    /// on_block if Chrome doesn't get through either.
+    blocked: Option<Box<(String, BlockKind, Response)>>,
 }
 
 impl PartialEq for Queued {
@@ -301,6 +394,7 @@ impl Crawler {
             }
             None => (None, None),
         };
+        let settings_pages = settings.browser_pages.max(1);
         let shared = Arc::new(Shared {
             fetcher: Fetcher::new(fetch.clone())?,
             checkpoint,
@@ -311,6 +405,9 @@ impl Crawler {
             state: Mutex::new(state),
             schedule: Notify::new(),
             events: Notify::new(),
+            browser: OnceCell::new(),
+            pages: Arc::new(Semaphore::new(settings_pages)),
+            runtime: tokio::runtime::Handle::current(),
         });
         tokio::spawn(schedule_loop(shared.clone()));
         Ok(Crawler { shared })
@@ -394,6 +491,13 @@ impl Crawler {
             cp.close();
         }
         flushed
+    }
+
+    /// Closes Chrome, if the crawl started it.
+    pub async fn close_browser(&self) {
+        if let Some(Ok(browser)) = self.shared.browser.get() {
+            let _ = browser.close().await;
+        }
     }
 
     fn admit(&self, request: CrawlRequest, persist: Persist<'_>) -> Submitted {
@@ -518,6 +622,12 @@ impl Drop for Crawler {
         if let Some(cp) = &self.shared.checkpoint {
             cp.close();
         }
+        if let Some(Ok(browser)) = self.shared.browser.get() {
+            let browser = browser.clone();
+            self.shared.runtime.spawn(async move {
+                let _ = browser.close().await;
+            });
+        }
     }
 }
 
@@ -541,7 +651,7 @@ impl Shared {
                 reason: DropReason::TdmReserved,
                 ..
             } => state.stats.dropped_tdm += 1,
-            Event::Blocked { .. } | Event::Paused { .. } => {}
+            Event::Blocked { .. } | Event::Paused { .. } | Event::Warning { .. } => {}
         }
         state.events.push_back(event);
         self.events.notify_waiters();
@@ -556,7 +666,7 @@ enum Persist<'a> {
 
 /// What the scheduler decided to do with a host's next request.
 enum Action {
-    Fetch(Queued, Fetcher),
+    Fetch(Box<Queued>, Fetcher),
     CheckRobots(String),
     CheckTdm(String),
     /// Another host's check of the same origin is under way.
@@ -578,8 +688,11 @@ async fn schedule_loop(s: Arc<Shared>) {
         };
         for action in actions {
             match action {
+                Action::Fetch(q, _) if q.in_browser => {
+                    tokio::spawn(browser_fetch(s.clone(), *q));
+                }
                 Action::Fetch(q, session) => {
-                    tokio::spawn(fetch(s.clone(), q, session));
+                    tokio::spawn(fetch(s.clone(), *q, session));
                 }
                 Action::CheckRobots(origin) => {
                     tokio::spawn(check_robots(s.clone(), origin));
@@ -629,6 +742,7 @@ fn enqueue(
     };
     request.url = url.to_string();
     state.seq += 1;
+    let in_browser = request.browser || settings.browser == BrowserMode::Always;
     let queued = Queued {
         priority: request.priority,
         seq: state.seq,
@@ -638,6 +752,8 @@ fn enqueue(
         path,
         hops,
         attempts: 0,
+        in_browser,
+        blocked: None,
     };
     state
         .hosts
@@ -813,7 +929,7 @@ fn plan(
                 .session
                 .clone()
                 .unwrap_or_else(|| shared.fetcher.clone());
-            actions.push(Action::Fetch(q, session));
+            actions.push(Action::Fetch(Box::new(q), session));
         }
     }
     let sleep_until = state.timers.peek().map(|Reverse((at, _))| *at);
@@ -888,6 +1004,12 @@ async fn fetch(shared: Arc<Shared>, mut q: Queued, session: Fetcher) {
             if can_retry {
                 retry(settings, &mut state, q);
                 None
+            } else if settings.browser == BrowserMode::OnBlock {
+                // One more go, in Chrome.
+                q.in_browser = true;
+                q.blocked = Some(Box::new((vendor, kind, response)));
+                retry(settings, &mut state, q);
+                None
             } else {
                 Some(Event::Blocked {
                     id: q.request.id,
@@ -915,6 +1037,7 @@ async fn fetch(shared: Arc<Shared>, mut q: Queued, session: Fetcher) {
                 Some(Event::Fetched {
                     id: q.request.id,
                     response,
+                    page: None,
                 })
             }
         }
@@ -935,6 +1058,7 @@ async fn fetch(shared: Arc<Shared>, mut q: Queued, session: Fetcher) {
                 Some(Event::Fetched {
                     id: q.request.id,
                     response,
+                    page: None,
                 })
             }
         }
@@ -976,6 +1100,292 @@ async fn fetch(shared: Arc<Shared>, mut q: Queued, session: Fetcher) {
     }
     drop(state);
     shared.schedule.notify_one();
+}
+
+/// How long a challenge page gets to pass and move on in Chrome.
+const CHALLENGE_WAIT: Duration = Duration::from_secs(20);
+
+/// Fetches `q` in Chrome, and deals with the outcome as `fetch` does for
+/// the HTTP client. A page that's still blocked isn't retried there.
+async fn browser_fetch(shared: Arc<Shared>, mut q: Queued) {
+    let started = Instant::now();
+    let rendered = guarded(
+        render(shared.clone(), q.request.url.clone(), q.blocked.is_some()),
+        |why| {
+            Err(FetchError {
+                kind: FetchErrorKind::Other,
+                message: format!("the browser fetch failed inside netweir: {why}"),
+            })
+        },
+    )
+    .await;
+    let latency = started.elapsed();
+    let settings = &shared.settings;
+    let outcome = rendered.as_ref().ok().map(|(r, _, _)| classify(r));
+    let mut state = shared.lock();
+    state.stats.in_flight -= 1;
+    if let Some(host) = state.hosts.get_mut(&q.host) {
+        host.in_flight -= 1;
+        if settings.throttle {
+            let status = rendered.as_ref().ok().map(|(r, _, _)| r.status);
+            host.delay = adjust_delay(settings, host.delay, latency, status);
+        }
+    }
+    if let Some(outcome) = &outcome {
+        state.stats.browser_fetches += 1;
+        breaker(
+            &shared,
+            &mut state,
+            &q.host,
+            matches!(outcome, Outcome::Blocked { .. }),
+        );
+    }
+    state.make_ready(&q.host);
+    let event = match (rendered, outcome) {
+        (Ok((response, _page, _)), Some(Outcome::Blocked { vendor, kind })) => {
+            state.stats.blocked += 1;
+            slow_down(settings, &mut state, &q.host, None, true);
+            Some(Event::Blocked {
+                id: q.request.id,
+                vendor,
+                kind,
+                response,
+            })
+        }
+        (Ok((response, page, cookies)), outcome) => {
+            if q.blocked.is_some() && matches!(outcome, Some(Outcome::Ok)) {
+                state.stats.browser_unblocked += 1;
+                if let Some(message) = hand_back(&shared, &mut state, &q.host, &cookies) {
+                    shared.push_event(&mut state, Event::Warning { message });
+                }
+            }
+            if settings.obey_tdmrep && page_reserved(&state, &q, &response) {
+                Some(Event::Dropped {
+                    id: q.request.id,
+                    reason: DropReason::TdmReserved,
+                })
+            } else {
+                Some(Event::Fetched {
+                    id: q.request.id,
+                    response,
+                    page: Some(page),
+                })
+            }
+        }
+        (Err(error), _) if q.attempts < settings.retries && transient(&error) => {
+            retry(settings, &mut state, q);
+            None
+        }
+        (Err(error), _) => match q.blocked.take() {
+            // Chrome didn't get anywhere: it's still the block it was.
+            Some(blocked) => {
+                let (vendor, kind, response) = *blocked;
+                Some(Event::Blocked {
+                    id: q.request.id,
+                    vendor,
+                    kind,
+                    response,
+                })
+            }
+            None => Some(Event::Failed {
+                id: q.request.id,
+                error,
+            }),
+        },
+    };
+    if let Some(event) = event {
+        shared.push_event(&mut state, event);
+    }
+    drop(state);
+    shared.schedule.notify_one();
+}
+
+/// Loads `url` in a new Chrome page and reads it back. A challenge page is
+/// given time to pass and move on. With `cookies`, also returns the
+/// page's cookies.
+async fn render(
+    shared: Arc<Shared>,
+    url: String,
+    cookies: bool,
+) -> Result<(Response, LivePage, Vec<Cookie>), FetchError> {
+    let permit = shared
+        .pages
+        .clone()
+        .acquire_owned()
+        .await
+        .map_err(|_| browser_error(netweir_browser::Error::Closed))?;
+    let launch = browser_launch(&shared)?;
+    let browser = shared
+        .browser
+        .get_or_init(|| async move { Browser::launch(launch).await.map_err(|e| e.to_string()) })
+        .await
+        .clone()
+        .map_err(|e| FetchError {
+            kind: FetchErrorKind::Other,
+            message: format!("can't start Chrome: {e}"),
+        })?;
+    let page = browser.new_page().await.map_err(browser_error)?;
+    let live = LivePage {
+        inner: Arc::new(Live {
+            page: page.clone(),
+            permit: Mutex::new(Some(permit)),
+            runtime: shared.runtime.clone(),
+        }),
+    };
+    let timeout = shared.options.timeout;
+    let mut document = page
+        .goto(&url, WaitUntil::Load, Some(timeout))
+        .await
+        .map_err(browser_error)?;
+    let mut response = rendered(&document, page.content().await.map_err(browser_error)?);
+    let deadline = Instant::now() + CHALLENGE_WAIT.min(timeout);
+    while matches!(
+        classify(&response),
+        Outcome::Blocked {
+            kind: BlockKind::Challenge,
+            ..
+        }
+    ) {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            break;
+        }
+        match page.wait_for_navigation(WaitUntil::Load, Some(left)).await {
+            Ok(next) => document = next,
+            Err(_) => break,
+        }
+        response = rendered(&document, page.content().await.map_err(browser_error)?);
+    }
+    let cookies = if cookies {
+        page.cookies().await.map_err(browser_error)?
+    } else {
+        Vec::new()
+    };
+    Ok((response, live, cookies))
+}
+
+/// How to start Chrome for this crawl: through the crawl's proxy, so the
+/// cookies Chrome earns come from the address the HTTP client uses.
+fn browser_launch(shared: &Shared) -> Result<LaunchOptions, FetchError> {
+    let mut launch = shared.settings.browser_launch.clone();
+    if let Some(proxy) = &shared.options.proxy {
+        let parsed =
+            Url::parse(proxy).map_err(|e| FetchError::invalid(format!("proxy {proxy}: {e}")))?;
+        // ponytail: Chrome asks for proxy credentials through the Fetch
+        // domain's authRequired event, which netweir doesn't answer yet.
+        if !parsed.username().is_empty() || parsed.password().is_some() {
+            return Err(FetchError::invalid(
+                "Chrome can't use a proxy that needs a username and password yet",
+            ));
+        }
+        launch.args.push(format!("--proxy-server={proxy}"));
+    }
+    Ok(launch)
+}
+
+/// A Response for a page Chrome rendered: the document's status and
+/// headers, and the HTML as it is now. The body is UTF-8 whatever the
+/// server sent, so the content type says so, and nothing about the body's
+/// original encoding or length still applies.
+fn rendered(document: &netweir_browser::Response, html: String) -> Response {
+    let mut headers: Vec<(String, String)> = document
+        .headers
+        .iter()
+        .map(|(k, v)| (k.to_ascii_lowercase(), v.clone()))
+        .filter(|(k, _)| {
+            !matches!(
+                k.as_str(),
+                "content-encoding" | "content-length" | "transfer-encoding"
+            )
+        })
+        .collect();
+    let mime = headers
+        .iter()
+        .find(|(k, _)| k == "content-type")
+        .and_then(|(_, v)| v.split(';').next())
+        .map_or("text/html", str::trim)
+        .to_string();
+    headers.retain(|(k, _)| k != "content-type");
+    headers.push(("content-type".into(), format!("{mime}; charset=utf-8")));
+    Response {
+        url: document.url.clone(),
+        status: document.status,
+        version: "browser",
+        headers,
+        body: html.into(),
+    }
+}
+
+fn browser_error(e: netweir_browser::Error) -> FetchError {
+    use netweir_browser::Error;
+    let kind = match &e {
+        Error::Timeout(_) => FetchErrorKind::Timeout,
+        Error::Navigation(m) if m.contains("TIMED_OUT") => FetchErrorKind::Timeout,
+        Error::Navigation(m) if m.contains("CERT") || m.contains("SSL") => FetchErrorKind::Tls,
+        Error::Navigation(m)
+            if [
+                "CONNECTION",
+                "NAME_NOT_RESOLVED",
+                "ADDRESS",
+                "INTERNET_DISCONNECTED",
+                "PROXY",
+            ]
+            .iter()
+            .any(|n| m.contains(n)) =>
+        {
+            FetchErrorKind::Connect
+        }
+        _ => FetchErrorKind::Other,
+    };
+    FetchError {
+        kind,
+        message: format!("in Chrome: {e}"),
+    }
+}
+
+/// Gives the host an HTTP session holding the cookies Chrome earned, so
+/// its next requests don't need Chrome. A site may tie those cookies to
+/// the browser they were issued to, so the session looks like the same
+/// Chrome when netweir has its profile. When it doesn't, the session keeps
+/// the crawl's profile and a warning (returned, once) says so.
+fn hand_back(shared: &Shared, state: &mut State, host: &str, cookies: &[Cookie]) -> Option<String> {
+    let version = shared
+        .browser
+        .get()
+        .and_then(|b| b.as_ref().ok())
+        .map(|b| b.version().to_string())
+        .unwrap_or_default();
+    let major = version
+        .trim_start_matches("Chrome/")
+        .split('.')
+        .next()
+        .unwrap_or_default()
+        .to_string();
+    let mut options = shared.options.clone();
+    let mut warning = None;
+    if !options
+        .profile
+        .name
+        .starts_with(&format!("chrome-{major}-"))
+    {
+        match Profile::for_chrome(&major) {
+            Some(profile) => options.profile = profile,
+            None if !state.warned_profile => {
+                state.warned_profile = true;
+                warning = Some(format!(
+                    "the installed {version} has no matching netweir profile, so cookies it earned \
+                     go to requests that look like {}; a site may not accept them",
+                    options.profile.name
+                ));
+            }
+            None => {}
+        }
+    }
+    if let (Ok(fetcher), Some(h)) = (Fetcher::new(options), state.hosts.get_mut(host)) {
+        fetcher.add_cookies(cookies);
+        h.session = Some(fetcher);
+    }
+    warning
 }
 
 /// Server errors worth another try: timeouts and overloaded or unreachable
@@ -1255,12 +1665,15 @@ mod tests {
                 headers: vec![],
                 dont_filter: false,
                 depth: 0,
+                browser: false,
             },
             host: String::new(),
             origin: String::new(),
             path: String::new(),
             hops: 0,
             attempts: 0,
+            in_browser: false,
+            blocked: None,
         };
         let mut heap: BinaryHeap<Queued> =
             [q(0, 1), q(5, 2), q(0, 3), q(5, 4)].into_iter().collect();

@@ -32,12 +32,16 @@ In a crawl, a request that fails climbs a ladder:
    `breaker_window` responses is paused for `breaker_pause` seconds, with
    one warning. It judges after 10 responses, so a site that blocks from
    the start pauses quickly.
-5. A request still blocked after its retries goes to your spider's
+5. With `browser="on_block"`, a request still blocked after its retries is
+   loaded once in Chrome, which has time to pass a challenge. If it gets
+   through, the callback gets the page, and the cookies Chrome earned go to
+   the site's HTTP session, so the next requests don't need Chrome.
+6. A request still blocked after all that goes to your spider's
    `on_block(request, page)`, which logs it by default and may yield items
    or requests like a callback.
 
-The stats count `retries`, `blocked`, `throttled`, `sessions_replaced` and
-`breaker_trips`.
+The stats count `retries`, `blocked`, `throttled`, `sessions_replaced`,
+`breaker_trips`, `browser_fetches` and `browser_unblocked`.
 
 ## Checkpoints
 

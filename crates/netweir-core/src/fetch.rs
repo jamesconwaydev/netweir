@@ -47,6 +47,7 @@ pub struct Fetcher {
     /// https origins (`host:port`) that answered over HTTP/1.1, so get no
     /// HTTP/2-only headers.
     http1_hosts: Arc<Mutex<HashSet<String>>>,
+    jar: Arc<wreq::cookie::Jar>,
 }
 
 #[derive(Debug, Clone)]
@@ -54,7 +55,8 @@ pub struct Response {
     /// The final URL, after redirects.
     pub url: String,
     pub status: u16,
-    /// "HTTP/1.1", "HTTP/2" and so on.
+    /// "HTTP/1.1", "HTTP/2" and so on, or "browser" for a page Chrome
+    /// rendered.
     pub version: &'static str,
     /// In the order received. Names are lowercase.
     pub headers: Vec<(String, String)>,
@@ -170,6 +172,7 @@ const MAX_REDIRECTS: usize = 20;
 
 impl Fetcher {
     pub fn new(options: FetchOptions) -> Result<Fetcher, FetchError> {
+        let jar = Arc::new(wreq::cookie::Jar::default());
         let profile = &options.profile;
         let emulation = profile
             .emulation()
@@ -177,7 +180,7 @@ impl Fetcher {
         let mut builder = wreq::Client::builder()
             .emulation(emulation)
             .timeout(options.timeout)
-            .cookie_store(true)
+            .cookie_provider(jar.clone())
             .gzip(true)
             .brotli(true)
             .zstd(true)
@@ -210,6 +213,7 @@ impl Fetcher {
             navigation_order: Arc::new(profile.header_order(false)),
             redirect_order: Arc::new(profile.header_order(true)),
             http1_hosts: Arc::default(),
+            jar,
         })
     }
 
@@ -245,6 +249,37 @@ impl Fetcher {
     /// `headers` replace the profile's header of the same name in its usual
     /// position; new names go after the profile's own, keeping the caller's
     /// capitalisation on HTTP/1.1.
+    /// Adds cookies a browser holds, as if the browser's responses had
+    /// set them here.
+    pub fn add_cookies(&self, cookies: &[netweir_browser::Cookie]) {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0.0, |d| d.as_secs_f64());
+        for c in cookies {
+            // A leading dot marks a cookie for the domain and its
+            // subdomains; without it, the cookie is the host's alone.
+            let host = c.domain.trim_start_matches('.');
+            let mut line = format!("{}={}; Path={}", c.name, c.value, c.path);
+            if c.domain.starts_with('.') {
+                line.push_str(&format!("; Domain={host}"));
+            }
+            if c.expires >= 0.0 {
+                line.push_str(&format!("; Max-Age={}", (c.expires - now).max(0.0) as u64));
+            }
+            if c.secure {
+                line.push_str("; Secure");
+            }
+            if c.http_only {
+                line.push_str("; HttpOnly");
+            }
+            if let Some(same_site) = &c.same_site {
+                line.push_str(&format!("; SameSite={same_site}"));
+            }
+            let scheme = if c.secure { "https" } else { "http" };
+            self.jar.add(line, format!("{scheme}://{host}{}", c.path));
+        }
+    }
+
     pub async fn get(
         &self,
         url: &str,

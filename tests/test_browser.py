@@ -1,6 +1,7 @@
 """The browser driver from Python. Skipped without Chrome, unless
 NETWEIR_REQUIRE_CHROME is set."""
 
+import asyncio
 import os
 import socket
 import threading
@@ -20,6 +21,7 @@ PAGES = {
 </script>
 <button id=more style="display:none" onclick="document.querySelector('#list').insertAdjacentHTML('beforeend', '<li>jam</li>')">more</button>
 <script>setTimeout(() => document.querySelector('#more').style.display = '', 200)</script>
+<a id=away href="/missing">away</a>
 <form onsubmit="event.preventDefault(); window.searched = document.querySelector('#q').value">
   <input id=q>
 </form>
@@ -85,6 +87,11 @@ async def test_actions_wait_and_evaluate_returns_python_values(browser, base):
         await page.fill("#q", "scones")
         await page.press("Enter")
         assert await page.evaluate("searched") == "scones"
+        # Waiting starts before the click, so the navigation can't slip past.
+        moved = asyncio.ensure_future(page.wait_for_navigation())
+        await page.click("#away")
+        moved = await moved
+        assert (moved.status, moved.url) == (404, base + "/missing")
         assert await page.evaluate(
             "() => ({n: 1, f: 1.5, ok: true, none: null, list: [1, 'a']})"
         ) == {

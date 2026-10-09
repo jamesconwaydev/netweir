@@ -64,6 +64,16 @@ does.
 `page.url` is where the page is now, `await page.title()` its title and
 `await page.content()` its HTML as Chrome currently has it.
 
+When an action loads another page, `await page.wait_for_navigation()` waits
+for it and returns its response. It waits for a navigation that starts
+after it's called, so start it before the click:
+
+```python
+moved = asyncio.ensure_future(page.wait_for_navigation())
+await page.click("a.next")
+response = await moved
+```
+
 ## Acting on the page
 
 | Method | Does |
@@ -109,6 +119,50 @@ its bytes; leave out the path to get only the bytes.
 with `name`, `value`, `domain`, `path`, `expires`, `http_only`, `secure`
 and `same_site`. `await page.set_cookies([...])` takes the same dicts;
 `name`, `value` and `domain` are required.
+
+## In a crawl
+
+A spider can send some requests through Chrome and the rest through the
+much faster HTTP client:
+
+```python
+class Shop(netweir.Spider):
+    async def start(self):
+        yield netweir.Request("https://example.com/catalogue", browser=True)
+
+    async def parse(self, page):
+        await page.browser.click("button.load-more")
+        await page.browser.wait_for("li.product:nth-child(40)")
+        root = await page.browser.parse()
+        for href in root.css("li.product a::attr(href)").getall():
+            yield page.follow(href)
+```
+
+The page a browser request gives its callback is the one Chrome rendered,
+so `page.css(...)` sees what the scripts built. `page.browser` is the live
+page until the callback returns, then it closes. Browser requests wait their
+turn like any other: robots.txt, each site's limits and its delay all
+apply. `browser_pages` (4 by default) caps how many are open at once.
+Callbacks that a declarative spider's rules call get the rendered page,
+but not `page.browser`.
+
+Two settings make Chrome step in on its own:
+
+- `browser="on_block"`: a request still blocked after its retries is
+  loaded once in Chrome, which waits up to 20 seconds for a challenge to
+  pass. If it gets through, the site's HTTP session takes Chrome's
+  cookies, so the next requests to that site go back to the HTTP client.
+  Those cookies are often tied to the browser that earned them, so the
+  session switches to netweir's profile for the installed Chrome's
+  version; if netweir has none, a warning says so.
+- `browser="always"`: every request goes through Chrome.
+
+Chrome goes through the crawl's `proxy`, so the cookies it earns come from
+the address the HTTP client uses. It can't use a proxy that asks for a
+username and password yet; with one, browser requests fail and say so.
+
+The stats count `browser_fetches`, pages Chrome fetched, and
+`browser_unblocked`, blocked requests it got through.
 
 ## Not looking automated
 

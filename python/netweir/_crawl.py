@@ -78,6 +78,12 @@ class Settings:
     track_threshold: float = 0.75
     #: Stop the crawl at the first exception in a callback or pipeline.
     fail_fast: bool = False
+    #: Which requests are fetched in Chrome: "off" (only those that ask
+    #: with ``browser=True``), "on_block" (also any still blocked after its
+    #: retries, once) or "always".
+    browser: str = "off"
+    #: Chrome pages open at once.
+    browser_pages: int = 4
 
     def __post_init__(self):
         if self.concurrency < 1 or self.per_domain < 1:
@@ -100,6 +106,10 @@ class Settings:
             raise ValueError("breaker_ratio must be between 0 and 1")
         if not 0 < self.track_threshold <= 1:
             raise ValueError("track_threshold must be above 0 and at most 1")
+        if self.browser not in ("off", "on_block", "always"):
+            raise ValueError(f'browser must be "off", "on_block" or "always", not {self.browser!r}')
+        if self.browser_pages < 1:
+            raise ValueError("browser_pages must be at least 1")
         # A list is fine to pass; stored as a tuple, as Settings is frozen.
         object.__setattr__(self, "proxies", tuple(self.proxies))
 
@@ -128,6 +138,8 @@ class Settings:
             breaker_ratio=self.breaker_ratio,
             breaker_pause=self.breaker_pause,
             checkpoint=self._checkpoint_file(),
+            browser=self.browser,
+            browser_pages=self.browser_pages,
         )
 
     def _checkpoint_file(self) -> str | None:
@@ -217,6 +229,7 @@ class Spider:
             run.completed = True
             return stats
         finally:
+            await run.engine.close_browser()
             for stage in pipelines:
                 if isinstance(stage, export._Exporter) and not any(stage is s for s in started):
                     continue
@@ -302,6 +315,7 @@ class _Run:
                 dont_filter=dont_filter,
                 errback=data.get("errback"),
                 depth=depth,
+                browser=data.get("browser", False),
             )
             self.submit(request, row=row)
         if saved["pending"] or self.delivered:
@@ -325,7 +339,11 @@ class _Run:
             raise TypeError(f"with a checkpoint, meta must be JSON: {e}") from None
         callback = json.dumps(self.method_name(request.callback))
         errback = json.dumps(self.method_name(request.errback))
-        return f'{{"callback": {callback}, "errback": {errback}, "meta": {meta}}}'
+        browser = json.dumps(request.browser)
+        return (
+            f'{{"callback": {callback}, "errback": {errback}, "meta": {meta}, '
+            f'"browser": {browser}}}'
+        )
 
     def method_name(self, fn: Callable[..., Any] | str | None) -> str | None:
         if fn is None or isinstance(fn, str):
@@ -355,6 +373,7 @@ class _Run:
             depth=request.depth,
             payload=payload,
             row=row,
+            browser=request.browser,
         )
         if outcome == "queued":
             self.waiting[rid] = request
@@ -555,6 +574,8 @@ class _Run:
                 request = Request(url, callback=self.rules[rule].callback)
             page = Page(response, request)
             await self.run_callback(self.spider.on_block, None, (request, page), url)
+        elif kind == "warning":
+            log.warning("%s", event[1])
         elif kind == "paused":
             _, host, seconds = event
             log.warning(
@@ -565,6 +586,7 @@ class _Run:
             request = self.waiting.pop(rid)
             if kind == "fetched":
                 page = Page(detail, request, rest[0])
+                page.browser = rest[1]
                 if page.outcome == "payment_required":
                     price = page._classified()[4]
                     log.warning(
@@ -572,7 +594,12 @@ class _Run:
                         page.url,
                         f" ({price})" if price else "",
                     )
-                await self.run_callback(request.callback, "parse", (page,), request.url)
+                try:
+                    await self.run_callback(request.callback, "parse", (page,), request.url)
+                finally:
+                    # Its place in browser_pages goes to the next request.
+                    if page.browser is not None:
+                        await page.browser.close()
             elif kind == "failed":
                 if request.errback is None:
                     log.warning("%s: %s", request.url, detail)

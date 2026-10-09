@@ -36,6 +36,7 @@ fn request(id: u64, url: String) -> CrawlRequest {
         headers: Vec::new(),
         dont_filter: false,
         depth: 0,
+        browser: false,
     }
 }
 
@@ -98,7 +99,9 @@ async fn crawls_until_there_is_nothing_left() {
     let events = drain(&c).await;
     assert_eq!(fetched(&events), [0, 1, 2]);
     let body = events.iter().find_map(|e| match e {
-        Event::Fetched { id: 1, response } => Some(response.text()),
+        Event::Fetched {
+            id: 1, response, ..
+        } => Some(response.text()),
         _ => None,
     });
     assert_eq!(body.as_deref(), Some("b"));

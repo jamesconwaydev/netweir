@@ -46,6 +46,7 @@ netweir.Request(
     priority=5,                 # higher first, among one site's requests
     headers={"Referer": "https://example.com/"},
     dont_filter=False,          # True fetches it even if seen before
+    browser=False,              # True fetches it in Chrome
 )
 ```
 
@@ -53,6 +54,11 @@ netweir.Request(
 here. A request the same as one already seen (same method and URL, ignoring
 fragments, query order and tracking parameters such as `utm_*`) is dropped
 unless `dont_filter=True`.
+
+A request with `browser=True` is loaded in Chrome, so the callback sees the
+page after its JavaScript ran, and `page.browser` is the live page for
+clicking and typing until the callback returns. See
+[Browser](browser.md#in-a-crawl).
 
 ## Running
 

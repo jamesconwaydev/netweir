@@ -37,6 +37,7 @@ fn request(id: u64, url: String) -> CrawlRequest {
         headers: Vec::new(),
         dont_filter: false,
         depth: 0,
+        browser: false,
     }
 }
 
@@ -55,7 +56,7 @@ async fn drain(c: &Crawler) -> Vec<Event> {
 
 fn status_of(events: &[Event], want: u64) -> Option<u16> {
     events.iter().find_map(|e| match e {
-        Event::Fetched { id, response } if *id == want => Some(response.status),
+        Event::Fetched { id, response, .. } if *id == want => Some(response.status),
         _ => None,
     })
 }

@@ -17,7 +17,9 @@ class Request:
     with the Request and the FetchError when no response arrives. ``meta``
     travels with the request and comes back as ``page.meta``. ``depth`` is
     set by the crawl: 0 for a start request, one more than its page's for
-    a request a callback yields.
+    a request a callback yields. ``browser=True`` fetches it in Chrome,
+    and the callback's ``page.browser`` is the page, open until the
+    callback returns.
     """
 
     url: str
@@ -28,3 +30,4 @@ class Request:
     dont_filter: bool = False
     errback: Callable[..., Any] | str | None = None
     depth: int = 0
+    browser: bool = False

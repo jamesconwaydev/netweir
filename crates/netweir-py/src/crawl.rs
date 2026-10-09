@@ -10,7 +10,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use netweir_core::{
-    CrawlRequest, CrawlSettings, Crawler as CoreCrawler, DropReason, Event, FetchError, Submitted,
+    BrowserMode, CrawlRequest, CrawlSettings, Crawler as CoreCrawler, DropReason, Event,
+    FetchError, Submitted,
 };
 use netweir_dom::extract::{self, TrackContext, Value};
 use netweir_dom::{Document, Query};
@@ -19,6 +20,7 @@ use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList, PyTuple};
 use url::Url;
 
+use crate::browser::BrowserPage;
 use crate::fetch::{Response, fetch_error_value, fetch_options};
 use crate::node::Node;
 use crate::rules::{ItemSpec, Notes, Rule, StoreRef, TrackStore, selector};
@@ -95,6 +97,10 @@ enum Out {
         id: u64,
         response: netweir_core::Response,
         root: Option<Arc<Document>>,
+        page: Option<netweir_core::LivePage>,
+    },
+    Warning {
+        message: String,
     },
     Failed {
         id: u64,
@@ -200,6 +206,7 @@ impl Engine {
                 headers: Vec::new(),
                 dont_filter: false,
                 depth,
+                browser: false,
             };
             let payload = format!(r#"{{"rule":{at}}}"#);
             if self.core.submit_with(request, &payload) != Submitted::Queued {
@@ -335,18 +342,21 @@ impl Engine {
                     | Event::Failed { id, .. }
                     | Event::Dropped { id, .. }
                     | Event::Blocked { id, .. } => Some(*id),
-                    Event::Paused { .. } => None,
+                    Event::Paused { .. } | Event::Warning { .. } => None,
                 })
                 .collect();
             let mut out = Vec::new();
             let mut work = Vec::new();
             for event in events {
                 match event {
-                    Event::Fetched { id, response } => match self.tags().remove(&id) {
+                    // A rules page's Chrome page closes here: rules read the
+                    // HTML, not the live page.
+                    Event::Fetched { id, response, page } => match self.tags().remove(&id) {
                         None => out.push(Out::Fetched {
                             id,
                             response,
                             root: None,
+                            page,
                         }),
                         Some(tag) => {
                             let (engine, rules) = (self.clone(), rules.clone());
@@ -408,6 +418,7 @@ impl Engine {
                         host,
                         seconds: pause.as_secs_f64(),
                     }),
+                    Event::Warning { message } => out.push(Out::Warning { message }),
                 }
             }
             for (id, tag, job) in work {
@@ -459,6 +470,7 @@ impl Engine {
                         id: done.id,
                         response,
                         root: done.root,
+                        page: None,
                     }),
                     (None, None) => out.push(Out::Handled { id: done.id }),
                     (Some(_), None) => {}
@@ -509,10 +521,26 @@ fn out_py<'py>(py: Python<'py>, engine: &Engine, event: Out) -> PyResult<Bound<'
             id,
             response: r,
             root,
-        } => tuple(
-            py,
-            vec![s("fetched")?, n(id)?, response(r)?, root_py(py, root)?],
-        ),
+            page,
+        } => {
+            let page = match page {
+                Some(live) => Py::new(py, BrowserPage::from_crawl(live))?
+                    .into_bound(py)
+                    .into_any(),
+                None => py.None().into_bound(py),
+            };
+            tuple(
+                py,
+                vec![
+                    s("fetched")?,
+                    n(id)?,
+                    response(r)?,
+                    root_py(py, root)?,
+                    page,
+                ],
+            )
+        }
+        Out::Warning { message } => tuple(py, vec![s("warning")?, s(&message)?]),
         Out::Failed { id, error } => tuple(
             py,
             vec![
@@ -633,6 +661,7 @@ impl Crawler {
         max_depth=None, max_pages_per_domain=None,
         retries=3, backoff_base=1.0, backoff_max=60.0, proxies=None,
         breaker_window=50, breaker_ratio=0.3, breaker_pause=300.0, checkpoint=None,
+        browser="off", browser_pages=4,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -660,7 +689,22 @@ impl Crawler {
         breaker_ratio: f64,
         breaker_pause: f64,
         checkpoint: Option<std::path::PathBuf>,
+        browser: &str,
+        browser_pages: usize,
     ) -> PyResult<Crawler> {
+        let browser = match browser {
+            "off" => BrowserMode::Off,
+            "on_block" => BrowserMode::OnBlock,
+            "always" => BrowserMode::Always,
+            _ => {
+                return Err(PyValueError::new_err(format!(
+                    "browser must be \"off\", \"on_block\" or \"always\", not {browser:?}"
+                )));
+            }
+        };
+        if browser_pages == 0 {
+            return Err(PyValueError::new_err("browser_pages must be at least 1"));
+        }
         if !(0.0..=1.0).contains(&breaker_ratio) {
             return Err(PyValueError::new_err(
                 "breaker_ratio must be between 0 and 1",
@@ -704,6 +748,9 @@ impl Crawler {
             breaker_ratio,
             breaker_pause: seconds("breaker_pause", breaker_pause)?,
             checkpoint,
+            browser,
+            browser_pages,
+            browser_launch: Default::default(),
         };
         let options = fetch_options(profile, proxy, timeout, verify)?;
         // The scheduler runs on the shared runtime.
@@ -759,7 +806,7 @@ impl Crawler {
     /// With `apply_rules`, the rules take links from the page; then the page
     /// reaches Python only if `to_python`, and a "handled" event says so
     /// otherwise.
-    #[pyo3(signature = (id, url, priority=0, headers=None, dont_filter=false, apply_rules=false, to_python=true, depth=0, payload="{}", row=None))]
+    #[pyo3(signature = (id, url, priority=0, headers=None, dont_filter=false, apply_rules=false, to_python=true, depth=0, payload="{}", row=None, browser=false))]
     #[allow(clippy::too_many_arguments)]
     fn submit(
         &self,
@@ -773,6 +820,7 @@ impl Crawler {
         depth: u32,
         payload: &str,
         row: Option<i64>,
+        browser: bool,
     ) -> PyResult<&'static str> {
         if id >= RULE_IDS {
             return Err(PyValueError::new_err("request ids must be below 2**62"));
@@ -796,6 +844,7 @@ impl Crawler {
             headers: headers.unwrap_or_default(),
             dont_filter,
             depth,
+            browser,
         };
         let outcome = match row {
             Some(row) => self.engine.core.resubmit(request, row),
@@ -816,7 +865,7 @@ impl Crawler {
 
     /// Awaits up to `max` events, as tuples:
     ///
-    /// - ("fetched", id, Response, root Node or None)
+    /// - ("fetched", id, Response, root Node or None, BrowserPage or None)
     /// - ("failed", id, FetchError)
     /// - ("dropped", id, "robots" | "tdm")
     /// - ("handled", id): dealt with by the rules in Rust
@@ -829,6 +878,7 @@ impl Crawler {
     /// - ("rule_dropped", rule, url, reason)
     /// - ("page_error", url, message)
     /// - ("paused", host, seconds)
+    /// - ("warning", message)
     ///
     /// An empty list means the crawl is finished.
     #[pyo3(signature = (max=256))]
@@ -898,6 +948,7 @@ impl Crawler {
                 headers: p.headers,
                 dont_filter: p.dont_filter,
                 depth: p.depth,
+                browser: false,
             };
             if self.engine.core.resubmit(request, p.row) != Submitted::Queued {
                 self.engine.tags().remove(&id);
@@ -946,6 +997,15 @@ impl Crawler {
         self.engine.core.save_counters(json);
     }
 
+    /// Closes Chrome, if the crawl started it.
+    fn close_browser<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let engine = self.engine.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            engine.core.close_browser().await;
+            Ok(())
+        })
+    }
+
     /// Commits the checkpoint and closes its file. Raises OSError if a
     /// write failed.
     fn close(&self, py: Python<'_>) -> PyResult<()> {
@@ -974,6 +1034,8 @@ impl Crawler {
         d.set_item("throttled", s.throttled)?;
         d.set_item("sessions_replaced", s.sessions_replaced)?;
         d.set_item("breaker_trips", s.breaker_trips)?;
+        d.set_item("browser_fetches", s.browser_fetches)?;
+        d.set_item("browser_unblocked", s.browser_unblocked)?;
         Ok(d)
     }
 }

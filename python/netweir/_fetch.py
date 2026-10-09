@@ -6,7 +6,7 @@ from urllib.parse import urljoin
 
 from netweir import _track
 from netweir._errors import Blocked
-from netweir._native import Fetcher, Node, Response, Selection
+from netweir._native import BrowserPage, Fetcher, Node, Response, Selection
 from netweir._request import Request
 
 Headers = Mapping[str, str] | Iterable[tuple[str, str]] | None
@@ -23,7 +23,7 @@ def _pairs(headers: Headers) -> list[tuple[str, str]]:
 class Page:
     """A fetched page: the response, and the document parsed from it."""
 
-    __slots__ = ("_base", "_outcome", "_response", "_root", "request")
+    __slots__ = ("_base", "_outcome", "_response", "_root", "browser", "request")
 
     def __init__(
         self, response: Response, request: Request | None = None, root: Node | None = None
@@ -35,6 +35,9 @@ class Page:
         self._outcome: tuple | None = None
         #: In a crawl, the Request this page answers.
         self.request = request
+        #: For a page fetched in Chrome, the BrowserPage, open until the
+        #: callback returns; otherwise None.
+        self.browser: BrowserPage | None = None
 
     @property
     def url(self) -> str:

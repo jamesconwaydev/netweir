@@ -53,6 +53,13 @@ ignored. Times are in seconds.
 | `breaker_ratio` | `0.3` | the share of those that were blocks above which the site pauses |
 | `breaker_pause` | `300.0` | how long the site pauses |
 
+## Browser
+
+| Setting | Default | Does |
+|---|---|---|
+| `browser` | `"off"` | which requests go through Chrome: `"off"` (those with `browser=True`), `"on_block"` (also any still blocked after its retries) or `"always"` |
+| `browser_pages` | `4` | Chrome pages open at once |
+
 ## State
 
 | Setting | Default | Does |

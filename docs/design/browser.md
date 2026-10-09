@@ -195,22 +195,36 @@ they own. Closing the browser closes every page.
 ## Crawl integration (milestone 9)
 
 - `Request(..., browser=True)` and `page.follow(..., browser=True)` fetch
-  that request in Chrome. The callback gets a netweir `Page` as usual,
-  with `page.browser` the live browser page for actions until the callback
-  returns.
+  that request in Chrome. The callback gets a netweir `Page` built from
+  the rendered HTML, with `page.browser` the live browser page for
+  actions until the callback returns; then it closes. Callbacks reached
+  through a declarative spider's rules get the rendered page but no live
+  one: the rules engine reads HTML on worker threads and lets the page go.
 - `Settings.browser` is `"off"` (the default), `"on_block"` or
   `"always"`. With `"on_block"`, a request still blocked after its retries
-  is fetched once in Chrome before `on_block` is called. If Chrome gets
-  through, its cookies are copied into the site's HTTP session and
-  following requests go back to the HTTP client.
-- `Settings.browser_pages` caps open pages (default 4). Browser fetches
-  obey the same robots.txt, per-domain limits and delays as HTTP ones.
+  is fetched once in Chrome before `on_block` is called. A challenge page
+  gets up to 20 seconds (or the request timeout, if shorter) to pass and
+  navigate on. If Chrome gets through, its cookies are copied into a new
+  HTTP session for that host, and following requests go back to the HTTP
+  client. If it doesn't, or Chrome fails, `on_block` hears about the
+  block as before. A page blocked in Chrome isn't retried there.
+- `Settings.browser_pages` caps open pages (default 4). A browser request
+  is scheduled like any other, so robots.txt, per-host limits and delays
+  apply, and it counts against the host's concurrency while it runs.
+- Chrome is started the first time a request needs it, through the
+  crawl's `proxy`, and closed when the crawl ends. A proxy with
+  credentials can't be used yet (Chrome asks for them through the Fetch
+  domain's `authRequired` event, which the driver doesn't answer), so
+  browser requests then fail with an error saying so.
+- A rendered page's `Response` has `version` `"browser"`, the document's
+  status and headers, and the HTML as UTF-8, with the content type saying
+  so and the original `content-encoding` and `content-length` dropped.
 - The stats count `browser_fetches` and `browser_unblocked`.
 
 Cookie hand-back only helps if the HTTP client looks like the same browser
-the cookie was issued to, so escalation uses the HTTP profile that matches
-the installed Chrome's major version, and logs a warning when there is
-none.
+the cookie was issued to, so the new session uses the HTTP profile that
+matches the installed Chrome's major version, and the crawl logs one
+warning when there is none.
 
 ## Firefox (milestone 10)
 

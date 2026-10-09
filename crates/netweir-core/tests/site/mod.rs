@@ -17,6 +17,8 @@ pub struct Page {
     pub headers: Vec<(String, String)>,
     pub body: String,
     pub delay: Duration,
+    /// Served instead when the request's Cookie header contains `.0`.
+    pub pass: Option<(String, Box<Page>)>,
 }
 
 impl Page {
@@ -26,6 +28,7 @@ impl Page {
             headers: vec![("content-type".into(), "text/html; charset=utf-8".into())],
             body: body.to_string(),
             delay: Duration::ZERO,
+            pass: None,
         }
     }
 
@@ -35,7 +38,14 @@ impl Page {
             headers: Vec::new(),
             body: body.to_string(),
             delay: Duration::ZERO,
+            pass: None,
         }
+    }
+
+    /// This page, or `page` for a request that carries `cookie`.
+    pub fn unless_cookie(mut self, cookie: &str, page: Page) -> Page {
+        self.pass = Some((cookie.to_string(), Box::new(page)));
+        self
     }
 
     pub fn with_header(mut self, k: &str, v: &str) -> Page {
@@ -98,12 +108,17 @@ impl Site {
                         let text = String::from_utf8_lossy(&head).to_string();
                         let path = text.split(' ').nth(1).unwrap_or("/").to_string();
                         log.lock().unwrap().push((path.clone(), Instant::now()));
-                        let headers = text
+                        let headers: Vec<(String, String)> = text
                             .lines()
                             .skip(1)
                             .filter_map(|l| l.split_once(':'))
                             .map(|(k, v)| (k.trim().to_ascii_lowercase(), v.trim().to_string()))
                             .collect();
+                        let cookie = headers
+                            .iter()
+                            .find(|(k, _)| k == "cookie")
+                            .map(|(_, v)| v.clone())
+                            .unwrap_or_default();
                         seen.lock().unwrap().push((path.clone(), headers));
                         let page = match pages.get(&path) {
                             Some(script) => {
@@ -114,6 +129,12 @@ impl Site {
                                 page
                             }
                             None => Page::status(404, "not found"),
+                        };
+                        let page = match &page.pass {
+                            Some((wanted, pass)) if cookie.contains(wanted.as_str()) => {
+                                (**pass).clone()
+                            }
+                            _ => page,
                         };
                         tokio::time::sleep(page.delay).await;
                         let mut out = format!(

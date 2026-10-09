@@ -116,7 +116,7 @@ impl Browser {
         let browser = self.inner.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let inner = browser.new_page().await.map_err(raise)?;
-            Ok(BrowserPage { inner })
+            Ok(BrowserPage { inner, live: None })
         })
     }
 
@@ -173,7 +173,7 @@ impl BrowserContext {
         let context = self.inner.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let inner = context.new_page().await.map_err(raise)?;
-            Ok(BrowserPage { inner })
+            Ok(BrowserPage { inner, live: None })
         })
     }
 
@@ -228,6 +228,18 @@ impl BrowserContext {
 #[pyclass(frozen, module = "netweir")]
 pub struct BrowserPage {
     inner: CorePage,
+    /// For a page a crawl fetched: closing it frees its place in the
+    /// crawl's pool.
+    live: Option<netweir_core::LivePage>,
+}
+
+impl BrowserPage {
+    pub(crate) fn from_crawl(live: netweir_core::LivePage) -> BrowserPage {
+        BrowserPage {
+            inner: live.page().clone(),
+            live: Some(live),
+        }
+    }
 }
 
 #[pymethods]
@@ -258,6 +270,27 @@ impl BrowserPage {
         let page = self.inner.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let inner = page.goto(&url, wait, timeout).await.map_err(raise)?;
+            Ok(BrowserResponse { inner })
+        })
+    }
+
+    /// Waits for the next navigation, one that starts after this call, to
+    /// reach `wait`. Resolves to its BrowserResponse.
+    #[pyo3(signature = (wait="load", timeout=None))]
+    fn wait_for_navigation<'py>(
+        &self,
+        py: Python<'py>,
+        wait: &str,
+        timeout: Option<f64>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let wait: WaitUntil = wait.parse().map_err(raise)?;
+        let timeout = seconds("timeout", timeout)?;
+        let page = self.inner.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let inner = page
+                .wait_for_navigation(wait, timeout)
+                .await
+                .map_err(raise)?;
             Ok(BrowserResponse { inner })
         })
     }
@@ -396,11 +429,16 @@ impl BrowserPage {
     }
 
     fn close<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-        let page = self.inner.clone();
-        pyo3_async_runtimes::tokio::future_into_py(
-            py,
-            async move { page.close().await.map_err(raise) },
-        )
+        let (page, live) = (self.inner.clone(), self.live.clone());
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            match live {
+                Some(live) => {
+                    live.close().await;
+                    Ok(())
+                }
+                None => page.close().await.map_err(raise),
+            }
+        })
     }
 
     fn __aenter__<'py>(slf: Bound<'py, Self>) -> PyResult<Bound<'py, PyAny>> {
