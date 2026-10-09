@@ -124,17 +124,13 @@ impl Query {
         if let [part] = self.parts.as_slice() {
             return part.run(scope);
         }
-        // Attribute values sort just after their element, before its
-        // children (whose order is higher), as XPath orders attributes.
-        let mut keyed: Vec<((u32, u8), Hit<'a>)> = Vec::new();
+        let mut keyed: Vec<((u32, u32), Hit<'a>)> = Vec::new();
         for part in &self.parts {
-            for (owner, hit) in part.run_with_owner(scope) {
-                let key = (owner.order(), matches!(hit, Hit::Value(_)) as u8);
-                keyed.push((key, hit));
-            }
+            keyed.extend(part.hits(scope, true));
         }
+        // Equal keys are the same node or the same attribute.
         keyed.sort_by_key(|(k, _)| *k);
-        keyed.dedup_by(|a, b| a.0 == b.0 && a.1 == b.1);
+        keyed.dedup_by_key(|(k, _)| *k);
         keyed.into_iter().map(|(_, h)| h).collect()
     }
 
@@ -180,14 +176,19 @@ impl Part {
     }
 
     fn run<'a>(&self, scope: Node<'a>) -> Vec<Hit<'a>> {
-        self.run_with_owner(scope)
+        self.hits(scope, false)
             .into_iter()
             .map(|(_, h)| h)
             .collect()
     }
 
-    /// Each hit with the node it came from (for a value, its element).
-    fn run_with_owner<'a>(&self, scope: Node<'a>) -> Vec<(Node<'a>, Hit<'a>)> {
+    /// The hits, with their positions in document order if `keyed` (a key
+    /// costs a call into lexbor and, on first use, the document index). An
+    /// attribute value sorts just after its element and before the
+    /// element's children (whose order is higher), in source order, as XPath
+    /// orders attributes.
+    fn hits<'a>(&self, scope: Node<'a>, keyed: bool) -> Vec<((u32, u32), Hit<'a>)> {
+        let key = |n: Node<'_>, at: u32| if keyed { (n.order(), at) } else { (0, 0) };
         let mut matches = self.select(scope);
         if self.output == (Output::Text { deep: true }) {
             matches = outermost(matches);
@@ -195,10 +196,20 @@ impl Part {
         let mut out = Vec::new();
         for node in matches {
             match &self.output {
-                Output::Nodes => out.push((node, Hit::Node(node))),
-                Output::Attr(name) => {
+                Output::Nodes => out.push((key(node, 0), Hit::Node(node))),
+                // Unkeyed, one lookup is enough.
+                Output::Attr(name) if !keyed => {
                     if let Some(v) = node.attr(name) {
-                        out.push((node, Hit::Value(v.to_string())));
+                        out.push(((0, 0), Hit::Value(v.to_string())));
+                    }
+                }
+                Output::Attr(name) => {
+                    let attrs = node.attrs();
+                    if let Some(at) = attrs.iter().position(|(n, _)| n.eq_ignore_ascii_case(name)) {
+                        out.push((
+                            key(node, at as u32 + 1),
+                            Hit::Value(attrs[at].1.to_string()),
+                        ));
                     }
                 }
                 Output::Text { deep } => {
@@ -210,7 +221,7 @@ impl Part {
                     out.extend(
                         texts
                             .filter(|n| n.kind() == NodeKind::Text)
-                            .map(|t| (t, Hit::Node(t))),
+                            .map(|t| (key(t, 0), Hit::Node(t))),
                     );
                 }
             }

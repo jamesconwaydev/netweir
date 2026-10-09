@@ -211,3 +211,12 @@ fn queries_run_on_many_documents() {
         assert_eq!(q.strings(doc.root()), [i.to_string()]);
     }
 }
+
+#[test]
+fn comma_lists_keep_equal_attribute_values_in_source_order() {
+    let doc = Document::parse(r#"<a href="x" title="x">1</a><a title="z" href="y">2</a>"#);
+    let q = |css: &str| Query::new(css).unwrap().strings(doc.root());
+    assert_eq!(q("a::attr(href), a::attr(title)"), ["x", "x", "z", "y"]);
+    assert_eq!(q("a::attr(title), a::attr(href)"), ["x", "x", "z", "y"]);
+    assert_eq!(q("a::attr(href), a::attr(href)"), ["x", "y"]);
+}
