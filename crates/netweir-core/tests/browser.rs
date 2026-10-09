@@ -364,3 +364,58 @@ async fn browser_requests_waiting_for_a_page_dont_hold_up_the_rest() {
     // The plain page needn't wait behind Chrome's queue.
     assert!(order.iter().position(|&id| id == 9) < Some(2), "{order:?}");
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_server_error_in_chrome_is_tried_again() {
+    if !have_chrome() {
+        return;
+    }
+    let site = Site::scripted(vec![(
+        "/flaky",
+        vec![Page::status(503, "busy"), Page::html(BUILT_BY_SCRIPT)],
+    )])
+    .await;
+    let c = crawler(settings(BrowserMode::Off));
+    c.submit(request(1, site.url("/flaky"), true));
+    let events = drain_closing(&c).await;
+    let statuses: Vec<u16> = events
+        .iter()
+        .filter_map(|(e, _)| match e {
+            Event::Fetched { response, .. } => Some(response.status),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(statuses, [200], "{events:?}");
+    assert_eq!(c.stats().retries, 1);
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_chrome_that_dies_is_started_again() {
+    if !have_chrome() {
+        return;
+    }
+    let site = Site::start(vec![
+        ("/a", Page::html(BUILT_BY_SCRIPT)),
+        ("/b", Page::html(BUILT_BY_SCRIPT)),
+    ])
+    .await;
+    let c = crawler(settings(BrowserMode::Off));
+    c.submit(request(1, site.url("/a"), true));
+    drain_closing(&c).await;
+    let first = c.browser().await.expect("Chrome was started");
+    unsafe { libc::kill(first.pid().unwrap() as i32, libc::SIGKILL) };
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while !first.is_closed() && std::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    c.submit(request(2, site.url("/b"), true));
+    let events = drain_closing(&c).await;
+    assert!(
+        events
+            .iter()
+            .any(|(e, _)| matches!(e, Event::Fetched { id: 2, .. })),
+        "{events:?}"
+    );
+    assert_ne!(c.browser().await.unwrap().pid(), first.pid());
+}

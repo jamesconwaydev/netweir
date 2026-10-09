@@ -27,6 +27,9 @@ wreq = { version = "0.16.1", default-features = false, features = ["chromium-roo
 zstd = "0.14"
 zip = { version = "9.0.0", default-features = false, features = ["deflate"] }
 
+[target.'cfg(unix)'.dev-dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 netweir-fingerprint = { path = "../netweir-fingerprint" }
 serde_json = "1"

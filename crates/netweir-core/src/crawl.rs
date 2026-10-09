@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use netweir_browser::{Browser, Cookie, LaunchOptions, WaitUntil};
-use tokio::sync::{Notify, OnceCell, OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore};
 use url::Url;
 
 use crate::canonical::{Fingerprint, fingerprint};
@@ -292,7 +292,9 @@ struct Shared {
     /// Woken when an event arrives or the crawl may have finished.
     events: Notify,
     /// Chrome, started the first time a request needs it.
-    browser: OnceCell<Result<Browser, String>>,
+    /// A Chrome that dies is started again for the next request that
+    /// needs one; one that can't start isn't tried again.
+    browser: tokio::sync::Mutex<Option<Result<Browser, String>>>,
     /// Places for open Chrome pages.
     pages: Arc<Semaphore>,
     runtime: tokio::runtime::Handle,
@@ -423,7 +425,7 @@ impl Crawler {
             state: Mutex::new(state),
             schedule: Notify::new(),
             events: Notify::new(),
-            browser: OnceCell::new(),
+            browser: tokio::sync::Mutex::new(None),
             pages: Arc::new(Semaphore::new(settings_pages)),
             runtime: tokio::runtime::Handle::current(),
         });
@@ -511,9 +513,17 @@ impl Crawler {
         flushed
     }
 
+    /// The Chrome the crawl is using, if it has started one.
+    pub async fn browser(&self) -> Option<Browser> {
+        match &*self.shared.browser.lock().await {
+            Some(Ok(browser)) => Some(browser.clone()),
+            _ => None,
+        }
+    }
+
     /// Closes Chrome, if the crawl started it.
     pub async fn close_browser(&self) {
-        if let Some(Ok(browser)) = self.shared.browser.get() {
+        if let Some(browser) = self.browser().await {
             let _ = browser.close().await;
         }
     }
@@ -640,12 +650,12 @@ impl Drop for Crawler {
         if let Some(cp) = &self.shared.checkpoint {
             cp.close();
         }
-        if let Some(Ok(browser)) = self.shared.browser.get() {
-            let browser = browser.clone();
-            self.shared.runtime.spawn(async move {
+        let shared = self.shared.clone();
+        self.shared.runtime.spawn(async move {
+            if let Some(Ok(browser)) = &*shared.browser.lock().await {
                 let _ = browser.close().await;
-            });
-        }
+            }
+        });
     }
 }
 
@@ -1148,8 +1158,8 @@ async fn fetch(shared: Arc<Shared>, mut q: Queued, session: Fetcher) {
 const CHALLENGE_WAIT: Duration = Duration::from_secs(20);
 
 /// What `render` brings back: the response, the open page, its cookies
-/// when asked for, and how long the page took to load.
-type Rendered = (Response, LivePage, Vec<Cookie>, Duration);
+/// when asked for, how long the page took to load, and Chrome's version.
+type Rendered = (Response, LivePage, Vec<Cookie>, Duration, String);
 
 /// Fetches `q` in Chrome, in the page slot `permit` holds, and deals with
 /// the outcome as `fetch` does for the HTTP client. A page that's still
@@ -1189,7 +1199,7 @@ async fn browser_fetch(shared: Arc<Shared>, mut q: Queued, permit: OwnedSemaphor
     if let Some(host) = state.hosts.get_mut(&q.host) {
         host.in_flight -= 1;
         if settings.throttle
-            && let Ok((r, _, _, latency)) = &rendered
+            && let Ok((r, _, _, latency, _)) = &rendered
         {
             host.delay = adjust_delay(settings, host.delay, *latency, Some(r.status));
         }
@@ -1218,7 +1228,19 @@ async fn browser_fetch(shared: Arc<Shared>, mut q: Queued, permit: OwnedSemaphor
                 response,
             })
         }
-        (Ok((response, page, cookies, _)), outcome) => {
+        // A server error is tried again, as the HTTP client would, unless
+        // this is a blocked request's one go in Chrome.
+        (Ok((response, page, ..)), Some(Outcome::HttpError(status)))
+            if q.blocked.is_none()
+                && q.attempts < settings.retries
+                && RETRY_STATUSES.contains(&status) =>
+        {
+            discard = Some(page);
+            drop(response);
+            retry(settings, &mut state, q);
+            None
+        }
+        (Ok((response, page, cookies, _, version)), outcome) => {
             // Chrome follows redirects itself: where it ended up counts as
             // seen, as a redirect the HTTP client followed would.
             if let Some(fp) = fingerprint("GET", &response.url)
@@ -1229,7 +1251,7 @@ async fn browser_fetch(shared: Arc<Shared>, mut q: Queued, permit: OwnedSemaphor
             }
             if q.blocked.is_some() && matches!(outcome, Some(Outcome::Ok)) {
                 state.stats.browser_unblocked += 1;
-                if let Some(message) = hand_back(&shared, &mut state, &q.host, &cookies) {
+                if let Some(message) = hand_back(&shared, &mut state, &q.host, &cookies, &version) {
                     shared.push_event(&mut state, Event::Warning { message });
                 }
             }
@@ -1294,16 +1316,19 @@ async fn render(
     cookies: bool,
     permit: OwnedSemaphorePermit,
 ) -> Result<Rendered, FetchError> {
-    let launch = browser_launch(&shared);
-    let browser = shared
-        .browser
-        .get_or_init(|| async move { Browser::launch(launch).await.map_err(|e| e.to_string()) })
-        .await
-        .clone()
-        .map_err(|e| FetchError {
-            kind: FetchErrorKind::Other,
-            message: format!("can't start Chrome: {e}"),
-        })?;
+    let browser = {
+        let mut slot = shared.browser.lock().await;
+        let dead = matches!(&*slot, Some(Ok(b)) if b.is_closed());
+        if slot.is_none() || dead {
+            let launched = Browser::launch(browser_launch(&shared)).await;
+            *slot = Some(launched.map_err(|e| e.to_string()));
+        }
+        slot.clone().expect("set above")
+    }
+    .map_err(|e| FetchError {
+        kind: FetchErrorKind::Other,
+        message: format!("can't start Chrome: {e}"),
+    })?;
     let page = browser.new_page().await.map_err(browser_error)?;
     let live = LivePage {
         inner: Arc::new(Live {
@@ -1368,7 +1393,13 @@ async fn render(
     } else {
         Vec::new()
     };
-    Ok((response, live, cookies, latency))
+    Ok((
+        response,
+        live,
+        cookies,
+        latency,
+        browser.version().to_string(),
+    ))
 }
 
 /// How to start Chrome for this crawl: through the crawl's proxy, login
@@ -1450,13 +1481,13 @@ fn browser_error(e: netweir_browser::Error) -> FetchError {
 /// the browser they were issued to, so the session looks like the same
 /// Chrome when netweir has its profile. When it doesn't, the session keeps
 /// the crawl's profile and a warning (returned, once) says so.
-fn hand_back(shared: &Shared, state: &mut State, host: &str, cookies: &[Cookie]) -> Option<String> {
-    let version = shared
-        .browser
-        .get()
-        .and_then(|b| b.as_ref().ok())
-        .map(|b| b.version().to_string())
-        .unwrap_or_default();
+fn hand_back(
+    shared: &Shared,
+    state: &mut State,
+    host: &str,
+    cookies: &[Cookie],
+    version: &str,
+) -> Option<String> {
     let major = version
         .trim_start_matches("Chrome/")
         .split('.')

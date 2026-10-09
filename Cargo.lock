@@ -1170,6 +1170,7 @@ dependencies = [
  "chardetng",
  "encoding_rs",
  "flate2",
+ "libc",
  "netweir-browser",
  "netweir-fingerprint",
  "rusqlite",
