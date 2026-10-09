@@ -48,7 +48,9 @@ pub struct Saved {
 }
 
 enum Op {
-    Request(Pending),
+    /// A new request and its URL's seen mark, which must land in the same
+    /// commit: seen but not queued, a resume would never fetch it.
+    Request(Fingerprint, Pending),
     Seen(Fingerprint),
     Done(i64),
     Item(String),
@@ -162,8 +164,9 @@ impl Checkpoint {
         }
     }
 
-    pub fn request(&self, pending: Pending) {
-        self.send(Op::Request(pending));
+    /// Records a new request as queued and its URL as seen, in one commit.
+    pub fn request(&self, fp: Fingerprint, pending: Pending) {
+        self.send(Op::Request(fp, pending));
     }
 
     pub fn seen(&self, fp: Fingerprint) {
@@ -347,7 +350,8 @@ fn commit(conn: &mut Connection, batch: Vec<Op>) -> rusqlite::Result<()> {
         )?;
         for op in batch {
             match op {
-                Op::Request(p) => {
+                Op::Request(fp, p) => {
+                    seen.execute(params![fp.as_slice()])?;
                     let headers = serde_json::to_string(&p.headers).unwrap_or_else(|_| "[]".into());
                     request.execute(params![
                         p.row,
@@ -430,8 +434,8 @@ mod tests {
             let (cp, saved) = Checkpoint::open(&path).unwrap();
             assert!(saved.pending.is_empty());
             assert_eq!(saved.next_row, 1);
-            cp.request(pending(1, "https://e.com/a"));
-            cp.request(pending(2, "https://e.com/b"));
+            cp.request([1; 16], pending(1, "https://e.com/a"));
+            cp.request([2; 16], pending(2, "https://e.com/b"));
             cp.seen([7; 16]);
             cp.done(1);
             cp.item("abc".into());
@@ -448,6 +452,30 @@ mod tests {
     }
 
     #[test]
+    fn a_request_and_its_seen_mark_are_never_committed_apart() {
+        // Committed apart, a crash between the two commits would leave the
+        // URL seen but not queued: a resume would drop it as a duplicate
+        // and never fetch it.
+        let dir = std::env::temp_dir().join(format!("netweir-cp-pair-{}", std::process::id()));
+        let path = dir.join("crawl.sqlite3");
+        let _ = std::fs::remove_dir_all(&dir);
+        drop(Checkpoint::open(&path).unwrap());
+        let mut conn = connect(&path).unwrap();
+        // One write, as the writer thread may cut a batch after any op.
+        commit(
+            &mut conn,
+            vec![Op::Request([9; 16], pending(1, "https://e.com/a"))],
+        )
+        .unwrap();
+        drop(conn);
+        let (_cp, saved) = Checkpoint::open(&path).unwrap();
+        assert_eq!(saved.pending, vec![pending(1, "https://e.com/a")]);
+        assert!(saved.seen.contains(&[9; 16]));
+        drop(_cp);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
     fn a_failed_write_is_reported_by_flush() {
         let dir = std::env::temp_dir().join(format!("netweir-cp-fail-{}", std::process::id()));
         let path = dir.join("crawl.sqlite3");
@@ -458,7 +486,7 @@ mod tests {
             .unwrap()
             .execute("DROP TABLE requests", [])
             .unwrap();
-        cp.request(pending(1, "https://e.com/a"));
+        cp.request([1; 16], pending(1, "https://e.com/a"));
         let err = cp.flush().unwrap_err();
         assert!(err.contains("requests"), "{err}");
         assert!(cp.flush().is_ok(), "reported once");

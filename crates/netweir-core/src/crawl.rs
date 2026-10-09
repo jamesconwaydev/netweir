@@ -569,16 +569,18 @@ impl Crawler {
                 Persist::New(payload) => {
                     let row = state.next_row;
                     state.next_row += 1;
-                    cp.seen(fp);
-                    cp.request(Pending {
-                        row,
-                        url: request.url.clone(),
-                        priority: request.priority,
-                        headers: request.headers.clone(),
-                        dont_filter: request.dont_filter,
-                        depth: request.depth,
-                        payload: payload.to_string(),
-                    });
+                    cp.request(
+                        fp,
+                        Pending {
+                            row,
+                            url: request.url.clone(),
+                            priority: request.priority,
+                            headers: request.headers.clone(),
+                            dont_filter: request.dont_filter,
+                            depth: request.depth,
+                            payload: payload.to_string(),
+                        },
+                    );
                     row
                 }
             };
