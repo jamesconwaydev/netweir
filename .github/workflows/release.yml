@@ -142,3 +142,20 @@ jobs:
           path: dist
           merge-multiple: true
       - uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2
+
+  github-release:
+    needs: [publish]
+    runs-on: ubuntu-latest
+    permissions:
+      # To create the release and attach the files.
+      contents: write
+    steps:
+      - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5.0.0
+        with:
+          path: dist
+          merge-multiple: true
+      # Notes list the pull requests merged since the last tag; the files
+      # are the ones just published to PyPI.
+      - run: gh release create "$GITHUB_REF_NAME" dist/* --repo "$GITHUB_REPOSITORY" --title "netweir ${GITHUB_REF_NAME#v}" --generate-notes --verify-tag
+        env:
+          GH_TOKEN: ${{ github.token }}
