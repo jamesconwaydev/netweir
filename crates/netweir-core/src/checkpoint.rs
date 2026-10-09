@@ -108,14 +108,7 @@ impl Checkpoint {
             std::fs::create_dir_all(dir)
                 .map_err(|e| CheckpointError(format!("can't create {}: {e}", dir.display())))?;
         }
-        let conn = Connection::open(path).map_err(sql)?;
-        conn.pragma_update(None, "journal_mode", "WAL")
-            .map_err(sql)?;
-        // WAL with NORMAL is crash-safe for the process dying; a power cut
-        // may lose the last commits, which resuming fetches again.
-        conn.pragma_update(None, "synchronous", "NORMAL")
-            .map_err(sql)?;
-        conn.execute_batch(SCHEMA).map_err(sql)?;
+        let conn = retrying(|| connect(path)).map_err(sql)?;
         let format: Option<String> = conn
             .query_row("SELECT value FROM meta WHERE key = 'format'", [], |r| {
                 r.get(0)
@@ -224,6 +217,41 @@ impl Drop for Checkpoint {
     fn drop(&mut self) {
         self.close();
     }
+}
+
+/// Runs `open` again for a few seconds while it fails the way a file
+/// still held elsewhere does. Right after a crash, the dead process's hold
+/// on the file can outlast it for a moment, as can a virus scanner's on a
+/// new file, which SQLite reports as an I/O error rather than waiting (on
+/// Windows especially).
+pub(crate) fn retrying<T>(mut open: impl FnMut() -> rusqlite::Result<T>) -> rusqlite::Result<T> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        match open() {
+            Err(rusqlite::Error::SqliteFailure(e, _))
+                if matches!(
+                    e.code,
+                    rusqlite::ErrorCode::SystemIoFailure
+                        | rusqlite::ErrorCode::DatabaseBusy
+                        | rusqlite::ErrorCode::DatabaseLocked
+                ) && std::time::Instant::now() < deadline =>
+            {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            other => return other,
+        }
+    }
+}
+
+/// Opens the file in WAL mode, with the tables in place.
+fn connect(path: &Path) -> rusqlite::Result<Connection> {
+    let conn = Connection::open(path)?;
+    conn.pragma_update(None, "journal_mode", "WAL")?;
+    // WAL with NORMAL is crash-safe for the process dying; a power cut may
+    // lose the last commits, which resuming fetches again.
+    conn.pragma_update(None, "synchronous", "NORMAL")?;
+    conn.execute_batch(SCHEMA)?;
+    Ok(conn)
 }
 
 fn read(conn: &Connection) -> rusqlite::Result<Saved> {
@@ -359,6 +387,27 @@ fn commit(conn: &mut Connection, batch: Vec<Op>) -> rusqlite::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_checkpoint_another_process_still_holds_is_waited_for() {
+        // As after a crash, when the dead process's lock on the file can
+        // outlive it for a moment (on Windows especially).
+        let dir = std::env::temp_dir().join(format!("netweir-cp-held-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("crawl.sqlite3");
+        drop(Checkpoint::open(&path).unwrap());
+        let holder = Connection::open(&path).unwrap();
+        holder.execute_batch("BEGIN EXCLUSIVE").unwrap();
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            holder.execute_batch("COMMIT").unwrap();
+        });
+        let opened = Checkpoint::open(&path);
+        release.join().unwrap();
+        assert!(opened.is_ok(), "{:?}", opened.err());
+        drop(opened);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
     fn pending(row: i64, url: &str) -> Pending {
         Pending {

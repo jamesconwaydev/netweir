@@ -25,19 +25,20 @@ impl TrackStore {
             std::fs::create_dir_all(dir)
                 .map_err(|e| CheckpointError(format!("can't create {}: {e}", dir.display())))?;
         }
-        let conn = Connection::open(path).map_err(err)?;
-        conn.busy_timeout(std::time::Duration::from_secs(5))
-            .map_err(err)?;
-        conn.pragma_update(None, "journal_mode", "WAL")
-            .map_err(err)?;
-        conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS tracks (
-                site TEXT NOT NULL,
-                name TEXT NOT NULL,
-                fingerprint TEXT NOT NULL,
-                PRIMARY KEY (site, name)
-            ) WITHOUT ROWID;",
-        )
+        let conn = crate::checkpoint::retrying(|| {
+            let conn = Connection::open(path)?;
+            conn.busy_timeout(std::time::Duration::from_secs(5))?;
+            conn.pragma_update(None, "journal_mode", "WAL")?;
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS tracks (
+                    site TEXT NOT NULL,
+                    name TEXT NOT NULL,
+                    fingerprint TEXT NOT NULL,
+                    PRIMARY KEY (site, name)
+                ) WITHOUT ROWID;",
+            )?;
+            Ok(conn)
+        })
         .map_err(err)?;
         Ok(TrackStore {
             conn: Mutex::new(Some(conn)),
