@@ -32,6 +32,27 @@ fn seconds(name: &str, value: f64) -> PyResult<Duration> {
 /// Ids from here up belong to requests the rules made; Python's count from 0.
 const RULE_IDS: u64 = 1 << 62;
 
+/// Why the rules should leave a page alone: an error status (a 404 page
+/// is no product page), or a body that isn't HTML (a PDF a loose rule
+/// linked to).
+fn not_a_page(r: &netweir_core::Response) -> Option<String> {
+    if !(200..300).contains(&r.status) {
+        return Some(format!("HTTP {}", r.status));
+    }
+    let ctype = r.header("content-type")?.to_ascii_lowercase();
+    let html = [
+        "text/html",
+        "application/xhtml+xml",
+        "text/xml",
+        "application/xml",
+    ];
+    if html.iter().any(|h| ctype.trim_start().starts_with(h)) {
+        None
+    } else {
+        Some(format!("not HTML ({})", ctype.trim()))
+    }
+}
+
 /// How long one rule page may take to parse before it is given up on.
 // ponytail: fixed budget; make it a setting if real pages need longer.
 const PARSE_BUDGET: Duration = Duration::from_secs(10);
@@ -52,11 +73,14 @@ struct Tag {
 struct Processed {
     id: u64,
     tag: Tag,
-    response: netweir_core::Response,
+    /// Kept only for pages Python will see.
+    response: Option<netweir_core::Response>,
     root: Option<Arc<Document>>,
     links: Vec<(String, usize)>,
     item: Option<Vec<Value>>,
     error: Option<String>,
+    /// Why the rules left the page alone: an error status, or not HTML.
+    ignored: Option<String>,
 }
 
 /// One event for Python, built under the GIL at the end of a batch.
@@ -102,10 +126,17 @@ enum Out {
         url: String,
         message: String,
     },
+    /// A page the rules left alone, and why.
+    Ignored {
+        url: String,
+        reason: String,
+    },
 }
 
 struct Engine {
     core: CoreCrawler,
+    /// One permit per core: how many rule pages are parsed at once.
+    parsers: Arc<tokio::sync::Semaphore>,
     rules: Mutex<Arc<Vec<Arc<Rule>>>>,
     tags: Mutex<HashMap<u64, Tag>>,
     next_id: AtomicU64,
@@ -157,31 +188,39 @@ impl Engine {
         let mut done = Processed {
             id,
             tag,
-            response,
+            response: None,
             root: None,
             links: Vec::new(),
             item: None,
             error: None,
+            ignored: not_a_page(&response),
         };
-        let doc = match Document::parse_within(&done.response.text(), PARSE_BUDGET) {
-            Ok(doc) => doc,
-            Err(e) => {
-                done.error = Some(e.to_string());
-                return done;
+        if done.ignored.is_none() {
+            match Document::parse_within(&response.text(), PARSE_BUDGET) {
+                Ok(doc) => {
+                    let root = doc.root();
+                    if done.tag.apply_rules {
+                        match self.links(rules, &response.url, root) {
+                            Ok(links) => done.links = links,
+                            Err(e) => done.error = Some(e),
+                        }
+                    }
+                    if let Some(item) = done.tag.rule.and_then(|r| rules[r].item.as_ref()) {
+                        done.item = Some(item.extract(root));
+                    }
+                    if done.tag.to_python {
+                        done.root = Some(Arc::new(doc));
+                    }
+                }
+                Err(e) => {
+                    done.error = Some(e.to_string());
+                    // Python would parse it again, without the budget.
+                    done.tag.to_python = false;
+                }
             }
-        };
-        let root = doc.root();
-        if done.tag.apply_rules {
-            match self.links(rules, &done.response.url, root) {
-                Ok(links) => done.links = links,
-                Err(e) => done.error = Some(e),
-            }
-        }
-        if let Some(item) = done.tag.rule.and_then(|r| rules[r].item.as_ref()) {
-            done.item = Some(item.extract(root));
         }
         if done.tag.to_python {
-            done.root = Some(Arc::new(doc));
+            done.response = Some(response);
         }
         done
     }
@@ -205,10 +244,16 @@ impl Engine {
             .and_then(|b| page.join(b.trim()).ok())
             .unwrap_or(page);
         let mut out = Vec::new();
+        // One request per page per link, however many times it appears.
+        let mut seen = std::collections::HashSet::new();
         for (at, rule) in rules.iter().enumerate() {
             for href in extract::links(&rule.selector, root)? {
-                if let Ok(url) = base.join(href.trim()) {
-                    out.push((url.into(), at));
+                if let Ok(mut url) = base.join(href.trim()) {
+                    url.set_fragment(None);
+                    let url: String = url.into();
+                    if seen.insert(url.clone()) {
+                        out.push((url, at));
+                    }
                 }
             }
         }
@@ -237,9 +282,20 @@ impl Engine {
                         }),
                         Some(tag) => {
                             let (engine, rules) = (self.clone(), rules.clone());
-                            work.push(tokio::task::spawn_blocking(move || {
-                                engine.process(&rules, id, tag, response)
-                            }));
+                            let job_tag = tag.clone();
+                            let parsers = self.parsers.clone();
+                            // At most one page per core is being parsed.
+                            work.push((
+                                id,
+                                job_tag,
+                                tokio::spawn(async move {
+                                    let _turn = parsers.acquire_owned().await;
+                                    tokio::task::spawn_blocking(move || {
+                                        engine.process(&rules, id, tag, response)
+                                    })
+                                    .await
+                                }),
+                            ));
                         }
                     },
                     Event::Failed { id, error } => match self.tags().remove(&id) {
@@ -266,14 +322,18 @@ impl Engine {
                     }
                 }
             }
-            for job in work {
+            for (id, tag, job) in work {
                 let done = match job.await {
-                    Ok(done) => done,
-                    Err(e) => {
+                    Ok(Ok(done)) => done,
+                    Ok(Err(e)) | Err(e) => {
                         out.push(Out::PageError {
-                            url: String::new(),
-                            message: format!("processing a page failed: {e}"),
+                            url: tag.url,
+                            message: format!("processing the page failed: {e}"),
                         });
+                        // Python still hears the last of its own requests.
+                        if tag.rule.is_none() {
+                            out.push(Out::Handled { id });
+                        }
                         continue;
                     }
                 };
@@ -284,23 +344,29 @@ impl Engine {
                         message,
                     });
                 }
+                if let Some(reason) = done.ignored {
+                    out.push(Out::Ignored {
+                        url: done.tag.url.clone(),
+                        reason,
+                    });
+                }
                 if let (Some(values), Some(rule)) = (done.item, done.tag.rule) {
                     out.push(Out::Item { rule, values });
                 }
-                match (done.tag.rule, done.tag.to_python) {
-                    (Some(rule), true) => out.push(Out::Ruled {
+                match (done.tag.rule, done.response) {
+                    (Some(rule), Some(response)) => out.push(Out::Ruled {
                         rule,
                         url: done.tag.url,
-                        response: done.response,
+                        response,
                         root: done.root,
                     }),
-                    (None, true) => out.push(Out::Fetched {
+                    (None, Some(response)) => out.push(Out::Fetched {
                         id: done.id,
-                        response: done.response,
+                        response,
                         root: done.root,
                     }),
-                    (None, false) => out.push(Out::Handled { id: done.id }),
-                    (Some(_), false) => {}
+                    (None, None) => out.push(Out::Handled { id: done.id }),
+                    (Some(_), None) => {}
                 }
             }
             if !out.is_empty() {
@@ -403,6 +469,7 @@ fn out_py<'py>(py: Python<'py>, engine: &Engine, event: Out) -> PyResult<Bound<'
             py,
             vec![s("rule_dropped")?, n(rule as u64)?, s(&url)?, s(why)?],
         ),
+        Out::Ignored { url, reason } => tuple(py, vec![s("ignored")?, s(&url)?, s(&reason)?]),
         Out::PageError { url, message } => {
             tuple(py, vec![s("page_error")?, s(&url)?, s(&message)?])
         }
@@ -471,6 +538,9 @@ impl Crawler {
         Ok(Crawler {
             engine: Arc::new(Engine {
                 core,
+                parsers: Arc::new(tokio::sync::Semaphore::new(
+                    std::thread::available_parallelism().map_or(4, |n| n.get()),
+                )),
                 rules: Mutex::new(Arc::new(Vec::new())),
                 tags: Mutex::new(HashMap::new()),
                 next_id: AtomicU64::new(RULE_IDS),

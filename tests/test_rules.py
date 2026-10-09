@@ -34,6 +34,13 @@ def detail(name):
     )
 
 
+ODD = (
+    "<a class='o' href='/gone'>404</a><a class='o' href='/file.pdf'>pdf</a>"
+    "<a class='o' href='/book/1-1'>a</a><a class='o' href='/book/1-1'>again</a>"
+    "<a class='o' href='/book/1-1#x'>fragment</a>"
+)
+
+
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     log: list[str] = []
@@ -50,11 +57,18 @@ class Handler(BaseHTTPRequestHandler):
             body, status = listing(int(p.rsplit("/", 1)[1])), 200
         elif p.startswith("/book/"):
             body, status = detail(p.rsplit("/", 1)[1]), 200
+        elif p == "/odd":
+            body, status = ODD, 200
+        elif p == "/gone":
+            body, status = "<h1>Gone</h1><p class='price_color'>£0.00</p>", 404
+        elif p == "/file.pdf":
+            body, status = "%PDF-1.4 <h1>pdf title</h1>", 200
         else:
             body, status = "missing", 404
         data = body.encode()
         self.send_response(status)
-        self.send_header("Content-Type", "text/html; charset=utf-8")
+        ctype = "application/pdf" if p.endswith(".pdf") else "text/html; charset=utf-8"
+        self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(data)))
         self.end_headers()
         self.wfile.write(data)
@@ -235,3 +249,60 @@ def test_bad_rules_and_fields_fail_up_front():
         netweir.Follow()
     with pytest.raises(TypeError):
         netweir.Follow("a", xpath="//a")
+
+
+def test_error_pages_and_files_give_no_items(base, caplog):
+    spider = books_spider(
+        base,
+        start_urls=[f"{base}/odd"],
+        rules=[netweir.Follow("a.o", extract=Book)],
+    )
+    with caplog.at_level(logging.INFO, logger="netweir"):
+        items, stats = collect(spider)
+    assert [i["upc"] for i in items] == ["upc-1-1"]
+    assert "404" in caplog.text and "application/pdf" in caplog.text
+    # The same link three ways is one request, not two duplicates.
+    assert stats["duplicates"] == 0
+
+
+def test_warnings_name_the_item_class_fully(caplog):
+    # Module and qualified name, so two Items called I in different places
+    # don't share (and silence) one warning.
+    def make():
+        class I(netweir.Item):  # noqa: E742
+            v = netweir.css(".price_color::text", into=int)
+
+        return I
+
+    with caplog.at_level(logging.WARNING, logger="netweir"):
+        make().extract(netweir.parse(detail("1-1")))
+    assert "test_rules.test_warnings_name_the_item_class_fully.<locals>.make.<locals>.I.v" in (
+        caplog.text
+    )
+
+
+def test_a_query_that_fails_says_so(caplog):
+    class Counted(netweir.Item):
+        n = netweir.xpath("count(1)")
+
+    with caplog.at_level(logging.WARNING, logger="netweir"):
+        assert Counted.extract(netweir.parse("<p>")) == {"n": None}
+    assert "query failed" in caplog.text and "couldn't convert" not in caplog.text
+
+
+def test_mistakes_in_items_and_rules_fail_where_written():
+    with pytest.raises(TypeError, match="into"):
+        netweir.css("p", into=object())
+    with pytest.raises(TypeError, match="priority"):
+        netweir.Follow("a", priority="high")
+    with pytest.raises(TypeError, match="extract"):
+
+        class Clash(netweir.Item):
+            extract = netweir.css("p")
+
+
+def test_a_pattern_group_that_did_not_take_part_is_empty_like_parsel():
+    class G(netweir.Item):
+        g = netweir.css("p::text", re=r"x(y)?")
+
+    assert G.extract(netweir.parse("<p>x</p>")) == {"g": ""}

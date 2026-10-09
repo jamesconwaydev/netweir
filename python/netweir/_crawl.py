@@ -146,7 +146,13 @@ class _Run:
         # parse runs alongside the rules only if the spider writes its own.
         self.has_parse = type(spider).parse is not Spider.parse
         self.warned: set[str] = set()
-        self.counts = {"items": 0, "items_dropped": 0, "callback_errors": 0, "invalid_urls": 0}
+        self.counts = {
+            "items": 0,
+            "items_dropped": 0,
+            "callback_errors": 0,
+            "invalid_urls": 0,
+            "pages_ignored": 0,
+        }
 
     def submit(self, request: Request) -> None:
         rid = next(self.ids)
@@ -223,6 +229,10 @@ class _Run:
         elif kind == "rule_dropped":
             _, _, url, why = event
             log.info("skipped %s: %s", url, _why(why))
+        elif kind == "ignored":
+            _, url, reason = event
+            self.counts["pages_ignored"] += 1
+            log.info("rules skipped %s: %s", url, reason)
         elif kind == "page_error":
             _, url, message = event
             log.warning("%s: %s", url, message)

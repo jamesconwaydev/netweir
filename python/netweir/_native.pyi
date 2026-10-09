@@ -281,11 +281,12 @@ class Crawler:
         | tuple[Literal["failed"], int, FetchError]
         | tuple[Literal["dropped"], int, Literal["robots", "tdm"]]
         | tuple[Literal["handled"], int]
-        | tuple[Literal["item"], int, dict[str, Any], list[tuple[str, str]]]
+        | tuple[Literal["item"], int, dict[str, Any], list[tuple[str, str, str]]]
         | tuple[Literal["ruled"], int, str, Response, Node | None]
         | tuple[Literal["rule_failed"], int, str, FetchError]
         | tuple[Literal["rule_dropped"], int, str, Literal["robots", "tdm"]]
         | tuple[Literal["page_error"], str, str]
+        | tuple[Literal["ignored"], str, str]
     ]: ...
     def stats(self) -> dict[str, int]: ...
 
@@ -306,7 +307,7 @@ class ItemSpec:
             ]
         ],
     ) -> None: ...
-    def extract(self, node: Node) -> tuple[dict[str, Any], list[tuple[str, str]]]: ...
+    def extract(self, node: Node) -> tuple[dict[str, Any], list[tuple[str, str, str]]]: ...
 
 class JsonlWriter:
     def __init__(self, path: str) -> None: ...

@@ -41,6 +41,14 @@ impl Node {
         Node { doc, id }
     }
 
+    pub(crate) fn document(&self) -> &Arc<Document> {
+        &self.doc
+    }
+
+    pub(crate) fn node_id(&self) -> NodeId {
+        self.id
+    }
+
     pub(crate) fn get(&self) -> netweir_dom::Node<'_> {
         // SAFETY: `id` was taken from a node of `doc`, which this Node keeps alive.
         unsafe { self.doc.node(self.id) }

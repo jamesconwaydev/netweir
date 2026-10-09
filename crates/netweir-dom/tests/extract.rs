@@ -164,3 +164,9 @@ fn compiled_specs_are_shared_across_threads() {
         );
     }
 }
+
+#[test]
+fn a_query_that_fails_is_an_error_not_a_bad_value() {
+    let f = Field::new("n", Selector::xpath("count(1)").unwrap());
+    assert!(matches!(one(f), Value::Error(e) if e.contains("count")));
+}

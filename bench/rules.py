@@ -8,6 +8,10 @@ Both spiders follow the pagination, visit every product and extract the
 same four fields; throttling and robots.txt are off, because the point is
 what the crawler costs, not the network. The figures are the best of three
 runs: wall time and this process's CPU time.
+
+The declarative spider can use as much CPU or more: the parsing is the
+same, it just happens on other threads, several pages at once, instead of
+waiting its turn for Python. What it saves is wall time and the GIL.
 """
 
 import multiprocessing

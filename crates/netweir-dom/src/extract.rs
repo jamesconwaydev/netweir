@@ -55,8 +55,10 @@ pub enum Value {
     Bool(bool),
     /// With `all`, one value per result.
     List(Vec<Value>),
-    /// The text that would not convert, or why the query failed.
+    /// The text that would not convert.
     Invalid(String),
+    /// Why the query failed on this page (an XPath type error, say).
+    Error(String),
 }
 
 /// A named query and what to do with what it finds.
@@ -82,7 +84,8 @@ impl Field {
     }
 
     /// Keeps only what `pattern` matches in each result: its first group if
-    /// it has groups, otherwise the whole match.
+    /// it has groups (empty when that group took no part in the match, as
+    /// in parsel), otherwise the whole match.
     pub fn re(mut self, pattern: &str) -> Result<Field, String> {
         let re = Regex::new(pattern).map_err(|e| {
             // The regex crate's message spans lines; the last one says why.
@@ -121,8 +124,9 @@ impl Field {
             let text = hit.to_string_value();
             match &self.re {
                 Some(re) => {
+                    let grouped = re.captures_len() > 1;
                     for caps in re.captures_iter(&text) {
-                        let m = caps.get(1).or_else(|| caps.get(0));
+                        let m = if grouped { caps.get(1) } else { caps.get(0) };
                         out.push(m.map_or("", |m| m.as_str()).to_string());
                         if !self.all {
                             return Ok(out);
@@ -162,7 +166,7 @@ impl Field {
     pub fn extract(&self, scope: Node<'_>) -> Value {
         let texts = match self.texts(scope) {
             Ok(t) => t,
-            Err(e) => return Value::Invalid(e),
+            Err(e) => return Value::Error(e),
         };
         if self.all {
             Value::List(texts.into_iter().map(|t| self.value(t)).collect())

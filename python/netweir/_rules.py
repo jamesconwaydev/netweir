@@ -19,6 +19,8 @@ class Field:
     __slots__ = ("all", "default", "into", "kind", "query", "re", "strip")
 
     def __init__(self, kind, query, re, into, all, strip, default):
+        if into is not None and not callable(into):
+            raise TypeError(f"into= takes a type or a function, not {into!r}")
         self.kind = kind
         self.query = query
         self.re = re
@@ -49,7 +51,8 @@ def css(
     """A field found by a CSS query (with ``::text`` and ``::attr()``).
 
     The value is the first result, as ``get()`` gives it, or every result with
-    ``all=True``. ``re`` keeps what the pattern matches (its first group if it
+    ``all=True`` (an empty list when nothing matches; ``default`` is then
+    not used). ``re`` keeps what the pattern matches (its first group if it
     has one), in Rust's regex syntax. ``strip`` trims whitespace. ``into`` of
     ``int``, ``float``, ``bool`` or ``str`` converts in Rust; a value that
     won't convert becomes None, with a warning. Any other callable is applied
@@ -92,8 +95,13 @@ class Item:
         for klass in reversed(cls.__mro__):
             for name, value in vars(klass).items():
                 if isinstance(value, Field):
+                    if hasattr(Item, name):
+                        raise TypeError(f"{cls.__qualname__}.{name}: Item uses {name!r} itself")
                     fields[name] = value
-        cls._spec = ItemSpec(cls.__name__, [f._spec(name) for name, f in fields.items()])
+        # Warnings name the field in full, so two classes called Book don't
+        # silence each other.
+        qualified = f"{cls.__module__}.{cls.__qualname__}"
+        cls._spec = ItemSpec(qualified, [f._spec(name) for name, f in fields.items()])
         cls._python_into = {
             name: into for name, f in fields.items() if (into := f._python_into()) is not None
         }
@@ -117,12 +125,14 @@ class Item:
             try:
                 item[name] = [into(v) for v in value] if isinstance(value, list) else into(value)
             except Exception as e:  # noqa: BLE001 - reported, value stored as None
-                _warn_once(f"{cls.__name__}.{name}", f"{into!r} failed on {value!r}: {e}", warned)
+                field = f"{cls.__module__}.{cls.__qualname__}.{name}"
+                _warn_once(field, f"{into!r} failed on {value!r}: {e}", warned)
                 item[name] = None
         return item
 
 
-#: Fields already warned about outside a crawl; a crawl keeps its own.
+#: Fields already warned about outside a crawl (once per field for the life
+#: of the process); a crawl keeps its own set.
 _warned: set[str] = set()
 
 
@@ -133,9 +143,10 @@ def _warn_once(field: str, detail: str, warned: set[str] | None = None) -> None:
         logging.getLogger("netweir").warning("%s: %s; stored None", field, detail)
 
 
-def _warn_invalid(invalid: list[tuple[str, str]], warned: set[str] | None = None) -> None:
-    for field, text in invalid:
-        _warn_once(field, f"couldn't convert {text!r}", warned)
+def _warn_invalid(invalid: list[tuple[str, str, str]], warned: set[str] | None = None) -> None:
+    for field, text, kind in invalid:
+        detail = f"query failed: {text}" if kind == "query" else f"couldn't convert {text!r}"
+        _warn_once(field, detail, warned)
 
 
 class Follow:
@@ -167,6 +178,8 @@ class Follow:
             raise TypeError("Follow takes a css query or an xpath query, not both or neither")
         if extract is not None and not (isinstance(extract, type) and issubclass(extract, Item)):
             raise TypeError("extract= takes an Item subclass")
+        if not isinstance(priority, int):
+            raise TypeError(f"priority takes an int, not {priority!r}")
         self.kind, self.query = ("css", css) if css is not None else ("xpath", xpath)
         self.extract = extract
         self.callback = callback

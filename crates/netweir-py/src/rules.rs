@@ -27,9 +27,12 @@ pub(crate) fn selector(kind: &str, query: &str) -> PyResult<Selector> {
     }
 }
 
-/// An extracted item, and ("Class.field", text) for each value that would
-/// not convert.
-pub(crate) type Extracted<'py> = (Bound<'py, PyDict>, Vec<(String, String)>);
+/// What went wrong with one field on one page: ("module.Class.field",
+/// what was found, "convert" or "query").
+pub(crate) type Problem = (String, String, &'static str);
+
+/// An extracted item, and its problems.
+pub(crate) type Extracted<'py> = (Bound<'py, PyDict>, Vec<Problem>);
 
 pub(crate) struct ItemInner {
     spec: extract::ItemSpec,
@@ -45,8 +48,8 @@ impl ItemInner {
     }
 
     /// The item as a dict in field order, a missing value replaced by its
-    /// default and one that would not convert by None. Also returns, for
-    /// each value that would not convert, "Class.field" and its text.
+    /// default, and one that would not convert or whose query failed by
+    /// None, with a Problem for each of those.
     pub(crate) fn to_python<'py>(
         &self,
         py: Python<'py>,
@@ -57,8 +60,8 @@ impl ItemInner {
         for ((name, default), value) in self.fields.iter().zip(&self.defaults).zip(values) {
             let v = match value {
                 Value::Missing => default.clone_ref(py).into_bound(py),
-                other => value_py(py, other, &mut |text| {
-                    invalid.push((format!("{}.{name}", self.name), text))
+                other => value_py(py, other, &mut |text, kind| {
+                    invalid.push((format!("{}.{name}", self.name), text, kind))
                 })?,
             };
             dict.set_item(name, v)?;
@@ -70,7 +73,7 @@ impl ItemInner {
 fn value_py<'py>(
     py: Python<'py>,
     value: Value,
-    invalid: &mut dyn FnMut(String),
+    invalid: &mut dyn FnMut(String, &'static str),
 ) -> PyResult<Bound<'py, PyAny>> {
     Ok(match value {
         Value::Missing => py.None().into_bound(py),
@@ -86,7 +89,11 @@ fn value_py<'py>(
             list.into_any()
         }
         Value::Invalid(text) => {
-            invalid(text);
+            invalid(text, "convert");
+            py.None().into_bound(py)
+        }
+        Value::Error(reason) => {
+            invalid(reason, "query");
             py.None().into_bound(py)
         }
     })
@@ -154,10 +161,12 @@ impl ItemSpec {
         })
     }
 
-    /// The item found below `node`, and the values that would not convert
-    /// as ("Class.field", text) pairs.
+    /// The item found below `node`, and its problems.
     fn extract<'py>(&self, py: Python<'py>, node: &Node) -> PyResult<Extracted<'py>> {
-        let values = self.inner.extract(node.get());
+        let (doc, id, inner) = (node.document().clone(), node.node_id(), self.inner.clone());
+        // SAFETY: the id came from a Node of this document, which `doc` keeps
+        // alive.
+        let values = py.detach(move || inner.extract(unsafe { doc.node(id) }));
         self.inner.to_python(py, values)
     }
 }
