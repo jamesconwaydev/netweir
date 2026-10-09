@@ -163,9 +163,17 @@ pub fn proxy() -> Proxy {
                         }
                     }
                     let reply = if authorised {
-                        let body = format!("<p id=via>via proxy: {target}</p>");
+                        // Scripts, for the workers a page starts.
+                        let (kind, body) = if target.ends_with(".js") {
+                            (
+                                "application/javascript",
+                                "postMessage('worker ran')".to_string(),
+                            )
+                        } else {
+                            ("text/html", format!("<p id=via>via proxy: {target}</p>"))
+                        };
                         format!(
-                            "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\n\r\n{body}",
+                            "HTTP/1.1 200 OK\r\nContent-Type: {kind}\r\nContent-Length: {}\r\n\r\n{body}",
                             body.len()
                         )
                     } else {

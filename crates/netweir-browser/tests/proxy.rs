@@ -70,3 +70,23 @@ async fn a_wrong_login_fails_instead_of_asking_forever() {
     );
     browser.close().await.unwrap();
 }
+
+#[tokio::test]
+async fn a_pages_workers_get_through_the_proxy_too() {
+    let proxy = proxy();
+    let with_login = proxy.url.replace("http://", "http://user:secret@");
+    let Some(browser) = browser_through(&with_login).await else {
+        return;
+    };
+    let page = browser.new_page().await.unwrap();
+    page.goto("http://shop.test/item", WaitUntil::Load, None)
+        .await
+        .unwrap();
+    let ran = page
+        .evaluate(
+            "new Promise((r, no) => { const w = new Worker('/w.js'); w.onmessage = (e) => r(e.data); w.onerror = () => no('worker failed'); setTimeout(() => no('timed out'), 5000); })",
+        )
+        .await;
+    assert_eq!(ran.unwrap(), json!("worker ran"));
+    browser.close().await.unwrap();
+}

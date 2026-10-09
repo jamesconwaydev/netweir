@@ -258,10 +258,10 @@ the proxy, and a crawl's browser requests use the crawl's `proxy`,
 credentials and all.
 
 Only HTTP(S) proxies: Chrome's SOCKS client offers no login, so a SOCKS
-proxy with one is refused with an error. And only pages get the login:
-workers and frames from other sites, which are targets of their own,
-aren't attached to, so behind a proxy that needs a login their requests
-fail.
+proxy with one is refused with an error. Only pages answer the
+challenge, but Chrome keeps the login for the context once given, so a
+page's workers and frames from other sites, which are targets of their
+own, get through without being asked; a test checks a worker does.
 
 **Installing Chrome.** `netweir install chrome` downloads the Chrome for
 Testing build whose major version matches netweir's newest Chrome
