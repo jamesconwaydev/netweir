@@ -82,7 +82,9 @@ impl Query {
             query: css.to_string(),
             reason,
         };
-        let mut parts = Vec::new();
+        // Owned by a Query from the start, so a later part failing to
+        // compile frees the parts compiled before it.
+        let mut query = Query { parts: Vec::new() };
         for piece in split_top_level(css) {
             let (selector, output) = split_output(piece).ok_or_else(|| error("bad ::attr()"))?;
             let list = if selector.trim().is_empty() {
@@ -97,9 +99,9 @@ impl Query {
                 }
                 list
             };
-            parts.push(Part { list, output });
+            query.parts.push(Part { list, output });
         }
-        Ok(Query { parts })
+        Ok(query)
     }
 
     /// The ending of each selector in the list, in order.

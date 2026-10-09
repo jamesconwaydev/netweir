@@ -220,3 +220,27 @@ fn comma_lists_keep_equal_attribute_values_in_source_order() {
     assert_eq!(q("a::attr(title), a::attr(href)"), ["x", "x", "z", "y"]);
     assert_eq!(q("a::attr(href), a::attr(href)"), ["x", "y"]);
 }
+
+/// Resident memory in kilobytes, from ps.
+fn rss_kb() -> u64 {
+    let out = std::process::Command::new("ps")
+        .args(["-o", "rss=", "-p", &std::process::id().to_string()])
+        .output()
+        .unwrap();
+    String::from_utf8_lossy(&out.stdout).trim().parse().unwrap()
+}
+
+#[test]
+fn a_list_that_fails_part_way_frees_what_it_compiled() {
+    // Forty good selectors, then a bad one.
+    let css = "p.a, ".repeat(40) + "p[";
+    for _ in 0..200 {
+        assert!(Query::new(&css).is_err());
+    }
+    let before = rss_kb();
+    for _ in 0..2000 {
+        assert!(Query::new(&css).is_err());
+    }
+    let grew = rss_kb().saturating_sub(before);
+    assert!(grew < 20_000, "grew {grew} kB over 2000 failed compiles");
+}
