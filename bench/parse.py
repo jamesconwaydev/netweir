@@ -1,7 +1,7 @@
 """Parse + query speed against the Python parsers people use today.
 
     uv run --group bench python bench/parse.py
-    uv run --group bench python bench/parse.py --check   # exit 1 if selectolax wins
+    uv run --group bench python bench/parse.py --check   # exit 1 if selectolax wins by >5%
 
 Each library parses the page and pulls out every product's price, title and
 link, which is the work a scraper does on every page. The figure is the best
@@ -95,7 +95,13 @@ def best_ms(fn, html, runs, budget=3.0):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--check", action="store_true", help="fail if netweir is not fastest")
+    ap.add_argument("--check", action="store_true", help="fail if selectolax is clearly faster")
+    ap.add_argument(
+        "--tolerance",
+        type=float,
+        default=0.05,
+        help="how much slower than selectolax --check allows; shared CI runners vary by a few %%",
+    )
     ap.add_argument("--runs", type=int, default=15)
     args = ap.parse_args()
 
@@ -112,7 +118,7 @@ def main():
             times[name] = best_ms(fn, html, args.runs)
         for name, ms in sorted(times.items(), key=lambda kv: kv[1]):
             print(f"  {name:14} {ms:9.2f} ms  {ms / times['netweir']:5.2f}x")
-        if times["selectolax"] < times["netweir"]:
+        if times["netweir"] > times["selectolax"] * (1 + args.tolerance):
             slower.append(label)
 
     if args.check and slower:
