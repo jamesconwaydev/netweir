@@ -67,6 +67,8 @@ struct Tag {
     /// Give the page to Python.
     to_python: bool,
     url: String,
+    /// The request's depth; links found on its page are one deeper.
+    depth: u32,
 }
 
 /// What became of a page that needed Rust work.
@@ -111,6 +113,7 @@ enum Out {
         url: String,
         response: netweir_core::Response,
         root: Option<Arc<Document>>,
+        depth: u32,
     },
     RuleFailed {
         rule: usize,
@@ -150,7 +153,7 @@ impl Engine {
 
     /// Queues the links a rule page gave, tagged with the rule that found
     /// each.
-    fn submit_links(&self, rules: &[Arc<Rule>], links: Vec<(String, usize)>) {
+    fn submit_links(&self, rules: &[Arc<Rule>], links: Vec<(String, usize)>, depth: u32) {
         for (url, at) in links {
             let rule = &rules[at];
             let id = self.next_id.fetch_add(1, Ordering::Relaxed);
@@ -162,6 +165,7 @@ impl Engine {
                     apply_rules: rule.follow,
                     to_python: rule.to_python,
                     url: url.clone(),
+                    depth,
                 },
             );
             let request = CrawlRequest {
@@ -170,6 +174,7 @@ impl Engine {
                 priority: rule.priority,
                 headers: Vec::new(),
                 dont_filter: false,
+                depth,
             };
             if self.core.submit(request) != Submitted::Queued {
                 self.tags().remove(&id);
@@ -337,7 +342,7 @@ impl Engine {
                         continue;
                     }
                 };
-                self.submit_links(&rules, done.links);
+                self.submit_links(&rules, done.links, done.tag.depth + 1);
                 if let Some(message) = done.error {
                     out.push(Out::PageError {
                         url: done.tag.url.clone(),
@@ -359,6 +364,7 @@ impl Engine {
                         url: done.tag.url,
                         response,
                         root: done.root,
+                        depth: done.tag.depth,
                     }),
                     (None, Some(response)) => out.push(Out::Fetched {
                         id: done.id,
@@ -446,6 +452,7 @@ fn out_py<'py>(py: Python<'py>, engine: &Engine, event: Out) -> PyResult<Bound<'
             url,
             response: r,
             root,
+            depth,
         } => tuple(
             py,
             vec![
@@ -454,6 +461,7 @@ fn out_py<'py>(py: Python<'py>, engine: &Engine, event: Out) -> PyResult<Bound<'
                 s(&url)?,
                 response(r)?,
                 root_py(py, root)?,
+                n(depth.into())?,
             ],
         ),
         Out::RuleFailed { rule, url, error } => tuple(
@@ -483,6 +491,7 @@ impl Crawler {
         profile="chrome", proxy=None, timeout=30.0, verify=true,
         concurrency=64, per_domain=8, obey_robots=true, robots_agent="netweir", obey_tdmrep=true,
         throttle=true, start_delay=1.0, min_delay=0.0, max_delay=60.0, target_concurrency=1.0,
+        max_depth=None, max_pages_per_domain=None,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -500,6 +509,8 @@ impl Crawler {
         min_delay: f64,
         max_delay: f64,
         target_concurrency: f64,
+        max_depth: Option<u32>,
+        max_pages_per_domain: Option<u64>,
     ) -> PyResult<Crawler> {
         if concurrency == 0 || per_domain == 0 {
             return Err(PyValueError::new_err(
@@ -529,6 +540,8 @@ impl Crawler {
             min_delay,
             max_delay,
             target_concurrency,
+            max_depth,
+            max_pages_per_domain,
         };
         let options = fetch_options(profile, proxy, timeout, verify)?;
         // The scheduler runs on the shared runtime.
@@ -577,11 +590,12 @@ impl Crawler {
         Ok(rules.len() - 1)
     }
 
-    /// Queues a request. Returns "queued", "duplicate" or "invalid".
+    /// Queues a request. Returns "queued", "duplicate", "invalid",
+    /// "too_deep", "trap" or "domain_full".
     /// With `apply_rules`, the rules take links from the page; then the page
     /// reaches Python only if `to_python`, and a "handled" event says so
     /// otherwise.
-    #[pyo3(signature = (id, url, priority=0, headers=None, dont_filter=false, apply_rules=false, to_python=true))]
+    #[pyo3(signature = (id, url, priority=0, headers=None, dont_filter=false, apply_rules=false, to_python=true, depth=0))]
     #[allow(clippy::too_many_arguments)]
     fn submit(
         &self,
@@ -592,6 +606,7 @@ impl Crawler {
         dont_filter: bool,
         apply_rules: bool,
         to_python: bool,
+        depth: u32,
     ) -> PyResult<&'static str> {
         if id >= RULE_IDS {
             return Err(PyValueError::new_err("request ids must be below 2**62"));
@@ -604,6 +619,7 @@ impl Crawler {
                     apply_rules,
                     to_python,
                     url: url.clone(),
+                    depth,
                 },
             );
         }
@@ -613,6 +629,7 @@ impl Crawler {
             priority,
             headers: headers.unwrap_or_default(),
             dont_filter,
+            depth,
         };
         let outcome = self.engine.core.submit(request);
         if outcome != Submitted::Queued {
@@ -622,6 +639,9 @@ impl Crawler {
             Submitted::Queued => "queued",
             Submitted::Duplicate => "duplicate",
             Submitted::Invalid => "invalid",
+            Submitted::TooDeep => "too_deep",
+            Submitted::Trap => "trap",
+            Submitted::DomainFull => "domain_full",
         })
     }
 
@@ -629,7 +649,7 @@ impl Crawler {
     /// root Node or None), ("failed", id, FetchError), ("dropped", id,
     /// "robots" | "tdm"), ("handled", id), ("item", rule, dict, [(field,
     /// text)] that would not convert), ("ruled", rule, url, Response, root
-    /// Node), ("rule_failed", rule, url, FetchError), ("rule_dropped", rule,
+    /// Node, depth), ("rule_failed", rule, url, FetchError), ("rule_dropped", rule,
     /// url, reason) or ("page_error", url, message). An empty list means the
     /// crawl is finished.
     #[pyo3(signature = (max=256))]
@@ -659,6 +679,9 @@ impl Crawler {
         d.set_item("dropped_robots", s.dropped_robots)?;
         d.set_item("dropped_tdm", s.dropped_tdm)?;
         d.set_item("bytes", s.bytes)?;
+        d.set_item("skipped_depth", s.skipped_depth)?;
+        d.set_item("skipped_traps", s.skipped_traps)?;
+        d.set_item("skipped_domain_full", s.skipped_domain_full)?;
         Ok(d)
     }
 }

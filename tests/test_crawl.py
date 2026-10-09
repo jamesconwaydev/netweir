@@ -562,3 +562,29 @@ def test_command_line_missing_file(tmp_path):
     )
     assert done.returncode == 2
     assert "no such file" in done.stderr and "Traceback" not in done.stderr
+
+
+def test_max_depth_stops_following(base):
+    depths = []
+
+    class Deep(netweir.Spider):
+        settings = netweir.Settings(throttle=False, start_delay=0, max_depth=1)
+
+        async def parse(self, page):
+            depths.append((page.url.rsplit("/", 1)[1], page.depth))
+            if nxt := page.css("li.next a::attr(href)").get():
+                yield page.follow(nxt)
+
+    spider = Deep()
+    spider.start_urls = [f"{base}/page/1"]
+    stats = spider.run()
+    assert depths == [("1", 0), ("2", 1)]
+    assert stats["skipped_depth"] == 1
+
+
+def test_max_pages_per_domain(base):
+    spider = Books()
+    spider.settings = netweir.Settings(throttle=False, start_delay=0, max_pages_per_domain=2)
+    spider.start_urls = [f"{base}/page/1"]
+    stats = spider.run()
+    assert stats["fetched"] == 2 and stats["skipped_domain_full"] == 1

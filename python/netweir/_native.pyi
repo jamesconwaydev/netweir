@@ -254,6 +254,8 @@ class Crawler:
         min_delay: float = 0.0,
         max_delay: float = 60.0,
         target_concurrency: float = 1.0,
+        max_depth: int | None = None,
+        max_pages_per_domain: int | None = None,
     ) -> None: ...
     def add_rule(
         self,
@@ -273,7 +275,8 @@ class Crawler:
         dont_filter: bool = False,
         apply_rules: bool = False,
         to_python: bool = True,
-    ) -> Literal["queued", "duplicate", "invalid"]: ...
+        depth: int = 0,
+    ) -> Literal["queued", "duplicate", "invalid", "too_deep", "trap", "domain_full"]: ...
     async def next(
         self, max: int = 256
     ) -> list[
@@ -282,7 +285,7 @@ class Crawler:
         | tuple[Literal["dropped"], int, Literal["robots", "tdm"]]
         | tuple[Literal["handled"], int]
         | tuple[Literal["item"], int, dict[str, Any], list[tuple[str, str, str]]]
-        | tuple[Literal["ruled"], int, str, Response, Node | None]
+        | tuple[Literal["ruled"], int, str, Response, Node | None, int]
         | tuple[Literal["rule_failed"], int, str, FetchError]
         | tuple[Literal["rule_dropped"], int, str, Literal["robots", "tdm"]]
         | tuple[Literal["page_error"], str, str]

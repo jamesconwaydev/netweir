@@ -15,7 +15,9 @@ class Request:
     ``callback`` is a function, or the name of a spider method, called with
     the Page; it defaults to the spider's ``parse``. ``errback`` is called
     with the Request and the FetchError when no response arrives. ``meta``
-    travels with the request and comes back as ``page.meta``.
+    travels with the request and comes back as ``page.meta``. ``depth`` is
+    set by the crawl: 0 for a start request, one more than its page's for
+    a request a callback yields.
     """
 
     url: str
@@ -25,3 +27,4 @@ class Request:
     meta: dict[str, Any] = dataclasses.field(default_factory=dict)
     dont_filter: bool = False
     errback: Callable[..., Any] | str | None = None
+    depth: int = 0

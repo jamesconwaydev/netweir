@@ -33,6 +33,7 @@ fn request(id: u64, url: String) -> CrawlRequest {
         priority: 0,
         headers: Vec::new(),
         dont_filter: false,
+        depth: 0,
     }
 }
 
@@ -583,4 +584,45 @@ async fn a_huge_crawl_delay_is_capped_at_max_delay() {
         "gap {gap:?}: the delay was ignored"
     );
     assert!(gap < Duration::from_secs(2), "gap {gap:?}");
+}
+
+#[tokio::test]
+async fn traps_are_refused_at_the_door() {
+    let site = Site::start(vec![("/a", Page::html("a"))]).await;
+    let c = crawler(CrawlSettings {
+        obey_robots: false,
+        obey_tdmrep: false,
+        max_depth: Some(2),
+        max_pages_per_domain: Some(3),
+        ..settings()
+    });
+    let deep = CrawlRequest {
+        depth: 3,
+        ..request(1, site.url("/deep"))
+    };
+    assert_eq!(c.submit(deep), Submitted::TooDeep);
+    let ok_depth = CrawlRequest {
+        depth: 2,
+        ..request(2, site.url("/a"))
+    };
+    assert_eq!(c.submit(ok_depth), Submitted::Queued);
+    assert_eq!(
+        c.submit(request(3, site.url("/x/y/x/y/x/y/page"))),
+        Submitted::Trap
+    );
+    assert_eq!(c.submit(request(4, site.url("/b"))), Submitted::Queued);
+    assert_eq!(c.submit(request(5, site.url("/c"))), Submitted::Queued);
+    assert_eq!(c.submit(request(6, site.url("/d"))), Submitted::DomainFull);
+    let other = request(7, site.url("/e").replace("127.0.0.1", "localhost"));
+    assert_eq!(c.submit(other), Submitted::Queued, "the limit is per host");
+    let stats = c.stats();
+    assert_eq!(
+        (
+            stats.skipped_depth,
+            stats.skipped_traps,
+            stats.skipped_domain_full
+        ),
+        (1, 1, 1)
+    );
+    drain(&c).await;
 }

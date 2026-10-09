@@ -11,6 +11,7 @@ mod fetch;
 mod profile;
 pub mod robots;
 pub mod tdmrep;
+pub mod traps;
 
 pub use crawl::{CrawlRequest, CrawlSettings, Crawler, DropReason, Event, Stats, Submitted};
 pub use decode::{decode, meta_content};

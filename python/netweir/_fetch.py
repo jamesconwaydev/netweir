@@ -88,6 +88,11 @@ class Page:
         return self.root.xpath(query, **variables)
 
     @property
+    def depth(self) -> int:
+        """Links followed from a start page to get here; 0 outside a crawl."""
+        return self.request.depth if self.request is not None else 0
+
+    @property
     def meta(self) -> dict:
         """The meta of the Request this page answers; empty outside a crawl."""
         return self.request.meta if self.request is not None else {}

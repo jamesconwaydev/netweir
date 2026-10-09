@@ -46,6 +46,10 @@ class Settings:
     min_delay: float = 0.0
     max_delay: float = 60.0
     target_concurrency: float = 1.0
+    #: Links followed from a start page beyond which requests are dropped.
+    max_depth: int | None = None
+    #: Requests accepted for one host beyond which more are dropped.
+    max_pages_per_domain: int | None = None
     #: Stop the crawl at the first exception in a callback or pipeline.
     fail_fast: bool = False
 
@@ -58,6 +62,10 @@ class Settings:
             raise ValueError("delays must be non-negative, with min_delay <= max_delay")
         if self.target_concurrency <= 0:
             raise ValueError("target_concurrency must be positive")
+        if self.max_depth is not None and self.max_depth < 0:
+            raise ValueError("max_depth must be 0 or more")
+        if self.max_pages_per_domain is not None and self.max_pages_per_domain < 1:
+            raise ValueError("max_pages_per_domain must be at least 1")
 
     def _engine(self) -> Crawler:
         return Crawler(
@@ -74,6 +82,8 @@ class Settings:
             min_delay=self.min_delay,
             max_delay=self.max_delay,
             target_concurrency=self.target_concurrency,
+            max_depth=self.max_depth,
+            max_pages_per_domain=self.max_pages_per_domain,
         )
 
 
@@ -146,6 +156,8 @@ class _Run:
         # parse runs alongside the rules only if the spider writes its own.
         self.has_parse = type(spider).parse is not Spider.parse
         self.warned: set[str] = set()
+        #: Depth of requests the running callback yields.
+        self.depth = 0
         self.counts = {
             "items": 0,
             "items_dropped": 0,
@@ -167,6 +179,7 @@ class _Run:
             request.dont_filter,
             apply_rules=apply_rules,
             to_python=to_python,
+            depth=request.depth,
         )
         if outcome == "queued":
             self.waiting[rid] = request
@@ -218,9 +231,9 @@ class _Run:
             _warn_invalid(invalid, self.warned)
             await self.handle(item_class._finish(item, self.warned))
         elif kind == "ruled":
-            _, rule, url, response, root = event
+            _, rule, url, response, root, depth = event
             callback = self.rules[rule].callback
-            request = Request(url, callback=callback)
+            request = Request(url, callback=callback, depth=depth)
             page = Page(response, request, root)
             await self.run_callback(callback, None, (page,), url)
         elif kind == "rule_failed":
@@ -256,6 +269,9 @@ class _Run:
         self, fn: Callable[..., Any] | str | None, default: str | None, args: tuple, url: str
     ) -> None:
         name = fn if isinstance(fn, str) else getattr(fn, "__name__", default)
+        # What it yields is one link further from the start.
+        source = args[0]
+        self.depth = (source.depth if isinstance(source, (Page, Request)) else 0) + 1
         try:
             fn = self.resolve(fn, default)
             result = fn(*args)
@@ -279,6 +295,7 @@ class _Run:
         if out is None:
             return
         if isinstance(out, Request):
+            out.depth = self.depth
             self.submit(out)
             return
         if isinstance(out, _NOT_ITEMS):

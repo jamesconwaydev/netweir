@@ -306,3 +306,15 @@ def test_a_pattern_group_that_did_not_take_part_is_empty_like_parsel():
         g = netweir.css("p::text", re=r"x(y)?")
 
     assert G.extract(netweir.parse("<p>x</p>")) == {"g": ""}
+
+
+def test_rules_respect_max_depth(base):
+    spider = books_spider(
+        base,
+        settings=netweir.Settings(throttle=False, start_delay=0, obey_tdmrep=False, max_depth=1),
+    )
+    items, stats = collect(spider)
+    # Page 1 (depth 0) and its books and page 2 (depth 1); page 2's links
+    # would be depth 2.
+    assert len(items) == PER_PAGE
+    assert stats["skipped_depth"] > 0

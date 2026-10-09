@@ -14,6 +14,7 @@ use crate::canonical::{Fingerprint, fingerprint};
 use crate::fetch::{FetchError, FetchErrorKind, FetchOptions, Fetcher, Hop, Response};
 use crate::robots::Robots;
 use crate::tdmrep::{self, Reservation, TdmFile};
+use crate::traps;
 
 #[derive(Debug, Clone)]
 pub struct CrawlSettings {
@@ -33,6 +34,10 @@ pub struct CrawlSettings {
     pub max_delay: Duration,
     /// Requests the throttle aims to have in flight to one host.
     pub target_concurrency: f64,
+    /// Links followed from a start page beyond which requests are refused.
+    pub max_depth: Option<u32>,
+    /// Requests accepted for one host beyond which more are refused.
+    pub max_pages_per_domain: Option<u64>,
 }
 
 impl Default for CrawlSettings {
@@ -48,6 +53,8 @@ impl Default for CrawlSettings {
             min_delay: Duration::ZERO,
             max_delay: Duration::from_secs(60),
             target_concurrency: 1.0,
+            max_depth: None,
+            max_pages_per_domain: None,
         }
     }
 }
@@ -62,6 +69,8 @@ pub struct CrawlRequest {
     pub headers: Vec<(String, String)>,
     /// Fetch even if an equal request was seen before.
     pub dont_filter: bool,
+    /// Links followed to get here from a start page (which is 0).
+    pub depth: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -71,6 +80,12 @@ pub enum Submitted {
     Duplicate,
     /// Not an http(s) URL.
     Invalid,
+    /// Deeper than `max_depth`.
+    TooDeep,
+    /// The path repeats itself, as crawler traps do.
+    Trap,
+    /// The host already has `max_pages_per_domain` requests.
+    DomainFull,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -99,6 +114,9 @@ pub struct Stats {
     pub dropped_robots: u64,
     pub dropped_tdm: u64,
     pub bytes: u64,
+    pub skipped_depth: u64,
+    pub skipped_traps: u64,
+    pub skipped_domain_full: u64,
 }
 
 /// A crawl in progress. Dropping it stops the scheduler; fetches already
@@ -146,6 +164,8 @@ struct Host {
     listed: bool,
     /// When this host's timer is set for, so it is set once.
     timer: Option<Instant>,
+    /// Requests submitted for this host, for `max_pages_per_domain`.
+    accepted: u64,
 }
 
 #[derive(Default)]
@@ -213,14 +233,40 @@ impl Crawler {
         let Some(fp) = fingerprint("GET", &request.url) else {
             return Submitted::Invalid;
         };
+        let Ok(parsed) = Url::parse(&request.url) else {
+            return Submitted::Invalid;
+        };
+        let settings = &self.shared.settings;
         let mut state = self.shared.lock();
+        if settings.max_depth.is_some_and(|max| request.depth > max) {
+            state.stats.skipped_depth += 1;
+            return Submitted::TooDeep;
+        }
+        if traps::repeats(parsed.path()) {
+            state.stats.skipped_traps += 1;
+            return Submitted::Trap;
+        }
         if !state.seen.insert(fp) && !request.dont_filter {
             state.stats.duplicates += 1;
             return Submitted::Duplicate;
         }
+        let host = parsed.host_str().unwrap_or_default();
+        let accepted = state.hosts.get(host).map_or(0, |h| h.accepted);
+        if settings
+            .max_pages_per_domain
+            .is_some_and(|max| accepted >= max)
+        {
+            // Not seen after all: the same URL is refused the same way.
+            state.seen.remove(&fp);
+            state.stats.skipped_domain_full += 1;
+            return Submitted::DomainFull;
+        }
         let url = request.url.clone();
-        if !enqueue(&self.shared.settings, &mut state, request, &url, 0) {
+        if !enqueue(settings, &mut state, request, &url, 0) {
             return Submitted::Invalid;
+        }
+        if let Some(h) = parsed.host_str().and_then(|h| state.hosts.get_mut(h)) {
+            h.accepted += 1;
         }
         drop(state);
         self.shared.schedule.notify_one();
@@ -403,6 +449,7 @@ fn enqueue(
             floor: Duration::ZERO,
             listed: false,
             timer: None,
+            accepted: 0,
         })
         .queue
         .push(queued);
@@ -806,6 +853,7 @@ mod tests {
                 priority,
                 headers: vec![],
                 dont_filter: false,
+                depth: 0,
             },
             host: String::new(),
             origin: String::new(),
