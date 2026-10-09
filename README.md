@@ -305,6 +305,25 @@ netweir builds a flat index of the document on the first query, so `//x` is
 a scan over a few arrays, and its time grows with the page and no faster.
 Both benchmarks run in CI, and the build fails if any library beats netweir.
 
+Parsing is one part of a crawl. `bench/crawl.py` times the whole thing: one
+local server plays 100 sites of 100 pages, each answer 50 ms late, and every
+crawler fetches all 10,000 pages and pulls a title and price from each,
+with the same limits (100 requests in flight, 8 per site):
+
+| | Pages a second | CPU per page | Peak memory |
+|---|---|---|---|
+| netweir | 1,770 | 0.22 ms | 68 MB |
+| Scrapy 2.19 | 890 | 1.1 ms | 125 MB |
+| httpx + selectolax | 220 | 3.2 ms | 190 MB |
+| Scrapling 0.4 | 180 | 0.8 ms | 76 MB |
+
+With 100 requests in flight and 50 ms per answer, 2,000 pages a second is
+the most any crawler could do here, so netweir is waiting on the server,
+not on itself. Scrapling is held back by its HTTP session's default of 10
+connections, which it doesn't let you change; that is how it ships. Same
+laptop, Python 3.13; run it yourself with
+`uv run python bench/crawl.py` once the others are installed.
+
 Pages you don't control can be built to be slow to parse. Pass a timeout and
 netweir gives up instead of hanging:
 
