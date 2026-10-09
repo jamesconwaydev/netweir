@@ -203,8 +203,8 @@ site that keeps blocking is paused for a while instead of hammered. With
 `browser="on_block"`, a request still blocked after all that gets one go in
 Chrome, which waits for the challenge to pass and then hands its cookies to
 the HTTP client, so the rest of the site doesn't need Chrome. If even that
-fails, your spider's `on_block(request, page)` hears about it. Outside a crawl, `netweir.get` raises
-`netweir.Blocked`, naming the vendor.
+fails, your spider's `on_block(request, page)` hears about it. Outside a
+crawl, `netweir.get` raises `netweir.Blocked`, naming the vendor.
 
 **The crawl dies.** Give it somewhere to keep its state and run it again
 after a crash, a reboot or a `kill -9`:

@@ -445,7 +445,7 @@ async fn wait_for_navigation_follows_a_script_that_moves_the_page_on() {
         .unwrap();
     assert_eq!(first.url, format!("{}/", server.url));
     let next = page
-        .wait_for_navigation(WaitUntil::Load, None)
+        .wait_for_navigation(&first, WaitUntil::Load, None)
         .await
         .unwrap();
     assert_eq!(
@@ -453,8 +453,14 @@ async fn wait_for_navigation_follows_a_script_that_moves_the_page_on() {
         (200, format!("{}/next", server.url))
     );
     assert_eq!(page.response(), next);
+    // Already past `first`: nothing more to wait for.
+    let again = page
+        .wait_for_navigation(&first, WaitUntil::Load, SHORT)
+        .await
+        .unwrap();
+    assert_eq!(again, next);
     let err = page
-        .wait_for_navigation(WaitUntil::Load, SHORT)
+        .wait_for_navigation(&next, WaitUntil::Load, SHORT)
         .await
         .unwrap_err();
     assert!(matches!(err, Error::Timeout(_)), "{err}");

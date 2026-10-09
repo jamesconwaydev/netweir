@@ -195,6 +195,23 @@ struct Live {
     page: netweir_browser::Page,
     permit: Mutex<Option<OwnedSemaphorePermit>>,
     runtime: tokio::runtime::Handle,
+    /// Told when the page's slot frees, so a browser request waiting for
+    /// one can start.
+    shared: std::sync::Weak<Shared>,
+}
+
+impl Live {
+    fn free(&self) {
+        let freed = self
+            .permit
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+            .is_some();
+        if freed && let Some(shared) = self.shared.upgrade() {
+            shared.schedule.notify_one();
+        }
+    }
 }
 
 impl LivePage {
@@ -204,16 +221,13 @@ impl LivePage {
 
     pub async fn close(&self) {
         let _ = self.inner.page.close().await;
-        self.inner
-            .permit
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .take();
+        self.inner.free();
     }
 }
 
 impl Drop for Live {
     fn drop(&mut self) {
+        self.free();
         if !self.page.is_closed() {
             let page = self.page.clone();
             self.runtime.spawn(async move {
@@ -305,6 +319,10 @@ struct State {
     closed: bool,
     /// Whether the crawl was told no HTTP profile matches its Chrome.
     warned_profile: bool,
+    /// Whether the crawl was told a blocked request couldn't go to Chrome.
+    warned_browser: bool,
+    /// Hosts whose next request waits for a free Chrome page.
+    page_waiters: Vec<String>,
 }
 
 struct Host {
@@ -666,7 +684,8 @@ enum Persist<'a> {
 
 /// What the scheduler decided to do with a host's next request.
 enum Action {
-    Fetch(Box<Queued>, Fetcher),
+    /// With a Chrome page slot for a browser request.
+    Fetch(Box<Queued>, Fetcher, Option<OwnedSemaphorePermit>),
     CheckRobots(String),
     CheckTdm(String),
     /// Another host's check of the same origin is under way.
@@ -688,10 +707,10 @@ async fn schedule_loop(s: Arc<Shared>) {
         };
         for action in actions {
             match action {
-                Action::Fetch(q, _) if q.in_browser => {
-                    tokio::spawn(browser_fetch(s.clone(), *q));
+                Action::Fetch(q, _, Some(permit)) => {
+                    tokio::spawn(browser_fetch(s.clone(), *q, permit));
                 }
-                Action::Fetch(q, session) => {
+                Action::Fetch(q, session, None) => {
                     tokio::spawn(fetch(s.clone(), *q, session));
                 }
                 Action::CheckRobots(origin) => {
@@ -818,6 +837,12 @@ fn plan(
         }
         state.make_ready(&name);
     }
+    // A Chrome page has freed: the hosts that waited for one go first.
+    if !state.page_waiters.is_empty() && shared.pages.available_permits() > 0 {
+        for name in std::mem::take(&mut state.page_waiters) {
+            state.make_ready(&name);
+        }
+    }
     let mut actions = Vec::new();
     'hosts: while let Some(name) = state.ready.front().cloned() {
         // Gate fetches count against the limit like any other request.
@@ -920,6 +945,22 @@ fn plan(
                 }
                 break;
             }
+            // A browser request starts only with a Chrome page to use, so
+            // it never holds a slot other requests could have had while it
+            // waits for one.
+            let permit = if host.queue.peek().is_some_and(|q| q.in_browser) {
+                match shared.pages.clone().try_acquire_owned() {
+                    Ok(permit) => Some(permit),
+                    Err(_) => {
+                        if !state.page_waiters.contains(&name) {
+                            state.page_waiters.push(name.clone());
+                        }
+                        break;
+                    }
+                }
+            } else {
+                None
+            };
             let q = host.queue.pop().expect("peeked above");
             host.in_flight += 1;
             host.next_at = now + host.delay.max(host.floor);
@@ -929,7 +970,7 @@ fn plan(
                 .session
                 .clone()
                 .unwrap_or_else(|| shared.fetcher.clone());
-            actions.push(Action::Fetch(Box::new(q), session));
+            actions.push(Action::Fetch(Box::new(q), session, permit));
         }
     }
     let sleep_until = state.timers.peek().map(|Reverse((at, _))| *at);
@@ -1005,10 +1046,11 @@ async fn fetch(shared: Arc<Shared>, mut q: Queued, session: Fetcher) {
                 retry(settings, &mut state, q);
                 None
             } else if settings.browser == BrowserMode::OnBlock {
-                // One more go, in Chrome.
+                // One more go, in Chrome, once the host's delay is up. Not a
+                // retry: the retries are spent.
                 q.in_browser = true;
                 q.blocked = Some(Box::new((vendor, kind, response)));
-                retry(settings, &mut state, q);
+                requeue(&mut state, q, Duration::ZERO);
                 None
             } else {
                 Some(Event::Blocked {
@@ -1105,12 +1147,33 @@ async fn fetch(shared: Arc<Shared>, mut q: Queued, session: Fetcher) {
 /// How long a challenge page gets to pass and move on in Chrome.
 const CHALLENGE_WAIT: Duration = Duration::from_secs(20);
 
-/// Fetches `q` in Chrome, and deals with the outcome as `fetch` does for
-/// the HTTP client. A page that's still blocked isn't retried there.
-async fn browser_fetch(shared: Arc<Shared>, mut q: Queued) {
-    let started = Instant::now();
+/// What `render` brings back: the response, the open page, its cookies
+/// when asked for, and how long the page took to load.
+type Rendered = (Response, LivePage, Vec<Cookie>, Duration);
+
+/// Fetches `q` in Chrome, in the page slot `permit` holds, and deals with
+/// the outcome as `fetch` does for the HTTP client. A page that's still
+/// blocked isn't retried in Chrome.
+async fn browser_fetch(shared: Arc<Shared>, mut q: Queued, permit: OwnedSemaphorePermit) {
+    let timeout = shared.options.timeout;
+    // A Chrome that stops answering mid-page mustn't hold the request, and
+    // its place in the crawl, for good.
+    let limit = timeout.saturating_mul(2) + CHALLENGE_WAIT;
+    let work = render(
+        shared.clone(),
+        q.request.url.clone(),
+        q.blocked.is_some(),
+        permit,
+    );
     let rendered = guarded(
-        render(shared.clone(), q.request.url.clone(), q.blocked.is_some()),
+        async move {
+            tokio::time::timeout(limit, work).await.unwrap_or_else(|_| {
+                Err(FetchError {
+                    kind: FetchErrorKind::Timeout,
+                    message: format!("Chrome took more than {}s", limit.as_secs()),
+                })
+            })
+        },
         |why| {
             Err(FetchError {
                 kind: FetchErrorKind::Other,
@@ -1119,16 +1182,16 @@ async fn browser_fetch(shared: Arc<Shared>, mut q: Queued) {
         },
     )
     .await;
-    let latency = started.elapsed();
     let settings = &shared.settings;
-    let outcome = rendered.as_ref().ok().map(|(r, _, _)| classify(r));
+    let outcome = rendered.as_ref().ok().map(|(r, ..)| classify(r));
     let mut state = shared.lock();
     state.stats.in_flight -= 1;
     if let Some(host) = state.hosts.get_mut(&q.host) {
         host.in_flight -= 1;
-        if settings.throttle {
-            let status = rendered.as_ref().ok().map(|(r, _, _)| r.status);
-            host.delay = adjust_delay(settings, host.delay, latency, status);
+        if settings.throttle
+            && let Ok((r, _, _, latency)) = &rendered
+        {
+            host.delay = adjust_delay(settings, host.delay, *latency, Some(r.status));
         }
     }
     if let Some(outcome) = &outcome {
@@ -1141,8 +1204,11 @@ async fn browser_fetch(shared: Arc<Shared>, mut q: Queued) {
         );
     }
     state.make_ready(&q.host);
+    // Pages to close once the lock is released.
+    let mut discard = None;
     let event = match (rendered, outcome) {
-        (Ok((response, _page, _)), Some(Outcome::Blocked { vendor, kind })) => {
+        (Ok((response, page, ..)), Some(Outcome::Blocked { vendor, kind })) => {
+            discard = Some(page);
             state.stats.blocked += 1;
             slow_down(settings, &mut state, &q.host, None, true);
             Some(Event::Blocked {
@@ -1152,7 +1218,15 @@ async fn browser_fetch(shared: Arc<Shared>, mut q: Queued) {
                 response,
             })
         }
-        (Ok((response, page, cookies)), outcome) => {
+        (Ok((response, page, cookies, _)), outcome) => {
+            // Chrome follows redirects itself: where it ended up counts as
+            // seen, as a redirect the HTTP client followed would.
+            if let Some(fp) = fingerprint("GET", &response.url)
+                && state.seen.insert(fp)
+                && let Some(cp) = &shared.checkpoint
+            {
+                cp.seen(fp);
+            }
             if q.blocked.is_some() && matches!(outcome, Some(Outcome::Ok)) {
                 state.stats.browser_unblocked += 1;
                 if let Some(message) = hand_back(&shared, &mut state, &q.host, &cookies) {
@@ -1160,6 +1234,7 @@ async fn browser_fetch(shared: Arc<Shared>, mut q: Queued) {
                 }
             }
             if settings.obey_tdmrep && page_reserved(&state, &q, &response) {
+                discard = Some(page);
                 Some(Event::Dropped {
                     id: q.request.id,
                     reason: DropReason::TdmReserved,
@@ -1177,8 +1252,17 @@ async fn browser_fetch(shared: Arc<Shared>, mut q: Queued) {
             None
         }
         (Err(error), _) => match q.blocked.take() {
-            // Chrome didn't get anywhere: it's still the block it was.
+            // Chrome didn't get anywhere: it's still the block it was. Say
+            // why once, or escalation would fail without a word.
             Some(blocked) => {
+                if !state.warned_browser {
+                    state.warned_browser = true;
+                    let message = format!(
+                        "a blocked request couldn't be tried in Chrome, so on_block gets it: {}",
+                        error.message
+                    );
+                    shared.push_event(&mut state, Event::Warning { message });
+                }
                 let (vendor, kind, response) = *blocked;
                 Some(Event::Blocked {
                     id: q.request.id,
@@ -1197,6 +1281,7 @@ async fn browser_fetch(shared: Arc<Shared>, mut q: Queued) {
         shared.push_event(&mut state, event);
     }
     drop(state);
+    drop(discard);
     shared.schedule.notify_one();
 }
 
@@ -1207,13 +1292,8 @@ async fn render(
     shared: Arc<Shared>,
     url: String,
     cookies: bool,
-) -> Result<(Response, LivePage, Vec<Cookie>), FetchError> {
-    let permit = shared
-        .pages
-        .clone()
-        .acquire_owned()
-        .await
-        .map_err(|_| browser_error(netweir_browser::Error::Closed))?;
+    permit: OwnedSemaphorePermit,
+) -> Result<Rendered, FetchError> {
     let launch = browser_launch(&shared)?;
     let browser = shared
         .browser
@@ -1230,38 +1310,65 @@ async fn render(
             page: page.clone(),
             permit: Mutex::new(Some(permit)),
             runtime: shared.runtime.clone(),
+            shared: Arc::downgrade(&shared),
         }),
     };
     let timeout = shared.options.timeout;
+    let started = Instant::now();
     let mut document = page
         .goto(&url, WaitUntil::Load, Some(timeout))
         .await
         .map_err(browser_error)?;
-    let mut response = rendered(&document, page.content().await.map_err(browser_error)?);
+    let latency = started.elapsed();
     let deadline = Instant::now() + CHALLENGE_WAIT.min(timeout);
-    while matches!(
-        classify(&response),
-        Outcome::Blocked {
-            kind: BlockKind::Challenge,
-            ..
+    let response = loop {
+        // A script may already have moved the page on (a challenge that
+        // passes at once does): read the newest document, once loaded.
+        if page.response().loader != document.loader {
+            let left = deadline.saturating_duration_since(Instant::now());
+            match page
+                .wait_for_navigation(&document, WaitUntil::Load, Some(left))
+                .await
+            {
+                Ok(next) => document = next,
+                Err(netweir_browser::Error::Timeout(_)) => {}
+                Err(e) => return Err(browser_error(e)),
+            }
         }
-    ) {
+        let response = rendered(&document, page.content().await.map_err(browser_error)?);
+        let challenged = matches!(
+            classify(&response),
+            Outcome::Blocked {
+                kind: BlockKind::Challenge,
+                ..
+            }
+        );
         let left = deadline.saturating_duration_since(Instant::now());
-        if left.is_zero() {
-            break;
+        if !challenged || left.is_zero() {
+            break response;
         }
-        match page.wait_for_navigation(WaitUntil::Load, Some(left)).await {
+        match page
+            .wait_for_navigation(&document, WaitUntil::Load, Some(left))
+            .await
+        {
             Ok(next) => document = next,
-            Err(_) => break,
+            // Out of time. One last look, for a challenge that swaps the
+            // page's content without navigating.
+            Err(netweir_browser::Error::Timeout(_)) => {
+                break rendered(
+                    &page.response(),
+                    page.content().await.map_err(browser_error)?,
+                );
+            }
+            Err(e) => return Err(browser_error(e)),
         }
-        response = rendered(&document, page.content().await.map_err(browser_error)?);
-    }
+    };
     let cookies = if cookies {
         page.cookies().await.map_err(browser_error)?
     } else {
         Vec::new()
     };
-    Ok((response, live, cookies))
+    Ok((response, live, cookies, latency))
 }
 
 /// How to start Chrome for this crawl: through the crawl's proxy, so the
@@ -1384,6 +1491,7 @@ fn hand_back(shared: &Shared, state: &mut State, host: &str, cookies: &[Cookie])
     if let (Ok(fetcher), Some(h)) = (Fetcher::new(options), state.hosts.get_mut(host)) {
         fetcher.add_cookies(cookies);
         h.session = Some(fetcher);
+        state.stats.sessions_replaced += 1;
     }
     warning
 }
@@ -1412,6 +1520,11 @@ fn retry(settings: &CrawlSettings, state: &mut State, mut q: Queued) {
         .saturating_mul(1u32 << q.attempts.min(20))
         .min(settings.backoff_max);
     let wait = cap.mul_f64(random_fraction(q.seq));
+    requeue(state, q, wait);
+}
+
+/// Puts `q` back on its host's queue, to start no sooner than `wait`.
+fn requeue(state: &mut State, mut q: Queued, wait: Duration) {
     let host = q.host.clone();
     state.seq += 1;
     q.seq = state.seq;

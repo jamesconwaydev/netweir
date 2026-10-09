@@ -143,8 +143,12 @@ so `page.css(...)` sees what the scripts built. `page.browser` is the live
 page until the callback returns, then it closes. Browser requests wait their
 turn like any other: robots.txt, each site's limits and its delay all
 apply. `browser_pages` (4 by default) caps how many are open at once.
-Callbacks that a declarative spider's rules call get the rendered page,
-but not `page.browser`.
+A declarative spider's rules read the rendered HTML, so callbacks the rules
+call, and a rules spider's own `parse`, get the rendered page but not
+`page.browser`.
+
+A page Chrome answers with an error status, such as a 503, is handed to the
+callback as it is; only a page that never loaded is tried again.
 
 Two settings make Chrome step in on its own:
 
@@ -154,15 +158,23 @@ Two settings make Chrome step in on its own:
   cookies, so the next requests to that site go back to the HTTP client.
   Those cookies are often tied to the browser that earned them, so the
   session switches to netweir's profile for the installed Chrome's
-  version; if netweir has none, a warning says so.
+  version; if netweir has none, a warning says so. If Chrome can't be
+  started, the request goes to `on_block` as before, and a warning says
+  why.
 - `browser="always"`: every request goes through Chrome.
+
+Chrome is started once per crawl, the first time it's needed. If it can't
+start, or dies partway, browser requests fail for the rest of the crawl.
 
 Chrome goes through the crawl's `proxy`, so the cookies it earns come from
 the address the HTTP client uses. It can't use a proxy that asks for a
-username and password yet; with one, browser requests fail and say so.
+username and password yet; with one, browser requests fail and say so. Nor
+does it move through `proxies` as a blocked HTTP session does: it and the
+session it hands its cookies to both use `proxy`.
 
 The stats count `browser_fetches`, pages Chrome fetched, and
-`browser_unblocked`, blocked requests it got through.
+`browser_unblocked`, blocked requests it got through. Each hand-back counts
+in `sessions_replaced` too.
 
 ## Not looking automated
 

@@ -69,6 +69,35 @@ async fn drain(c: &Crawler) -> Vec<Event> {
     }
 }
 
+/// The first event about a request; warnings come and go with the
+/// machine (a runner's Chrome may have no matching profile).
+fn main(events: &[Event]) -> Option<&Event> {
+    events.iter().find(|e| !matches!(e, Event::Warning { .. }))
+}
+
+/// Like `drain`, but closes each Chrome page as it arrives, as a spider's
+/// callback returning would.
+async fn drain_closing(c: &Crawler) -> Vec<(Event, std::time::Instant)> {
+    let mut all = Vec::new();
+    loop {
+        let batch = tokio::time::timeout(Duration::from_secs(30), c.next(64))
+            .await
+            .expect("crawl stalled");
+        if batch.is_empty() {
+            return all;
+        }
+        for event in batch {
+            if let Event::Fetched {
+                page: Some(page), ..
+            } = &event
+            {
+                page.close().await;
+            }
+            all.push((event, std::time::Instant::now()));
+        }
+    }
+}
+
 const BUILT_BY_SCRIPT: &str = "<p id=static>static</p><script>document.body.insertAdjacentHTML('beforeend', '<p id=made>made by script</p>')</script>";
 
 #[tokio::test(flavor = "multi_thread")]
@@ -80,7 +109,7 @@ async fn a_browser_request_comes_back_rendered_with_its_page_open() {
     let c = crawler(settings(BrowserMode::Off));
     c.submit(request(1, site.url("/"), true));
     let events = drain(&c).await;
-    let Some(Event::Fetched { response, page, .. }) = events.first() else {
+    let Some(Event::Fetched { response, page, .. }) = main(&events) else {
         panic!("{events:?}");
     };
     assert_eq!(response.status, 200);
@@ -113,7 +142,7 @@ async fn other_requests_still_use_the_http_client() {
     let c = crawler(settings(BrowserMode::Off));
     c.submit(request(1, site.url("/"), false));
     let events = drain(&c).await;
-    let Some(Event::Fetched { response, page, .. }) = events.first() else {
+    let Some(Event::Fetched { response, page, .. }) = main(&events) else {
         panic!("{events:?}");
     };
     assert!(page.is_none());
@@ -146,9 +175,16 @@ async fn with_browser_always_every_request_goes_through_chrome() {
 /// A challenge that a browser passes: its script sets a cookie and
 /// reloads, and with the cookie the site serves the page.
 fn challenge() -> Page {
+    challenge_moving_on(
+        "setTimeout(() => { document.cookie = 'pass=1; path=/'; location.reload() }, 200)",
+    )
+}
+
+/// A challenge whose script `moves_on` once it has set the cookie.
+fn challenge_moving_on(moves_on: &str) -> Page {
     Page::status(
         403,
-        "<title>Just a moment...</title><script>setTimeout(() => { document.cookie = 'pass=1; path=/'; location.reload() }, 200)</script>",
+        &format!("<title>Just a moment...</title><script>{moves_on}</script>"),
     )
     .with_header("content-type", "text/html")
     .with_header("cf-mitigated", "challenge")
@@ -164,7 +200,7 @@ async fn a_blocked_request_gets_through_in_chrome_and_hands_its_cookies_back() {
     let c = crawler(settings(BrowserMode::OnBlock));
     c.submit(request(1, site.url("/guarded"), false));
     let events = drain(&c).await;
-    let Some(Event::Fetched { response, page, .. }) = events.first() else {
+    let Some(Event::Fetched { response, page, .. }) = main(&events) else {
         panic!("{events:?}");
     };
     assert_eq!(response.status, 200);
@@ -178,7 +214,7 @@ async fn a_blocked_request_gets_through_in_chrome_and_hands_its_cookies_back() {
     // The HTTP client now carries Chrome's cookie and isn't challenged.
     c.submit(request(2, site.url("/also"), false));
     let events = drain(&c).await;
-    let Some(Event::Fetched { response, page, .. }) = events.first() else {
+    let Some(Event::Fetched { response, page, .. }) = main(&events) else {
         panic!("{events:?}");
     };
     assert!(page.is_none(), "fetched over HTTP");
@@ -196,7 +232,7 @@ async fn without_escalation_a_block_goes_to_on_block() {
     c.submit(request(1, site.url("/guarded"), false));
     let events = drain(&c).await;
     assert!(
-        matches!(events.first(), Some(Event::Blocked { .. })),
+        matches!(main(&events), Some(Event::Blocked { .. })),
         "{events:?}"
     );
     assert_eq!(c.stats().browser_fetches, 0);
@@ -214,7 +250,7 @@ async fn a_chrome_that_wont_start_fails_its_requests() {
     });
     c.submit(request(1, site.url("/"), true));
     let events = drain(&c).await;
-    let Some(Event::Failed { error, .. }) = events.first() else {
+    let Some(Event::Failed { error, .. }) = main(&events) else {
         panic!("{events:?}");
     };
     assert!(
@@ -222,4 +258,104 @@ async fn a_chrome_that_wont_start_fails_its_requests() {
         "{}",
         error.message
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_challenge_that_moves_on_at_once_still_counts_as_passed() {
+    if !have_chrome() {
+        return;
+    }
+    // Real challenges navigate whenever they like, including before the
+    // first page has been read.
+    let site = Site::start(vec![
+        (
+            "/soon",
+            challenge_moving_on(
+                "setTimeout(() => { document.cookie = 'pass=1; path=/'; location.reload() }, 0)",
+            ),
+        ),
+        (
+            "/now",
+            challenge_moving_on("document.cookie = 'pass=1; path=/'; location.reload()"),
+        ),
+    ])
+    .await;
+    let c = crawler(settings(BrowserMode::OnBlock));
+    c.submit(request(1, site.url("/soon"), false));
+    c.submit(request(2, site.url("/now"), false));
+    let started = std::time::Instant::now();
+    let events = drain_closing(&c).await;
+    let passed = events
+        .iter()
+        .filter(|(e, _)| matches!(e, Event::Fetched { response, .. } if response.status == 200))
+        .count();
+    assert_eq!(passed, 2, "{events:?}");
+    assert!(
+        started.elapsed() < Duration::from_secs(15),
+        "{:?}",
+        started.elapsed()
+    );
+    assert_eq!(c.stats().browser_unblocked, 2);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_blocked_request_that_cant_reach_chrome_says_why() {
+    let site = Site::start(vec![("/guarded", challenge())]).await;
+    let c = crawler(CrawlSettings {
+        browser_launch: LaunchOptions {
+            executable: Some("/nonexistent/chrome".into()),
+            ..LaunchOptions::default()
+        },
+        ..settings(BrowserMode::OnBlock)
+    });
+    c.submit(request(1, site.url("/guarded"), false));
+    let events = drain(&c).await;
+    assert!(
+        matches!(main(&events), Some(Event::Blocked { .. })),
+        "{events:?}"
+    );
+    let warned = events.iter().any(
+        |e| matches!(e, Event::Warning { message } if message.contains("/nonexistent/chrome")),
+    );
+    assert!(warned, "{events:?}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn browser_requests_waiting_for_a_page_dont_hold_up_the_rest() {
+    if !have_chrome() {
+        return;
+    }
+    let slow = Page::html(BUILT_BY_SCRIPT).slow(Duration::from_millis(500));
+    let site = Site::start(vec![
+        ("/a", slow.clone()),
+        ("/b", slow.clone()),
+        ("/c", slow.clone()),
+    ])
+    .await;
+    let other = Site::start(vec![("/plain", Page::html("plain"))]).await;
+    let c = crawler(CrawlSettings {
+        concurrency: 2,
+        browser_pages: 1,
+        ..settings(BrowserMode::Off)
+    });
+    for (i, path) in ["/a", "/b", "/c"].iter().enumerate() {
+        c.submit(request(i as u64, site.url(path), true));
+    }
+    // Another host: localhost, where the browser requests go to 127.0.0.1.
+    c.submit(request(
+        9,
+        format!("http://localhost:{}/plain", other.port),
+        false,
+    ));
+    let events = drain_closing(&c).await;
+    let order: Vec<u64> = events
+        .iter()
+        .filter_map(|(e, _)| match e {
+            Event::Fetched { id, .. } => Some(*id),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(order.len(), 4, "{events:?}");
+    // The plain page needn't wait behind Chrome's queue.
+    assert!(order.iter().position(|&id| id == 9) < Some(2), "{order:?}");
 }

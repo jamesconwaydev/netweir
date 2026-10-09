@@ -60,6 +60,9 @@ pub struct Response {
     /// 0 when there was no HTTP response (about:, data:, chrome:).
     pub status: u16,
     pub headers: Vec<(String, String)>,
+    /// Chrome's id for the document's load, which
+    /// [`Page::wait_for_navigation`] waits past.
+    pub loader: String,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -197,6 +200,7 @@ impl State {
                     url: str_of(r, "url"),
                     status: r["status"].as_u64().unwrap_or(0) as u16,
                     headers,
+                    loader: str_of(p, "loaderId"),
                 };
                 // Navigations that never commit (a 204, a download) leave
                 // responses behind; only committed ones are kept.
@@ -411,20 +415,22 @@ impl Page {
         self.response_for(None)
     }
 
-    /// Waits for the page's next navigation, one that starts after this
-    /// call (a script's redirect, a form, a challenge passing), to reach
-    /// `wait`. Returns its response.
+    /// Waits until a document that replaced `after` (by a script's
+    /// redirect, a form, a challenge passing) reaches `wait`, and returns
+    /// the response of the document showing then. Returns at once if that
+    /// has already happened. Take `after` from [`Page::goto`] or
+    /// [`Page::response`] before whatever is expected to navigate.
     pub async fn wait_for_navigation(
         &self,
+        after: &Response,
         wait: WaitUntil,
         timeout: Option<Duration>,
     ) -> Result<Response> {
-        let current = self.state().loader.clone();
         let event = wait.event();
         self.until(
-            || format!("{event} of a navigation away from {}", self.url()),
+            || format!("{event} of a navigation away from {}", after.url),
             self.timeout(timeout),
-            |s| s.reached_after(&current, event),
+            |s| s.reached_after(&after.loader, event),
         )
         .await?;
         Ok(self.response_for(None))
@@ -441,6 +447,7 @@ impl Page {
                 url: state.url.clone(),
                 status: 0,
                 headers: Vec::new(),
+                loader: loader.to_string(),
             })
     }
 

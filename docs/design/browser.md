@@ -219,7 +219,19 @@ they own. Closing the browser closes every page.
 - A rendered page's `Response` has `version` `"browser"`, the document's
   status and headers, and the HTML as UTF-8, with the content type saying
   so and the original `content-encoding` and `content-length` dropped.
-- The stats count `browser_fetches` and `browser_unblocked`.
+- The stats count `browser_fetches` and `browser_unblocked`; a hand-back
+  counts in `sessions_replaced`, and sending a blocked request to Chrome
+  isn't counted as a retry.
+- A browser request starts only once a Chrome page is free, so one waiting
+  for a page holds no concurrency slot. The whole browser fetch has a
+  limit (twice the request timeout plus the challenge wait), so a Chrome
+  that stops answering can't hold the request forever.
+- Chrome follows redirects itself; the URL it ends on counts as seen. That
+  URL's own robots.txt isn't consulted, unlike a redirect the HTTP client
+  follows hop by hop.
+- Chrome isn't restarted if it dies; the rest of the crawl's browser
+  requests fail. A page Chrome answers with a server error isn't retried
+  there.
 
 Cookie hand-back only helps if the HTTP client looks like the same browser
 the cookie was issued to, so the new session uses the HTTP profile that

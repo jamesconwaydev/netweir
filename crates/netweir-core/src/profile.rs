@@ -129,8 +129,6 @@ impl Profile {
             .collect()
     }
 
-    /// A built-in profile by name. `"chrome"` and `"firefox"` are the
-    /// newest of each.
     /// The built-in profile of Chrome `major` (such as "154"), if there is
     /// one.
     pub fn for_chrome(major: &str) -> Option<Profile> {
@@ -141,6 +139,8 @@ impl Profile {
             .and_then(|(n, _)| Profile::named(n).ok())
     }
 
+    /// A built-in profile by name. `"chrome"` and `"firefox"` are the
+    /// newest of each.
     pub fn named(name: &str) -> Result<Profile, ProfileError> {
         let name = LATEST
             .iter()

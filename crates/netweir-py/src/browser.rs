@@ -274,8 +274,8 @@ impl BrowserPage {
         })
     }
 
-    /// Waits for the next navigation, one that starts after this call, to
-    /// reach `wait`. Resolves to its BrowserResponse.
+    /// Waits for a navigation away from the document showing now to reach
+    /// `wait`. Resolves to the BrowserResponse of the new document.
     #[pyo3(signature = (wait="load", timeout=None))]
     fn wait_for_navigation<'py>(
         &self,
@@ -286,9 +286,13 @@ impl BrowserPage {
         let wait: WaitUntil = wait.parse().map_err(raise)?;
         let timeout = seconds("timeout", timeout)?;
         let page = self.inner.clone();
+        // The document showing now, read before anything is awaited, so a
+        // navigation that starts while the future waits to run still
+        // counts.
+        let after = page.response();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let inner = page
-                .wait_for_navigation(wait, timeout)
+                .wait_for_navigation(&after, wait, timeout)
                 .await
                 .map_err(raise)?;
             Ok(BrowserResponse { inner })

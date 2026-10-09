@@ -326,7 +326,7 @@ class Crawler:
     async def next(
         self, max: int = 256
     ) -> list[
-        tuple[Literal["fetched"], int, Response, Node | None]
+        tuple[Literal["fetched"], int, Response, Node | None, BrowserPage | None]
         | tuple[Literal["failed"], int, FetchError]
         | tuple[Literal["dropped"], int, Literal["robots", "tdm"]]
         | tuple[Literal["handled"], int]
@@ -346,6 +346,7 @@ class Crawler:
         | tuple[Literal["ignored"], str, str]
         | tuple[Literal["blocked"], int, int | None, str, str, str, Response]
         | tuple[Literal["paused"], str, float]
+        | tuple[Literal["warning"], str]
     ]: ...
     def stats(self) -> dict[str, int]: ...
 
