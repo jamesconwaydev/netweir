@@ -93,23 +93,25 @@ class Spider:
     pipelines: list[Callable[[Any], Any]] = []
 
     async def start(self) -> AsyncIterator[Request]:
+        """The first requests. An async generator by default; a plain
+        generator or a list works too."""
         for url in self.start_urls:
             yield Request(url)
 
     def parse(self, page: Page) -> Any:
         raise NotImplementedError(f"{type(self).__name__} needs a parse(self, page) method")
 
-    def run(self, output: str | None = None) -> dict[str, int]:
+    def run(self, output: Any = None) -> dict[str, int]:
         """Crawls to the end and returns the stats. ``output`` writes every
-        item to a .jsonl, .csv or .parquet file."""
+        item to a .jsonl, .csv or .parquet file (or is an exporter)."""
         return asyncio.run(self.crawl(output))
 
-    async def crawl(self, output: str | None = None) -> dict[str, int]:
+    async def crawl(self, output: Any = None) -> dict[str, int]:
         from netweir import export
 
         pipelines = list(self.pipelines)
         if output is not None:
-            pipelines.append(export.to_path(output))
+            pipelines.append(export.to_path(output) if isinstance(output, str) else output)
         try:
             return await _Run(self, pipelines).go()
         finally:
@@ -153,8 +155,13 @@ class _Run:
         started = time.monotonic()
         if not self.settings.obey_robots:
             log.warning("obey_robots is off: robots.txt is not being checked")
-        async for request in self.spider.start():
-            self.submit(request)
+        start = self.spider.start()
+        if inspect.isasyncgen(start):
+            async for request in start:
+                self.submit(request)
+        else:
+            for request in start:
+                self.submit(request)
         while True:
             events = await self.engine.next(256)
             if not events:
@@ -163,14 +170,14 @@ class _Run:
                 request = self.waiting.pop(rid)
                 if kind == "fetched":
                     page = Page(detail, request)
-                    callback = self.resolve(request.callback, "parse")
-                    await self.run_callback(callback, (page,), request.url)
+                    await self.run_callback(request.callback, "parse", (page,), request.url)
                 elif kind == "failed":
-                    errback = self.resolve(request.errback, None)
-                    if errback is None:
+                    if request.errback is None:
                         log.warning("%s: %s", request.url, detail)
                     else:
-                        await self.run_callback(errback, (request, detail), request.url)
+                        await self.run_callback(
+                            request.errback, None, (request, detail), request.url
+                        )
                 else:
                     log.info(
                         "skipped %s: %s",
@@ -187,8 +194,12 @@ class _Run:
         )
         return stats
 
-    async def run_callback(self, fn: Callable[..., Any], args: tuple, url: str) -> None:
+    async def run_callback(
+        self, fn: Callable[..., Any] | str | None, default: str | None, args: tuple, url: str
+    ) -> None:
+        name = fn if isinstance(fn, str) else getattr(fn, "__name__", default)
         try:
+            fn = self.resolve(fn, default)
             result = fn(*args)
             if inspect.isasyncgen(result):
                 async for out in result:
@@ -197,17 +208,14 @@ class _Run:
                 if inspect.isawaitable(result):
                     result = await result
                 if result is not None:
-                    for out in (
-                        result
-                        if isinstance(result, Iterable) and not isinstance(result, (dict, str))
-                        else [result]
-                    ):
+                    many = isinstance(result, Iterable) and not isinstance(result, _NOT_MANY)
+                    for out in result if many else [result]:
                         await self.handle(out)
         except Exception:
             self.counts["callback_errors"] += 1
             if self.settings.fail_fast:
                 raise
-            log.exception("error in %s for %s", getattr(fn, "__name__", fn), url)
+            log.exception("error in %s for %s", name, url)
 
     async def handle(self, out: Any) -> None:
         if out is None:
@@ -215,6 +223,10 @@ class _Run:
         if isinstance(out, Request):
             self.submit(out)
             return
+        if isinstance(out, _NOT_ITEMS):
+            raise TypeError(
+                f"a callback produced a {type(out).__name__}: yield dicts, dataclasses or Requests"
+            )
         item = out
         for stage in self.pipelines:
             item = stage(item)
@@ -224,3 +236,9 @@ class _Run:
                 self.counts["items_dropped"] += 1
                 return
         self.counts["items"] += 1
+
+
+#: Iterable, but one result rather than many.
+_NOT_MANY = (dict, str, bytes, bytearray)
+#: Never an item.
+_NOT_ITEMS = (str, bytes, bytearray, int, float, bool, set, frozenset)

@@ -437,3 +437,126 @@ def test_urljoin_resolves_against_the_page(base):
     spider.start_urls = [f"{base}/based"]
     spider.run()
     assert seen == [f"{base}/book/y"]
+
+
+def test_exporters_on_the_class_survive_a_second_run(base, tmp_path):
+    out = tmp_path / "books.jsonl"
+
+    class Twice(Books):
+        pipelines = [netweir.export.jsonl(str(out))]
+
+    Twice.start_urls = [f"{base}/page/3"]
+    Twice().run()
+    stats = Twice().run()
+    assert stats["callback_errors"] == 0 and stats["items"] == 3
+    assert len(out.read_text().splitlines()) == 3, "the second run starts the file afresh"
+
+
+def test_odd_callback_results(base, caplog):
+    class Odd(netweir.Spider):
+        settings = FAST
+
+        def parse(self, page):
+            return b"abc"
+
+    spider = Odd()
+    spider.start_urls = [f"{base}/book/x"]
+    with caplog.at_level(logging.ERROR, logger="netweir"):
+        stats = spider.run()
+    assert stats["items"] == 0
+    assert stats["callback_errors"] == 1
+    assert "bytes" in caplog.text
+
+
+def test_an_unknown_callback_name_is_counted_not_raised(base):
+    class Missing(netweir.Spider):
+        settings = FAST
+
+        async def start(self):
+            yield netweir.Request(f"{base}/book/x", callback="nope")
+
+    assert Missing().run()["callback_errors"] == 1
+
+
+def test_start_can_be_a_plain_generator(base):
+    class Plain(netweir.Spider):
+        settings = FAST
+
+        def start(self):
+            yield netweir.Request(f"{base}/book/x")
+
+        def parse(self, page):
+            yield {"url": page.url}
+
+    assert Plain().run()["items"] == 1
+
+
+def test_command_line_spiders_can_use_dataclasses(base, tmp_path):
+    script = tmp_path / "netweir.py"  # a name that could shadow the package
+    script.write_text(
+        "from __future__ import annotations\n"
+        "import dataclasses\n"
+        "import netweir\n"
+        "@dataclasses.dataclass\n"
+        "class Book:\n"
+        "    url: str\n"
+        "class One(netweir.Spider):\n"
+        f"    start_urls = ['{base}/book/x']\n"
+        "    def parse(self, page):\n"
+        "        yield Book(page.url)\n"
+    )
+    out = tmp_path / "out.jsonl"
+    done = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "netweir",
+            "crawl",
+            str(script),
+            "-o",
+            str(out),
+            "-s",
+            "throttle=false",
+            "-s",
+            "start_delay=0",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert done.returncode == 0, done.stderr
+    assert json.loads(out.read_text()) == {"url": f"{base}/book/x"}
+
+
+@pytest.mark.parametrize(
+    "args, message",
+    [
+        (["-s", "profile=netscape"], "netscape"),
+        (["-o", "/nonexistent/dir/x.jsonl"], "nonexistent"),
+        (["-o", "out.xml"], "xml"),
+    ],
+)
+def test_command_line_errors_are_one_line(base, tmp_path, args, message):
+    script = tmp_path / "s.py"
+    script.write_text("import netweir\nclass S(netweir.Spider):\n    start_urls = []\n")
+    done = subprocess.run(
+        [sys.executable, "-m", "netweir", "crawl", str(script), *args],
+        capture_output=True,
+        text=True,
+        timeout=60,
+        cwd=tmp_path,
+    )
+    assert done.returncode == 2, done.stderr
+    assert "Traceback" not in done.stderr
+    assert message in done.stderr
+
+
+def test_command_line_missing_file(tmp_path):
+    done = subprocess.run(
+        [sys.executable, "-m", "netweir", "crawl", str(tmp_path / "nope.py")],
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert done.returncode == 2
+    assert "no such file" in done.stderr and "Traceback" not in done.stderr

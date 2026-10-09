@@ -17,32 +17,56 @@ from netweir._native import CsvWriter, JsonlWriter, ParquetWriter
 log = logging.getLogger("netweir")
 
 
-class jsonl:  # noqa: N801 - reads as a function in a pipeline list
-    """One JSON object per line."""
+class _Exporter:
+    """Writes items to ``path``. Closing finishes the file; an item after
+    that starts it afresh, so one exporter serves every run of a spider."""
 
     def __init__(self, path: str):
         self.path = path
-        self._writer = JsonlWriter(path)
+        self._writer: Any = self._open()
+
+    def _open(self) -> Any:
+        raise NotImplementedError
+
+    def _write(self, item: Any) -> Any:
+        if self._writer is None:
+            self._writer = self._open()
+        return self._writer.write(item)
 
     def __call__(self, item: Any) -> Any:
-        self._writer.write(item)
+        self._write(item)
         return item
 
     def close(self) -> None:
-        self._writer.close()
+        if self._writer is not None:
+            writer, self._writer = self._writer, None
+            self._closed(writer.close())
+
+    def _closed(self, report: Any) -> None:
+        pass
 
 
-class csv:  # noqa: N801
+class jsonl(_Exporter):  # noqa: N801 - reads as a function in a pipeline list
+    """One JSON object per line."""
+
+    def _open(self) -> JsonlWriter:
+        return JsonlWriter(self.path)
+
+
+class csv(_Exporter):  # noqa: N801
     """A CSV file. Columns are ``fields`` if given, otherwise the first
     item's keys; keys outside them are left out, with one warning."""
 
     def __init__(self, path: str, fields: list[str] | None = None):
-        self.path = path
-        self._writer = CsvWriter(path, fields)
+        self.fields = fields
+        super().__init__(path)
+
+    def _open(self) -> CsvWriter:
         self._warned: set[str] = set()
+        return CsvWriter(self.path, self.fields)
 
     def __call__(self, item: Any) -> Any:
-        extra = set(self._writer.write(item)) - self._warned
+        extra = set(self._write(item)) - self._warned
         if extra:
             self._warned |= extra
             log.warning(
@@ -52,11 +76,8 @@ class csv:  # noqa: N801
             )
         return item
 
-    def close(self) -> None:
-        self._writer.close()
 
-
-class parquet:  # noqa: N801
+class parquet(_Exporter):  # noqa: N801
     """A Parquet file. Columns and their types (bool, 64-bit int, double
     or text) come from the first 1,000 items: a key holding both ints and
     floats is a double column, any other mix is text, and lists and dicts
@@ -66,16 +87,11 @@ class parquet:  # noqa: N801
     column are left out; closing logs a warning for each.
     """
 
-    def __init__(self, path: str):
-        self.path = path
-        self._writer = ParquetWriter(path)
+    def _open(self) -> ParquetWriter:
+        return ParquetWriter(self.path)
 
-    def __call__(self, item: Any) -> Any:
-        self._writer.write(item)
-        return item
-
-    def close(self) -> None:
-        for key, missing, wrong in self._writer.close():
+    def _closed(self, report: list[tuple[str, int, int]]) -> None:
+        for key, missing, wrong in report:
             if missing:
                 log.warning("%s: no column for %r, left out of %d items", self.path, key, missing)
             if wrong:
