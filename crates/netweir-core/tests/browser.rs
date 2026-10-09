@@ -60,10 +60,15 @@ fn request(id: u64, url: String, browser: bool) -> CrawlRequest {
     }
 }
 
+/// Longer than the crawl gives a Chrome fetch (twice the timeout, plus
+/// the wait for a challenge), so a slow page fails with the crawl's own
+/// error, which says what went wrong, rather than here.
+const STALLED: Duration = Duration::from_secs(90);
+
 async fn drain(c: &Crawler) -> Vec<Event> {
     let mut all = Vec::new();
     loop {
-        let batch = tokio::time::timeout(Duration::from_secs(30), c.next(64))
+        let batch = tokio::time::timeout(STALLED, c.next(64))
             .await
             .expect("crawl stalled");
         if batch.is_empty() {
@@ -84,7 +89,7 @@ fn main(events: &[Event]) -> Option<&Event> {
 async fn drain_closing(c: &Crawler) -> Vec<(Event, std::time::Instant)> {
     let mut all = Vec::new();
     loop {
-        let batch = tokio::time::timeout(Duration::from_secs(30), c.next(64))
+        let batch = tokio::time::timeout(STALLED, c.next(64))
             .await
             .expect("crawl stalled");
         if batch.is_empty() {
@@ -180,19 +185,21 @@ async fn with_browser_always_every_request_goes_through_chrome() {
 /// reloads, and with the cookie the site serves the page.
 fn challenge() -> Page {
     challenge_moving_on(
+        "pass=1",
         "setTimeout(() => { document.cookie = 'pass=1; path=/'; location.reload() }, 200)",
     )
 }
 
-/// A challenge whose script `moves_on` once it has set the cookie.
-fn challenge_moving_on(moves_on: &str) -> Page {
+/// A challenge whose script `moves_on` once it has set the cookie
+/// `pass` (`name=value`), which gets the page instead.
+fn challenge_moving_on(pass: &str, moves_on: &str) -> Page {
     Page::status(
         403,
         &format!("<title>Just a moment...</title><script>{moves_on}</script>"),
     )
     .with_header("content-type", "text/html")
     .with_header("cf-mitigated", "challenge")
-    .unless_cookie("pass=1", Page::html("<p id=prize>the page</p>"))
+    .unless_cookie(pass, Page::html("<p id=prize>the page</p>"))
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -270,17 +277,23 @@ async fn a_challenge_that_moves_on_at_once_still_counts_as_passed() {
         return;
     };
     // Real challenges navigate whenever they like, including before the
-    // first page has been read.
+    // first page has been read. Each sets its own cookie: with one cookie
+    // for both, the first to pass hands it back to the HTTP client, and the
+    // second can get through without being blocked at all.
     let site = Site::start(vec![
         (
             "/soon",
             challenge_moving_on(
-                "setTimeout(() => { document.cookie = 'pass=1; path=/'; location.reload() }, 0)",
+                "soon=1",
+                "setTimeout(() => { document.cookie = 'soon=1; path=/'; location.reload() }, 0)",
             ),
         ),
         (
             "/now",
-            challenge_moving_on("document.cookie = 'pass=1; path=/'; location.reload()"),
+            challenge_moving_on(
+                "now=1",
+                "document.cookie = 'now=1; path=/'; location.reload()",
+            ),
         ),
         ("/warm", Page::html("warm")),
     ])
