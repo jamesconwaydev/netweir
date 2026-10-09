@@ -81,6 +81,12 @@ fn not_utf16(e: &'static Encoding) -> &'static Encoding {
 
 /// The value of `name=` inside one tag (already lowercased), quoted or not.
 fn attribute<'a>(tag: &'a [u8], name: &[u8]) -> Option<&'a [u8]> {
+    attribute_range(tag, name).map(|r| &tag[r])
+}
+
+/// Where `name=`'s value sits inside `tag` (lowercased), as a byte range,
+/// so the value can be read from the original, case intact.
+fn attribute_range(tag: &[u8], name: &[u8]) -> Option<std::ops::Range<usize>> {
     let mut from = 0;
     while let Some(i) = find(&tag[from..], name) {
         let at = from + i;
@@ -96,19 +102,48 @@ fn attribute<'a>(tag: &'a [u8], name: &[u8]) -> Option<&'a [u8]> {
             }
             return Some(match tag.get(j) {
                 Some(&q @ (b'"' | b'\'')) => {
-                    let value = &tag[j + 1..];
-                    &value[..value.iter().position(|&b| b == q).unwrap_or(value.len())]
+                    let start = j + 1;
+                    start
+                        ..tag[start..]
+                            .iter()
+                            .position(|&b| b == q)
+                            .map_or(tag.len(), |p| start + p)
                 }
                 _ => {
-                    let value = &tag[j..];
-                    &value[..value
+                    j..tag[j..]
                         .iter()
                         .position(|b| b.is_ascii_whitespace() || *b == b'/')
-                        .unwrap_or(value.len())]
+                        .map_or(tag.len(), |p| j + p)
                 }
             });
         }
         from = at + 1;
+    }
+    None
+}
+
+/// The `content` of the first `<meta name="...">` with this name (compared
+/// without case) in the first 64 KiB of a page.
+pub fn meta_content(body: &[u8], name: &str) -> Option<String> {
+    let head = &body[..body.len().min(64 * 1024)];
+    let lower = head.to_ascii_lowercase();
+    let want = name.to_ascii_lowercase();
+    let mut from = 0;
+    while let Some(i) = find(&lower[from..], b"<meta") {
+        let start = from + i + b"<meta".len();
+        let end = lower[start..]
+            .iter()
+            .position(|&b| b == b'>')
+            .map_or(lower.len(), |p| start + p);
+        let tag = &lower[start..end];
+        if attribute(tag, b"name").is_some_and(|n| n == want.as_bytes())
+            && let Some(r) = attribute_range(tag, b"content")
+        {
+            return Some(
+                String::from_utf8_lossy(&head[start + r.start..start + r.end]).into_owned(),
+            );
+        }
+        from = end;
     }
     None
 }
@@ -175,6 +210,17 @@ mod tests {
         let mut body = b"<meta http-equiv=refresh content=\"5\"><meta charset=latin1>".to_vec();
         body.push(0xe9);
         assert!(decode(&body, None).ends_with('é'));
+    }
+
+    #[test]
+    fn meta_content_keeps_the_value_case() {
+        let page = br#"<head><meta charset=utf-8><meta NAME="tdm-policy" content="https://Example.com/P"><meta name=x content=y>"#;
+        assert_eq!(
+            meta_content(page, "TDM-Policy").as_deref(),
+            Some("https://Example.com/P")
+        );
+        assert_eq!(meta_content(page, "x").as_deref(), Some("y"));
+        assert_eq!(meta_content(page, "missing"), None);
     }
 
     #[test]
