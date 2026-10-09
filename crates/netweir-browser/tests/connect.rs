@@ -13,6 +13,7 @@ struct Running {
     child: std::process::Child,
     ws: String,
     profile: std::path::PathBuf,
+    _turn: common::Turn,
 }
 
 impl Drop for Running {
@@ -29,6 +30,7 @@ fn running() -> Option<Running> {
 
 fn running_with(extra: &[&str]) -> Option<Running> {
     let executable = chrome()?;
+    let turn = common::turn();
     static COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
     // One each: Chromes sharing a profile hand off to the first.
     let n = COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -52,7 +54,12 @@ fn running_with(extra: &[&str]) -> Option<Running> {
         .map_while(Result::ok)
         .find_map(|l| l.strip_prefix("DevTools listening on ").map(str::to_string))
         .expect("Chrome printed its DevTools URL");
-    Some(Running { child, ws, profile })
+    Some(Running {
+        child,
+        ws,
+        profile,
+        _turn: turn,
+    })
 }
 
 #[tokio::test]

@@ -1,20 +1,19 @@
 mod common;
 
 use common::{chrome, proxy};
-use netweir_browser::{Browser, Error, LaunchOptions, WaitUntil};
+use netweir_browser::{Error, LaunchOptions, WaitUntil};
 use serde_json::json;
 
-async fn browser_through(proxy: &str) -> Option<Browser> {
+async fn browser_through(proxy: &str) -> Option<common::TestBrowser> {
     let executable = chrome()?;
     Some(
-        Browser::launch(LaunchOptions {
+        common::launch(LaunchOptions {
             executable: Some(executable),
             proxy: Some(proxy.to_string()),
             timeout: std::time::Duration::from_secs(30),
             ..LaunchOptions::default()
         })
-        .await
-        .unwrap(),
+        .await,
     )
 }
 

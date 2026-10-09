@@ -6,12 +6,11 @@ use netweir_browser::{Browser, LaunchOptions};
 #[tokio::test]
 async fn closing_the_browser_ends_chrome_and_removes_its_profile() {
     let Some(executable) = chrome() else { return };
-    let browser = Browser::launch(LaunchOptions {
+    let browser = common::launch(LaunchOptions {
         executable: Some(executable),
         ..LaunchOptions::default()
     })
-    .await
-    .unwrap();
+    .await;
     let profile = browser.profile_dir().unwrap().to_path_buf();
     assert!(profile.exists());
     assert!(
@@ -40,12 +39,11 @@ async fn a_missing_executable_says_where_it_looked() {
 #[tokio::test]
 async fn a_browser_that_dies_reads_as_closed() {
     let Some(executable) = chrome() else { return };
-    let browser = Browser::launch(LaunchOptions {
+    let browser = common::launch(LaunchOptions {
         executable: Some(executable),
         ..LaunchOptions::default()
     })
-    .await
-    .unwrap();
+    .await;
     let pid = browser.pid().unwrap();
     unsafe { libc::kill(pid as i32, libc::SIGKILL) };
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);

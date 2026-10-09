@@ -113,19 +113,62 @@ pub fn serve(routes: Vec<(&'static str, Reply)>) -> Server {
 }
 
 /// A headless browser for a test, or None when there's no Chrome.
-pub async fn browser() -> Option<netweir_browser::Browser> {
+/// A turn with Chrome. Only two tests have a Chrome at once: a small CI
+/// runner with one each, all at once, takes longer over a page than a test
+/// waits. Blocking, so the helpers that start Chrome by hand can take one.
+pub struct Turn(());
+
+static TURNS: (Mutex<usize>, std::sync::Condvar) = (Mutex::new(2), std::sync::Condvar::new());
+
+pub fn turn() -> Turn {
+    let mut free = TURNS.0.lock().unwrap_or_else(|e| e.into_inner());
+    while *free == 0 {
+        free = TURNS.1.wait(free).unwrap_or_else(|e| e.into_inner());
+    }
+    *free -= 1;
+    Turn(())
+}
+
+impl Drop for Turn {
+    fn drop(&mut self) {
+        *TURNS.0.lock().unwrap_or_else(|e| e.into_inner()) += 1;
+        TURNS.1.notify_one();
+    }
+}
+
+/// A launched Chrome, with its turn, for the test.
+pub struct TestBrowser {
+    browser: netweir_browser::Browser,
+    _turn: Turn,
+}
+
+impl std::ops::Deref for TestBrowser {
+    type Target = netweir_browser::Browser;
+    fn deref(&self) -> &netweir_browser::Browser {
+        &self.browser
+    }
+}
+
+/// Launches Chrome with `options`, once it's this test's turn.
+pub async fn launch(options: netweir_browser::LaunchOptions) -> TestBrowser {
+    let turn = turn();
+    TestBrowser {
+        browser: netweir_browser::Browser::launch(options).await.unwrap(),
+        _turn: turn,
+    }
+}
+
+pub async fn browser() -> Option<TestBrowser> {
     let executable = chrome()?;
     Some(
-        netweir_browser::Browser::launch(netweir_browser::LaunchOptions {
+        launch(netweir_browser::LaunchOptions {
             executable: Some(executable),
-            // Generous: the tests start a Chrome each, all at once, and a
-            // small CI runner can take many seconds over a page. Tests
-            // that expect a timeout set a short one themselves.
+            // Generous: a small CI runner can take many seconds over a
+            // page. Tests that expect a timeout set a short one themselves.
             timeout: std::time::Duration::from_secs(30),
             ..Default::default()
         })
-        .await
-        .unwrap(),
+        .await,
     )
 }
 
