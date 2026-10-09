@@ -24,43 +24,91 @@ fn charset_param(content_type: &str) -> Option<&'static Encoding> {
     })
 }
 
-/// Looks for `charset=` in the first 1024 bytes, as the HTML spec's
-/// prescan does. Covers both `<meta charset=x>` and the http-equiv form.
+/// The encoding a page declares near its top: an XML declaration's
+/// `encoding`, or a `<meta charset>` / `<meta content="...; charset=...">`
+/// in the first 1024 bytes, as the HTML spec's prescan reads them.
 fn meta_charset(body: &[u8]) -> Option<&'static Encoding> {
     let head = &body[..body.len().min(1024)];
     let lower = head.to_ascii_lowercase();
+    if lower.starts_with(b"<?xml") {
+        let end = find(&lower, b"?>").unwrap_or(lower.len());
+        if let Some(label) = attribute(&lower[..end], b"encoding") {
+            return Encoding::for_label(label).map(not_utf16);
+        }
+    }
     let mut from = 0;
-    while let Some(i) = find(&lower[from..], b"charset") {
-        let mut j = from + i + b"charset".len();
-        while lower.get(j).is_some_and(|b| b.is_ascii_whitespace()) {
+    while let Some(i) = find(&lower[from..], b"<meta") {
+        let tag_start = from + i + b"<meta".len();
+        let tag_end = lower[tag_start..]
+            .iter()
+            .position(|&b| b == b'>')
+            .map_or(lower.len(), |p| tag_start + p);
+        let tag = &lower[tag_start..tag_end];
+        let label = attribute(tag, b"charset").or_else(|| {
+            let content = attribute(tag, b"content")?;
+            let at = find(content, b"charset")?;
+            let rest = &content[at + b"charset".len()..];
+            let rest = rest
+                .iter()
+                .position(|&b| b == b'=')
+                .map(|p| &rest[p + 1..])?;
+            let start = rest
+                .iter()
+                .position(|b| !b.is_ascii_whitespace() && *b != b'"' && *b != b'\'')?;
+            let rest = &rest[start..];
+            let end = rest
+                .iter()
+                .position(|b| b.is_ascii_whitespace() || matches!(b, b';' | b'"' | b'\''))
+                .unwrap_or(rest.len());
+            Some(&rest[..end])
+        });
+        if let Some(e) = label.and_then(Encoding::for_label) {
+            return Some(not_utf16(e));
+        }
+        from = tag_end;
+    }
+    None
+}
+
+/// A page read as ASCII here can't really be UTF-16, whatever it says.
+fn not_utf16(e: &'static Encoding) -> &'static Encoding {
+    if e == encoding_rs::UTF_16LE || e == encoding_rs::UTF_16BE {
+        UTF_8
+    } else {
+        e
+    }
+}
+
+/// The value of `name=` inside one tag (already lowercased), quoted or not.
+fn attribute<'a>(tag: &'a [u8], name: &[u8]) -> Option<&'a [u8]> {
+    let mut from = 0;
+    while let Some(i) = find(&tag[from..], name) {
+        let at = from + i;
+        let before_ok = at == 0 || tag[at - 1].is_ascii_whitespace() || tag[at - 1] == b'/';
+        let mut j = at + name.len();
+        while tag.get(j).is_some_and(|b| b.is_ascii_whitespace()) {
             j += 1;
         }
-        if lower.get(j) == Some(&b'=') {
+        if before_ok && tag.get(j) == Some(&b'=') {
             j += 1;
-            while lower
-                .get(j)
-                .is_some_and(|b| b.is_ascii_whitespace() || *b == b'"' || *b == b'\'')
-            {
+            while tag.get(j).is_some_and(|b| b.is_ascii_whitespace()) {
                 j += 1;
             }
-            let end = lower[j..]
-                .iter()
-                .position(|b| {
-                    b.is_ascii_whitespace() || matches!(b, b'"' | b'\'' | b';' | b'>' | b'/')
-                })
-                .map_or(lower.len(), |p| j + p);
-            if let Some(e) = Encoding::for_label(&lower[j..end]) {
-                // A page can't truly be UTF-16 if we're reading ASCII here.
-                return Some(
-                    if e == encoding_rs::UTF_16LE || e == encoding_rs::UTF_16BE {
-                        UTF_8
-                    } else {
-                        e
-                    },
-                );
-            }
+            return Some(match tag.get(j) {
+                Some(&q @ (b'"' | b'\'')) => {
+                    let value = &tag[j + 1..];
+                    &value[..value.iter().position(|&b| b == q).unwrap_or(value.len())]
+                }
+                _ => {
+                    let value = &tag[j..];
+                    &value[..value
+                        .iter()
+                        .position(|b| b.is_ascii_whitespace() || *b == b'/')
+                        .unwrap_or(value.len())]
+                }
+            });
         }
-        from = from + i + 1;
+        from = at + 1;
     }
     None
 }
@@ -101,6 +149,32 @@ mod tests {
             decode(b"<meta charset='shift_jis'>\x93\xfa\x96\x7b", None),
             "<meta charset='shift_jis'>日本"
         );
+    }
+
+    #[test]
+    fn charset_outside_a_meta_tag_is_ignored() {
+        // A comment, a script and a <link charset> all mention charset=;
+        // only <meta> declares the page's encoding.
+        let body = "<!-- charset=windows-1251 --><script>var s='charset=koi8-r'</script>\
+                    <link rel=stylesheet charset=shift_jis href=a.css><p>café</p>";
+        assert_eq!(decode(body.as_bytes(), None), body);
+    }
+
+    #[test]
+    fn xml_declaration_names_the_encoding() {
+        // 0xe1 is alpha in ISO-8859-7 but a-acute in Latin-1, which is what
+        // a guess from the bytes alone would pick.
+        let mut body = b"<?xml version=\"1.0\" encoding=\"ISO-8859-7\"?><feed>".to_vec();
+        body.push(0xe1);
+        body.extend_from_slice(b"</feed>");
+        assert!(decode(&body, Some("application/xml")).contains("<feed>\u{3b1}</feed>"));
+    }
+
+    #[test]
+    fn meta_content_type_without_charset_is_skipped() {
+        let mut body = b"<meta http-equiv=refresh content=\"5\"><meta charset=latin1>".to_vec();
+        body.push(0xe9);
+        assert!(decode(&body, None).ends_with('é'));
     }
 
     #[test]
