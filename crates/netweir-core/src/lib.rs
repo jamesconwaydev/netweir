@@ -10,6 +10,7 @@ pub mod classify;
 mod crawl;
 mod decode;
 mod fetch;
+pub mod install;
 mod profile;
 pub mod robots;
 pub mod tdmrep;

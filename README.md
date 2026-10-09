@@ -40,7 +40,8 @@ Working today:
 - A Chrome driver for pages that need JavaScript: click, type and wait
   like Playwright, then read the page with netweir's selectors. In a
   crawl, it can take over a request a site keeps blocking, and hand the
-  cookies it earns back to the fast HTTP client.
+  cookies it earns back to the fast HTTP client. `netweir install chrome`
+  fetches the Chrome it's tuned for.
 
 Coming next, in order: a Safari profile and the 0.1 release, then Firefox
 in the driver. The designs are in [docs/design/](docs/design/).

@@ -12,7 +12,11 @@ use crate::conn::Connection;
 use crate::page::{Cookie, Page, WaitUntil, cookies_from, cookies_to};
 use crate::{Error, Result, launch};
 
-#[derive(Debug, Clone)]
+/// For a Chrome major version (such as "154"), the `Sec-CH-UA` value its
+/// pages should present, if not Chrome's own.
+pub type Brands = Arc<dyn Fn(&str) -> Option<String> + Send + Sync>;
+
+#[derive(Clone)]
 pub struct LaunchOptions {
     /// Chrome's executable; found with [`crate::find_chrome`] when None.
     pub executable: Option<PathBuf>,
@@ -25,6 +29,22 @@ pub struct LaunchOptions {
     /// fetches. A username and password in it are answered when the proxy
     /// asks for them.
     pub proxy: Option<String>,
+    /// The brands pages present. Chrome for Testing calls itself Chromium
+    /// alone, where Google Chrome of the same version lists itself too.
+    pub brands: Option<Brands>,
+}
+
+impl std::fmt::Debug for LaunchOptions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LaunchOptions")
+            .field("executable", &self.executable)
+            .field("headless", &self.headless)
+            .field("args", &self.args)
+            .field("timeout", &self.timeout)
+            .field("proxy", &self.proxy.as_ref().map(|_| "…"))
+            .field("brands", &self.brands.as_ref().map(|_| "…"))
+            .finish()
+    }
 }
 
 impl Default for LaunchOptions {
@@ -35,6 +55,7 @@ impl Default for LaunchOptions {
             args: Vec::new(),
             timeout: Duration::from_secs(30),
             proxy: None,
+            brands: None,
         }
     }
 }
@@ -133,8 +154,35 @@ impl Browser {
         let mut browser = Browser {
             inner: Arc::new(inner),
         };
-        if user_agent.contains("HeadlessChrome/") {
-            let metadata = browser.own_metadata().await?;
+        let full = browser
+            .inner
+            .version
+            .trim_start_matches("Chrome/")
+            .to_string();
+        let major = full.split('.').next().unwrap_or_default().to_string();
+        let brands = options.brands.as_ref().and_then(|b| b(&major));
+        if user_agent.contains("HeadlessChrome/") || brands.is_some() {
+            let mut metadata = browser.own_metadata().await?;
+            if let Some(header) = brands {
+                let list = parse_brands(&header);
+                metadata["brands"] = list
+                    .iter()
+                    .map(|(brand, version)| json!({"brand": brand, "version": version}))
+                    .collect();
+                // A brand at Chrome's own major version carries its full
+                // version; the made-up one, as in Chrome, is N.0.0.0.
+                metadata["fullVersionList"] = list
+                    .iter()
+                    .map(|(brand, version)| {
+                        let full = if *version == major {
+                            full.clone()
+                        } else {
+                            format!("{version}.0.0.0")
+                        };
+                        json!({"brand": brand, "version": full})
+                    })
+                    .collect();
+            }
             let identity = Identity {
                 user_agent: user_agent.replace("HeadlessChrome/", "Chrome/"),
                 metadata,
@@ -314,6 +362,21 @@ fn profile_dir() -> std::io::Result<PathBuf> {
     ));
     std::fs::create_dir_all(&dir)?;
     Ok(dir)
+}
+
+/// `"Chromium";v="154", "Google Chrome";v="154"` as (brand, version)
+/// pairs.
+fn parse_brands(header: &str) -> Vec<(String, String)> {
+    header
+        .split(',')
+        .filter_map(|part| {
+            let (brand, version) = part.trim().split_once(";v=")?;
+            Some((
+                brand.trim_matches('"').to_string(),
+                version.trim_matches('"').to_string(),
+            ))
+        })
+        .collect()
 }
 
 /// A proxy URL as Chrome takes it (`scheme://host:port`, which has no

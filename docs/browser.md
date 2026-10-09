@@ -21,9 +21,27 @@ async with netweir.browser() as browser:
 
 ## Starting Chrome
 
-`netweir.browser()` starts an installed Chrome: the one at
-`$NETWEIR_CHROME`, or else the first of Google Chrome, Chrome for Testing
-and Chromium in their usual places. Its options:
+`netweir.browser()` starts the Chrome at `$NETWEIR_CHROME`, or else the
+newest one `netweir install chrome` installed, or else the first of Google
+Chrome, Chrome for Testing and Chromium in their usual places.
+
+If you don't have Chrome, or want the one netweir is tuned for:
+
+```
+netweir install chrome
+```
+
+downloads the Chrome for Testing build whose version matches netweir's
+newest Chrome profile into `~/.netweir/chrome/` (`$NETWEIR_HOME` moves
+it). Chrome for Testing is Chrome without the auto-updates, so a crawl's
+cookie hand-back always has a profile that matches. It names itself
+Chromium where Google Chrome adds its own name, so its pages present the
+brands of the Google Chrome version netweir has a profile for, as the HTTP
+client does. `--headless-shell` installs `chrome-headless-shell` instead,
+which is lighter and faster but easier to tell from a real browser; pass
+its path as `executable` to use it.
+
+The options:
 
 | Option | Default | Does |
 |---|---|---|

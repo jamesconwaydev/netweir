@@ -6,7 +6,72 @@ use std::process::{Child, Command, Stdio};
 
 use crate::{Error, Result};
 
-/// The Chrome to launch: `$NETWEIR_CHROME`, then the usual install paths
+/// netweir's own folder: `$NETWEIR_HOME`, or `~/.netweir`.
+pub fn netweir_home() -> PathBuf {
+    if let Some(home) = std::env::var_os("NETWEIR_HOME") {
+        return PathBuf::from(home);
+    }
+    let user = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"));
+    user.map(PathBuf::from).unwrap_or_default().join(".netweir")
+}
+
+/// This machine as Chrome for Testing names platforms, if it has builds
+/// for it.
+pub fn cft_platform() -> Option<&'static str> {
+    match (std::env::consts::OS, std::env::consts::ARCH) {
+        ("macos", "aarch64") => Some("mac-arm64"),
+        ("macos", "x86_64") => Some("mac-x64"),
+        ("linux", "x86_64") => Some("linux64"),
+        ("linux", "aarch64") => Some("linux-arm64"),
+        ("windows", "x86_64") => Some("win64"),
+        ("windows", "x86") => Some("win32"),
+        _ => None,
+    }
+}
+
+/// Where the executable is in an unpacked Chrome for Testing download for
+/// `platform`: Chrome itself, or `chrome-headless-shell`.
+pub fn cft_executable(platform: &str, headless_shell: bool) -> PathBuf {
+    let exe = if platform.starts_with("win") {
+        ".exe"
+    } else {
+        ""
+    };
+    if headless_shell {
+        return PathBuf::from(format!(
+            "chrome-headless-shell-{platform}/chrome-headless-shell{exe}"
+        ));
+    }
+    if platform.starts_with("mac") {
+        return PathBuf::from(format!(
+            "chrome-{platform}/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing"
+        ));
+    }
+    PathBuf::from(format!("chrome-{platform}/chrome{exe}"))
+}
+
+/// The newest Chrome `netweir install chrome` put under `home`.
+pub(crate) fn installed_chrome(home: &Path) -> Option<PathBuf> {
+    let platform = cft_platform()?;
+    let mut versions: Vec<(Vec<u32>, PathBuf)> = std::fs::read_dir(home.join("chrome"))
+        .ok()?
+        .filter_map(|e| e.ok())
+        .filter_map(|e| {
+            let name = e.file_name().into_string().ok()?;
+            let version: Option<Vec<u32>> = name.split('.').map(|n| n.parse().ok()).collect();
+            Some((version?, e.path()))
+        })
+        .collect();
+    versions.sort();
+    versions
+        .into_iter()
+        .rev()
+        .map(|(_, dir)| dir.join(cft_executable(platform, false)))
+        .find(|p| p.is_file())
+}
+
+/// The Chrome to launch: `$NETWEIR_CHROME`, then the newest one
+/// `netweir install chrome` installed, then the usual install paths
 /// (Chrome, Chrome for Testing, Chromium). The error lists where it
 /// looked.
 pub fn find_chrome() -> Result<PathBuf> {
@@ -21,6 +86,10 @@ pub fn find_chrome() -> Result<PathBuf> {
             )))
         };
     }
+    let home = netweir_home();
+    if let Some(installed) = installed_chrome(&home) {
+        return Ok(installed);
+    }
     let candidates = candidates();
     candidates
         .iter()
@@ -29,7 +98,9 @@ pub fn find_chrome() -> Result<PathBuf> {
         .ok_or_else(|| {
             let looked: Vec<String> = candidates.iter().map(|p| p.display().to_string()).collect();
             Error::Launch(format!(
-                "no Chrome found; set $NETWEIR_CHROME or pass executable=. Looked in: {}",
+                "no Chrome found; run `netweir install chrome`, set $NETWEIR_CHROME or pass \
+                 executable=. Looked in: {}, {}",
+                home.join("chrome").display(),
                 looked.join(", ")
             ))
         })
@@ -185,4 +256,39 @@ fn hand_over(
         writes.as_raw_handle() as usize
     ));
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_newest_installed_chrome_is_found() {
+        let Some(platform) = cft_platform() else {
+            return;
+        };
+        let home = std::env::temp_dir().join(format!("netweir-home-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        assert_eq!(installed_chrome(&home), None);
+        for version in [
+            "154.0.8037.98",
+            "154.0.8037.110",
+            "153.0.1.1",
+            "not-a-version",
+        ] {
+            let exe = home
+                .join("chrome")
+                .join(version)
+                .join(cft_executable(platform, false));
+            std::fs::create_dir_all(exe.parent().unwrap()).unwrap();
+            std::fs::write(&exe, "").unwrap();
+        }
+        let found = installed_chrome(&home).unwrap();
+        assert!(
+            found.starts_with(home.join("chrome").join("154.0.8037.110")),
+            "{}",
+            found.display()
+        );
+        std::fs::remove_dir_all(&home).unwrap();
+    }
 }

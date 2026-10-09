@@ -90,3 +90,71 @@ async fn a_page_finds_no_sign_of_automation() {
     }
     browser.close().await.unwrap();
 }
+
+#[tokio::test]
+async fn pages_present_the_brands_netweir_is_told_to() {
+    let Some(executable) = common::chrome() else {
+        return;
+    };
+    // Chrome for Testing calls itself Chromium alone; netweir's profiles
+    // know what Google Chrome of the same version says.
+    let brands: netweir_browser::Brands = std::sync::Arc::new(|major: &str| {
+        Some(format!(
+            "\"Chromium\";v=\"{major}\", \"Brand X\";v=\"{major}\", \"Not A(Brand\";v=\"99\""
+        ))
+    });
+    let browser = netweir_browser::Browser::launch(netweir_browser::LaunchOptions {
+        executable: Some(executable),
+        brands: Some(brands),
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    let major = browser
+        .version()
+        .trim_start_matches("Chrome/")
+        .split('.')
+        .next()
+        .unwrap()
+        .to_string();
+    let mut page_html = html("<p>x</p>");
+    page_html
+        .headers
+        .push(("Accept-CH", "Sec-CH-UA-Full-Version-List".into()));
+    let server = serve(vec![("/", page_html), ("/again", html("<p>again</p>"))]);
+    let page = browser.new_page().await.unwrap();
+    page.goto(&format!("{}/", server.url), WaitUntil::Load, None)
+        .await
+        .unwrap();
+    let seen = page
+        .evaluate("navigator.userAgentData.getHighEntropyValues(['fullVersionList']).then(h => [navigator.userAgentData.brands.map(b => b.brand + '/' + b.version), h.fullVersionList.map(b => b.brand + '/' + b.version)])")
+        .await
+        .unwrap();
+    let full = browser.version().trim_start_matches("Chrome/").to_string();
+    assert_eq!(
+        seen,
+        json!([
+            [
+                "Chromium/".to_string() + &major,
+                "Brand X/".to_string() + &major,
+                "Not A(Brand/99".to_string()
+            ],
+            [
+                "Chromium/".to_string() + &full,
+                "Brand X/".to_string() + &full,
+                "Not A(Brand/99.0.0.0".to_string()
+            ],
+        ])
+    );
+    page.goto(&format!("{}/again", server.url), WaitUntil::Load, None)
+        .await
+        .unwrap();
+    let sent = server.headers_for("/again");
+    let ua = sent
+        .iter()
+        .find(|(k, _)| k == "sec-ch-ua")
+        .map(|(_, v)| v.clone())
+        .unwrap();
+    assert!(ua.contains("\"Brand X\""), "{ua}");
+    browser.close().await.unwrap();
+}

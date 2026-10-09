@@ -1,6 +1,7 @@
 """The ``netweir`` command.
 
 netweir crawl spider.py -o items.jsonl -s concurrency=32
+netweir install chrome
 """
 
 from __future__ import annotations
@@ -79,7 +80,16 @@ def main(argv: list[str] | None = None) -> int:
     )
     crawl.add_argument("--spider", help="which Spider, when the file has several")
     crawl.add_argument("-q", "--quiet", action="store_true", help="only warnings and errors")
+    install = commands.add_parser("install", help="download a browser for netweir to drive")
+    install.add_argument("browser", choices=["chrome"])
+    install.add_argument(
+        "--headless-shell",
+        action="store_true",
+        help="chrome-headless-shell instead: lighter, but easier to tell from a real browser",
+    )
     args = parser.parse_args(argv)
+    if args.command == "install":
+        return _install(args)
 
     logging.basicConfig(
         level=logging.WARNING if args.quiet else logging.INFO, format="%(levelname)s %(message)s"
@@ -94,6 +104,21 @@ def main(argv: list[str] | None = None) -> int:
     except KeyboardInterrupt:
         print("netweir: interrupted", file=sys.stderr)
         return 130
+    return 0
+
+
+def _install(args) -> int:
+    from netweir._errors import BrowserError
+    from netweir._native import install_chrome
+
+    what = "chrome-headless-shell" if args.headless_shell else "Chrome"
+    print(f"netweir: installing {what} for Testing...", file=sys.stderr)
+    try:
+        version, path, already = install_chrome(headless_shell=args.headless_shell)
+    except BrowserError as e:
+        print(f"netweir: {e}", file=sys.stderr)
+        return 1
+    print(f"{what} {version} {'was already' if already else 'is'} installed: {path}")
     return 0
 
 

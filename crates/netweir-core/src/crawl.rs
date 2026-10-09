@@ -1379,6 +1379,9 @@ fn browser_launch(shared: &Shared) -> LaunchOptions {
     if launch.proxy.is_none() {
         launch.proxy = shared.options.proxy.clone();
     }
+    if launch.brands.is_none() {
+        launch.brands = Some(Arc::new(Profile::chrome_brands));
+    }
     launch
 }
 

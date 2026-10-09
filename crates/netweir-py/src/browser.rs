@@ -87,6 +87,8 @@ pub(crate) fn launch(
         args,
         timeout,
         proxy,
+        // Chrome for Testing presents itself as Google Chrome would.
+        brands: Some(Arc::new(netweir_core::Profile::chrome_brands)),
     };
     pyo3_async_runtimes::tokio::future_into_py(py, async move {
         let inner = CoreBrowser::launch(options).await.map_err(raise)?;
@@ -582,8 +584,44 @@ fn to_python(py: Python<'_>, value: &serde_json::Value) -> PyResult<Py<PyAny>> {
     })
 }
 
+/// Installs the Chrome for Testing build matching netweir's newest Chrome
+/// profile under `home` (`$NETWEIR_HOME` or `~/.netweir` by default), as
+/// `index` lists it. Returns (version, executable, already installed).
+#[pyfunction]
+#[pyo3(signature = (headless_shell=false, index=netweir_core::install::CHROME_FOR_TESTING.to_string(), home=None))]
+fn install_chrome(
+    py: Python<'_>,
+    headless_shell: bool,
+    index: String,
+    home: Option<PathBuf>,
+) -> PyResult<(String, PathBuf, bool)> {
+    let home = home.unwrap_or_else(netweir_browser::netweir_home);
+    let runtime = pyo3_async_runtimes::tokio::get_runtime();
+    py.detach(|| {
+        runtime.block_on(netweir_core::install::install_chrome(
+            &index,
+            &home,
+            headless_shell,
+        ))
+    })
+    .map(|i| (i.version, i.executable, i.already))
+    .map_err(|e| {
+        Python::attach(|py| -> PyErr {
+            match py
+                .import("netweir._errors")
+                .and_then(|m| m.getattr("BrowserError"))
+                .and_then(|c| c.call1((e.clone(),)))
+            {
+                Ok(v) => PyErr::from_value(v),
+                Err(err) => err,
+            }
+        })
+    })
+}
+
 pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(launch, m)?)?;
+    m.add_function(wrap_pyfunction!(install_chrome, m)?)?;
     m.add_class::<Browser>()?;
     m.add_class::<BrowserContext>()?;
     m.add_class::<BrowserPage>()?;

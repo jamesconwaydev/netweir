@@ -139,6 +139,17 @@ impl Profile {
             .and_then(|(n, _)| Profile::named(n).ok())
     }
 
+    /// The `Sec-CH-UA` value Google Chrome `major` sends, as captured for
+    /// its profile, if netweir has one. Chrome for Testing leaves "Google
+    /// Chrome" out of its own; given this, its pages present Chrome's.
+    pub fn chrome_brands(major: &str) -> Option<String> {
+        Profile::for_chrome(major)?
+            .headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case("sec-ch-ua"))
+            .map(|(_, v)| v.clone())
+    }
+
     /// A built-in profile by name. `"chrome"` and `"firefox"` are the
     /// newest of each.
     pub fn named(name: &str) -> Result<Profile, ProfileError> {
@@ -465,5 +476,12 @@ speed = 11
             include_str!("../../../profiles/chrome-154-macos.toml")
         );
         assert!(Profile::from_toml(&extra).is_err());
+    }
+
+    #[test]
+    fn chrome_brands_come_from_the_profile_of_that_version() {
+        let brands = Profile::chrome_brands("154").unwrap();
+        assert!(brands.contains("\"Google Chrome\";v=\"154\""), "{brands}");
+        assert_eq!(Profile::chrome_brands("1"), None);
     }
 }

@@ -25,6 +25,7 @@ toml = "1"
 url = "2"
 wreq = { version = "0.16.1", default-features = false, features = ["chromium-roots", "tokio-rt", "gzip", "brotli", "zstd", "deflate", "cookies"] }
 zstd = "0.14"
+zip = { version = "9.0.0", default-features = false, features = ["deflate"] }
 
 [dev-dependencies]
 netweir-fingerprint = { path = "../netweir-fingerprint" }
