@@ -1,0 +1,89 @@
+# Chrome 154 on macOS, as a top-level navigation.
+#
+# Written from profiles/chrome-154-macos.capture.json and
+# chrome-154-macos.http1.capture.json, which the capture tool recorded from
+# Chrome 154.0.8037.98 over HTTP/2 and HTTP/1.1. netweir-core's fingerprint
+# test fails if a request made with this profile looks any different.
+
+name = "chrome-154-macos"
+
+# Sent on every request, in this order and with this capitalisation, unless
+# the caller overrides one. HTTP/2 lowercases the names and drops Host and
+# Connection; this list is what Chrome sends over HTTP/1.1.
+headers = [
+    ["Host", ""],
+    ["Connection", "keep-alive"],
+    ["sec-ch-ua", "\"Chromium\";v=\"154\", \"Google Chrome\";v=\"154\", \"Not A(Brand\";v=\"99\""],
+    ["sec-ch-ua-mobile", "?0"],
+    ["sec-ch-ua-platform", "\"macOS\""],
+    ["Upgrade-Insecure-Requests", "1"],
+    ["User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/154.0.0.0 Safari/537.36"],
+    ["Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7"],
+    ["Sec-Fetch-Site", "none"],
+    ["Sec-Fetch-Mode", "navigate"],
+    ["Sec-Fetch-User", "?1"],
+    ["Sec-Fetch-Dest", "document"],
+    ["Accept-Encoding", "gzip, deflate, br, zstd"],
+    ["Accept-Language", "en-US,en;q=0.9"],
+]
+
+# Chrome sends these only over HTTP/2, after the others.
+http2_headers = [
+    ["priority", "u=0, i"],
+]
+
+[tls]
+ciphers = [
+    "TLS_AES_128_GCM_SHA256",
+    "TLS_AES_256_GCM_SHA384",
+    "TLS_CHACHA20_POLY1305_SHA256",
+    "ECDHE-ECDSA-AES128-GCM-SHA256",
+    "ECDHE-RSA-AES128-GCM-SHA256",
+    "ECDHE-ECDSA-AES256-GCM-SHA384",
+    "ECDHE-RSA-AES256-GCM-SHA384",
+    "ECDHE-ECDSA-CHACHA20-POLY1305",
+    "ECDHE-RSA-CHACHA20-POLY1305",
+    "ECDHE-RSA-AES128-SHA",
+    "ECDHE-RSA-AES256-SHA",
+    "AES128-GCM-SHA256",
+    "AES256-GCM-SHA384",
+    "AES128-SHA",
+    "AES256-SHA",
+]
+groups = ["X25519MLKEM768", "X25519", "P-256", "P-384"]
+key_shares = ["X25519MLKEM768", "X25519"]
+signature_algorithms = [
+    "mldsa44",
+    "mldsa65",
+    "mldsa87",
+    "ecdsa_secp256r1_sha256",
+    "rsa_pss_rsae_sha256",
+    "rsa_pkcs1_sha256",
+    "ecdsa_secp384r1_sha384",
+    "rsa_pss_rsae_sha384",
+    "rsa_pkcs1_sha384",
+    "rsa_pss_rsae_sha512",
+    "rsa_pkcs1_sha512",
+]
+alpn = ["h2", "http/1.1"]
+alps = ["h2"]
+alps_new_codepoint = true
+certificate_compression = ["brotli"]
+grease = true
+grease_signature_algorithms = true
+permute_extensions = true
+ech_grease = true
+ocsp_stapling = true
+signed_certificate_timestamps = true
+session_ticket = true
+pre_shared_key = true
+# The trust_anchors extension body, without its length prefix: the IDs of
+# the roots in this Chrome's store.
+trust_anchors = "0582df1302010582df1302060582df13020d0582df13020e0582df13020f0582df1302120582df1302130582df13021408839a648c9b2d010708839a648c9b2d010808839a648c9b2d010908839a648c9b2d010a08839a648c9b2d010b08839a648c9b2d010c08839a648c9b2d010d08839a648c9b2d011208839a648c9b2d011304d679090104d679090404d679090504d679090604d679090704d679090804d679090a04d679090b04d679090c04d679090d04d679090f"
+
+[http2]
+# (setting id, value) in the order Chrome sends them.
+settings = [[1, 65536], [2, 0], [4, 6291456], [6, 262144]]
+window_update = 15663105
+pseudo_header_order = ["method", "authority", "scheme", "path"]
+headers_priority = { exclusive = true, depends_on = 0, weight = 255 }

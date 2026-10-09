@@ -1,0 +1,329 @@
+//! Browser profiles: everything a request needs to look like it came from
+//! one particular browser. Profiles are data, in `profiles/*.toml` at the
+//! repository root, compiled into the library.
+
+use std::io::Write;
+
+use serde::Deserialize;
+use wreq::header::{HeaderMap, HeaderName, HeaderValue, OrigHeaderMap};
+use wreq::http2::{
+    Http2Options, PseudoId, PseudoOrder, SettingId, SettingsOrder, StreamDependency, StreamId,
+};
+use wreq::tls::compress::{CertificateCompressionAlgorithm, CertificateCompressor, Codec};
+use wreq::tls::{AlpnProtocol, AlpsProtocol, KeyShare, TlsOptions, TlsVersion};
+use wreq::{Emulation, Group};
+
+/// Profiles shipped with netweir, by name.
+const BUILT_IN: &[(&str, &str)] = &[(
+    "chrome-154-macos",
+    include_str!("../../../profiles/chrome-154-macos.toml"),
+)];
+
+/// What `profile="chrome"` means today.
+pub const DEFAULT: &str = "chrome-154-macos";
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Profile {
+    pub name: String,
+    pub tls: Tls,
+    pub http2: Http2,
+    /// Every request, in order; the capitalisation is HTTP/1.1's.
+    pub headers: Vec<(String, String)>,
+    /// Sent after `headers`, over HTTP/2 only.
+    #[serde(default)]
+    pub http2_headers: Vec<(String, String)>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Tls {
+    pub ciphers: Vec<String>,
+    pub groups: Vec<String>,
+    pub key_shares: Vec<String>,
+    pub signature_algorithms: Vec<String>,
+    pub alpn: Vec<String>,
+    pub alps: Vec<String>,
+    pub alps_new_codepoint: bool,
+    pub certificate_compression: Vec<String>,
+    pub grease: bool,
+    pub grease_signature_algorithms: bool,
+    pub permute_extensions: bool,
+    pub ech_grease: bool,
+    pub ocsp_stapling: bool,
+    pub signed_certificate_timestamps: bool,
+    pub session_ticket: bool,
+    pub pre_shared_key: bool,
+    pub trust_anchors: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Http2 {
+    pub settings: Vec<(u16, u32)>,
+    pub window_update: u32,
+    pub pseudo_header_order: Vec<String>,
+    pub headers_priority: Option<HeadersPriority>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HeadersPriority {
+    pub exclusive: bool,
+    pub depends_on: u32,
+    pub weight: u8,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProfileError(pub String);
+
+impl std::fmt::Display for ProfileError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for ProfileError {}
+
+impl Profile {
+    /// A built-in profile by name. `"chrome"` is the newest Chrome.
+    pub fn named(name: &str) -> Result<Profile, ProfileError> {
+        let name = if name == "chrome" { DEFAULT } else { name };
+        let (_, src) = BUILT_IN.iter().find(|(n, _)| *n == name).ok_or_else(|| {
+            let known: Vec<&str> = BUILT_IN.iter().map(|(n, _)| *n).collect();
+            ProfileError(format!(
+                "unknown profile {name:?}; known: chrome, {}",
+                known.join(", ")
+            ))
+        })?;
+        Profile::from_toml(src)
+    }
+
+    pub fn from_toml(src: &str) -> Result<Profile, ProfileError> {
+        toml::from_str(src).map_err(|e| ProfileError(format!("bad profile: {e}")))
+    }
+
+    pub(crate) fn emulation(&self) -> Result<Emulation, ProfileError> {
+        let bad = |what: &str, v: &str| {
+            ProfileError(format!("profile {}: unknown {what} {v:?}", self.name))
+        };
+        let t = &self.tls;
+
+        let key_shares = t
+            .key_shares
+            .iter()
+            .map(|k| match k.as_str() {
+                "X25519MLKEM768" => Ok(KeyShare::X25519_MLKEM768),
+                "X25519" => Ok(KeyShare::X25519),
+                "P-256" => Ok(KeyShare::P256),
+                "P-384" => Ok(KeyShare::P384),
+                _ => Err(bad("key share", k)),
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let alpn = t
+            .alpn
+            .iter()
+            .map(|p| match p.as_str() {
+                "h2" => Ok(AlpnProtocol::HTTP2),
+                "http/1.1" => Ok(AlpnProtocol::HTTP1),
+                _ => Err(bad("ALPN protocol", p)),
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let alps = t
+            .alps
+            .iter()
+            .map(|p| match p.as_str() {
+                "h2" => Ok(AlpsProtocol::HTTP2),
+                "http/1.1" => Ok(AlpsProtocol::HTTP1),
+                _ => Err(bad("ALPS protocol", p)),
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let compressors = t
+            .certificate_compression
+            .iter()
+            .map(|c| match c.as_str() {
+                "brotli" => Ok(&BROTLI as &'static dyn CertificateCompressor),
+                _ => Err(bad("certificate compression", c)),
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+
+        let mut tls = TlsOptions::builder()
+            .cipher_list(t.ciphers.join(":"))
+            .curves_list(t.groups.join(":"))
+            .key_shares(key_shares)
+            .sigalgs_list(t.signature_algorithms.join(":"))
+            .alpn_protocols(alpn)
+            .alps_protocols(alps)
+            .alps_use_new_codepoint(t.alps_new_codepoint)
+            .certificate_compressors(compressors)
+            .min_tls_version(TlsVersion::TLS_1_2)
+            .max_tls_version(TlsVersion::TLS_1_3)
+            .grease_enabled(t.grease)
+            .grease_sigalgs_enabled(t.grease_signature_algorithms)
+            .permute_extensions(t.permute_extensions)
+            .enable_ech_grease(t.ech_grease)
+            .enable_ocsp_stapling(t.ocsp_stapling)
+            .enable_signed_cert_timestamps(t.signed_certificate_timestamps)
+            .session_ticket(t.session_ticket)
+            .pre_shared_key(t.pre_shared_key);
+        if let Some(hex) = &t.trust_anchors {
+            tls = tls.trust_anchors(decode_hex(hex).ok_or_else(|| bad("trust anchor hex", hex))?);
+        }
+
+        let h = &self.http2;
+        let mut order = SettingsOrder::builder();
+        let mut http2 = Http2Options::builder();
+        for &(id, value) in &h.settings {
+            let (setting, builder) = match id {
+                1 => (SettingId::HeaderTableSize, http2.header_table_size(value)),
+                2 => (SettingId::EnablePush, http2.enable_push(value != 0)),
+                3 => (
+                    SettingId::MaxConcurrentStreams,
+                    http2.max_concurrent_streams(value),
+                ),
+                4 => (
+                    SettingId::InitialWindowSize,
+                    http2.initial_window_size(value),
+                ),
+                5 => (SettingId::MaxFrameSize, http2.max_frame_size(value)),
+                6 => (
+                    SettingId::MaxHeaderListSize,
+                    http2.max_header_list_size(value),
+                ),
+                8 => (
+                    SettingId::EnableConnectProtocol,
+                    http2.enable_connect_protocol(value != 0),
+                ),
+                9 => (
+                    SettingId::NoRfc7540Priorities,
+                    http2.no_rfc7540_priorities(value != 0),
+                ),
+                _ => return Err(bad("HTTP/2 setting", &id.to_string())),
+            };
+            order = order.push(setting);
+            http2 = builder;
+        }
+        let pseudo = h
+            .pseudo_header_order
+            .iter()
+            .map(|p| match p.as_str() {
+                "method" => Ok(PseudoId::Method),
+                "authority" => Ok(PseudoId::Authority),
+                "scheme" => Ok(PseudoId::Scheme),
+                "path" => Ok(PseudoId::Path),
+                _ => Err(bad("pseudo-header", p)),
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        // The connection window starts at 65535; WINDOW_UPDATE adds to it.
+        http2 = http2
+            .initial_connection_window_size(65_535 + h.window_update)
+            .settings_order(order.build())
+            .headers_pseudo_order(PseudoOrder::builder().extend(pseudo).build());
+        if let Some(p) = &h.headers_priority {
+            http2 = http2.headers_stream_dependency(StreamDependency::new(
+                StreamId::from(p.depends_on),
+                p.weight,
+                p.exclusive,
+            ));
+        }
+
+        let mut headers = HeaderMap::new();
+        let mut header_order = OrigHeaderMap::new();
+        for (k, v) in &self.headers {
+            header_order.insert(k.clone());
+            if k.eq_ignore_ascii_case("host") {
+                continue;
+            }
+            let name = HeaderName::from_bytes(k.to_ascii_lowercase().as_bytes())
+                .map_err(|_| bad("header name", k))?;
+            let value = HeaderValue::from_str(v).map_err(|_| bad("header value", v))?;
+            headers.insert(name, value);
+        }
+        // Their place in the order; Fetcher adds them per request.
+        for (k, _) in &self.http2_headers {
+            header_order.insert(k.clone());
+        }
+
+        Ok(Emulation::builder()
+            .tls_options(tls.build())
+            .http2_options(http2.build())
+            .headers(headers)
+            .orig_headers(header_order)
+            .build(Group::new(self.name.clone())))
+    }
+}
+
+fn decode_hex(s: &str) -> Option<Vec<u8>> {
+    if !s.len().is_multiple_of(2) {
+        return None;
+    }
+    (0..s.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(s.get(i..i + 2)?, 16).ok())
+        .collect()
+}
+
+/// Brotli certificate decompression (RFC 8879), which Chrome offers and
+/// many CDNs use.
+#[derive(Debug)]
+struct Brotli;
+
+static BROTLI: Brotli = Brotli;
+
+impl CertificateCompressor for Brotli {
+    fn compress(&self) -> Codec {
+        Codec::Pointer(|input, out| {
+            let mut w = brotli::CompressorWriter::new(out, 4096, 11, 22);
+            w.write_all(input)?;
+            w.flush()
+        })
+    }
+
+    fn decompress(&self) -> Codec {
+        Codec::Pointer(|input, out| {
+            let mut r = brotli::Decompressor::new(input, 4096);
+            std::io::copy(&mut r, out).map(|_| ())
+        })
+    }
+
+    fn algorithm(&self) -> CertificateCompressionAlgorithm {
+        CertificateCompressionAlgorithm::BROTLI
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn every_built_in_profile_loads_and_builds() {
+        for (name, _) in BUILT_IN {
+            let p = Profile::named(name).unwrap();
+            p.emulation().unwrap();
+        }
+        assert_eq!(Profile::named("chrome").unwrap().name, DEFAULT);
+    }
+
+    #[test]
+    fn unknown_names_list_the_known_ones() {
+        let err = Profile::named("netscape").unwrap_err();
+        assert!(err.0.contains("chrome-154-macos"), "{err}");
+    }
+
+    #[test]
+    fn typos_in_a_profile_are_errors() {
+        let src = include_str!("../../../profiles/chrome-154-macos.toml").replace(
+            r#"key_shares = ["X25519MLKEM768""#,
+            r#"key_shares = ["X25519MLKEM769""#,
+        );
+        assert!(Profile::from_toml(&src).unwrap().emulation().is_err());
+        assert!(Profile::from_toml("name = 1").is_err());
+        let extra = format!(
+            "{}
+speed = 11
+",
+            include_str!("../../../profiles/chrome-154-macos.toml")
+        );
+        assert!(Profile::from_toml(&extra).is_err());
+    }
+}

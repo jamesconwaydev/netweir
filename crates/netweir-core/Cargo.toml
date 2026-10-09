@@ -1,0 +1,24 @@
+[package]
+name = "netweir-core"
+description = "netweir's fetching engine: browser-identical HTTP requests"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+brotli = "8"
+btls = "0.5.6"
+bytes = "1"
+chardetng = "1"
+encoding_rs = "0.8"
+serde = { version = "1", features = ["derive"] }
+toml = "1"
+wreq = { version = "0.16.1", default-features = false, features = ["chromium-roots", "tokio-rt", "gzip", "brotli", "zstd", "deflate", "cookies"] }
+
+[dev-dependencies]
+netweir-fingerprint = { path = "../netweir-fingerprint" }
+serde_json = "1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
