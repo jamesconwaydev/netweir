@@ -68,9 +68,10 @@ const STALLED: Duration = Duration::from_secs(90);
 async fn drain(c: &Crawler) -> Vec<Event> {
     let mut all = Vec::new();
     loop {
-        let batch = tokio::time::timeout(STALLED, c.next(64))
-            .await
-            .expect("crawl stalled");
+        let Ok(batch) = tokio::time::timeout(STALLED, c.next(64)).await else {
+            // Where the request had got to says which half to look at.
+            panic!("crawl stalled after {} events: {:?}", all.len(), c.stats());
+        };
         if batch.is_empty() {
             return all;
         }
@@ -89,9 +90,10 @@ fn main(events: &[Event]) -> Option<&Event> {
 async fn drain_closing(c: &Crawler) -> Vec<(Event, std::time::Instant)> {
     let mut all = Vec::new();
     loop {
-        let batch = tokio::time::timeout(STALLED, c.next(64))
-            .await
-            .expect("crawl stalled");
+        let Ok(batch) = tokio::time::timeout(STALLED, c.next(64)).await else {
+            // Where the request had got to says which half to look at.
+            panic!("crawl stalled after {} events: {:?}", all.len(), c.stats());
+        };
         if batch.is_empty() {
             return all;
         }
