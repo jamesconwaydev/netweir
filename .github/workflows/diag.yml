@@ -30,13 +30,12 @@ jobs:
       - run: uv sync --group dev
       - run: uv run maturin develop --uv
       - run: uv run netweir install chrome
-      - run: cargo test -p netweir-core --test browser --no-run
       - name: Run the browser tests until one stalls
         shell: bash
         run: |
-          for f in target/debug/deps/browser-*; do
-            case "$f" in *.d) ;; *) bin=$f ;; esac
-          done
+          bin=$(cargo test -p netweir-core --test browser --no-run 2>&1 \
+            | grep -oE 'target/debug/deps/browser-[0-9a-f]+' | head -1)
+          echo "testing with $bin"
           mkdir -p diag
           snapshot() {
             local out=diag/$1
