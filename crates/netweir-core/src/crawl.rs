@@ -11,6 +11,7 @@ use netweir_browser::{Browser, Cookie, LaunchOptions, WaitUntil};
 use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore};
 use url::Url;
 
+use crate::cache::{Cache, Policy, Redirect};
 use crate::canonical::{Fingerprint, fingerprint, fingerprint_with};
 use crate::checkpoint::{Checkpoint, Pending, Saved};
 use crate::classify::{BlockKind, Outcome, classify};
@@ -74,6 +75,11 @@ pub struct CrawlSettings {
     /// `allowed_domains`; empty for any. A request elsewhere is dropped
     /// unless it has `dont_filter`.
     pub allowed_domains: Vec<String>,
+    /// A file to keep responses in, so a rerun is served from it rather
+    /// than the site.
+    pub cache: Option<std::path::PathBuf>,
+    /// How long a kept response stays fresh; for good if None.
+    pub cache_expiry: Option<Duration>,
 }
 
 /// Which requests a crawl fetches in Chrome.
@@ -116,6 +122,8 @@ impl Default for CrawlSettings {
             browser_pages: 4,
             browser_launch: LaunchOptions::default(),
             allowed_domains: Vec::new(),
+            cache: None,
+            cache_expiry: None,
         }
     }
 }
@@ -288,6 +296,10 @@ pub struct Stats {
     pub browser_unblocked: u64,
     /// Requests dropped for going outside `allowed_domains`.
     pub offsite: u64,
+    /// Pages served from the cache rather than fetched.
+    pub cache_hits: u64,
+    /// Responses written to the cache.
+    pub cache_stores: u64,
 }
 
 /// A crawl in progress. Dropping it stops the scheduler; fetches already
@@ -299,6 +311,7 @@ pub struct Crawler {
 struct Shared {
     fetcher: Fetcher,
     checkpoint: Option<Checkpoint>,
+    cache: Option<Arc<Cache>>,
     /// What the checkpoint held at the start, until the caller takes it.
     saved: Mutex<Option<Saved>>,
     /// What new sessions are made from.
@@ -343,12 +356,18 @@ struct State {
     gate_fetches: usize,
     /// Requests sent so far, retries among them, for `max_pages`.
     sent: u64,
+    /// Requests the cache has a response for, served ahead of any host.
+    hits: BinaryHeap<Queued>,
+    /// Whether a hit is being read from the cache.
+    serving: bool,
     stats: Stats,
     closed: bool,
     /// Whether the crawl was told no HTTP profile matches its Chrome.
     warned_profile: bool,
     /// Whether the crawl was told a blocked request couldn't go to Chrome.
     warned_browser: bool,
+    /// Whether the crawl was told its cache failed.
+    warned_cache: bool,
     /// Hosts whose next request waits for a free Chrome page.
     page_waiters: Vec<String>,
 }
@@ -401,9 +420,20 @@ struct Queued {
     attempts: u32,
     /// Fetch it in Chrome.
     in_browser: bool,
+    /// What the cache needs to keep its response. None if it isn't cached.
+    keep: Option<Keep>,
     /// Blocked over HTTP and sent to Chrome: what the block was, for
     /// on_block if Chrome doesn't get through either.
     blocked: Option<Box<(String, BlockKind, Response)>>,
+}
+
+/// A cached request's way through to its response.
+struct Keep {
+    /// The fingerprint of the request as submitted, before any redirect,
+    /// which the cache keeps the response under.
+    key: Fingerprint,
+    /// The redirects followed so far.
+    redirects: Vec<Redirect>,
 }
 
 impl PartialEq for Queued {
@@ -440,10 +470,25 @@ impl Crawler {
             }
             None => (None, None),
         };
+        let cache = match &settings.cache {
+            Some(path) => Some(Arc::new(
+                Cache::open(
+                    path,
+                    settings.cache_expiry,
+                    Policy {
+                        robots: settings.obey_robots.then(|| settings.robots_agent.clone()),
+                        tdm: settings.obey_tdmrep,
+                    },
+                )
+                .map_err(FetchError::invalid)?,
+            )),
+            None => None,
+        };
         let settings_pages = settings.browser_pages.max(1);
         let shared = Arc::new(Shared {
             fetcher: Fetcher::new(fetch.clone())?,
             checkpoint,
+            cache,
             saved: Mutex::new(saved),
             options: fetch,
             proxy_turn: std::sync::atomic::AtomicUsize::new(0),
@@ -536,6 +581,9 @@ impl Crawler {
         if let Some(cp) = &self.shared.checkpoint {
             cp.close();
         }
+        if let Some(cache) = &self.shared.cache {
+            cache.close();
+        }
         flushed
     }
 
@@ -604,6 +652,18 @@ impl Crawler {
             state.stats.skipped_domain_full += 1;
             return Submitted::DomainFull;
         }
+        // Chrome hands the callback a live page, which no kept response
+        // can stand in for.
+        let cache = self
+            .shared
+            .cache
+            .as_ref()
+            .filter(|_| !wants_browser(settings, &request));
+        let hit = cache.is_some_and(|c| c.has(&fp));
+        let keep = cache.map(|_| Keep {
+            key: fp,
+            redirects: Vec::new(),
+        });
         let url = request.url.clone();
         let saving = self.shared.checkpoint.as_ref().map(|cp| {
             let row = match persist {
@@ -634,7 +694,7 @@ impl Crawler {
             };
             (request.id, row)
         });
-        if !enqueue(settings, &mut state, request, &url, 0) {
+        if !enqueue(settings, &mut state, request, &url, 0, keep, hit) {
             return Submitted::Invalid;
         }
         if let Some((id, row)) = saving {
@@ -684,7 +744,7 @@ async fn next_events(shared: Arc<Shared>, max: usize) -> Vec<Event> {
                 shared.schedule.notify_one();
                 return batch;
             }
-            let idle = state.stats.in_flight == 0 && state.gate_fetches == 0;
+            let idle = state.stats.in_flight == 0 && state.gate_fetches == 0 && !state.serving;
             if idle && (state.stats.queued == 0 || state.capped(&shared.settings)) {
                 return Vec::new();
             }
@@ -701,6 +761,9 @@ impl Drop for Crawler {
         // checkpoint file shouldn't stay open with it.
         if let Some(cp) = &self.shared.checkpoint {
             cp.close();
+        }
+        if let Some(cache) = &self.shared.cache {
+            cache.close();
         }
         let shared = self.shared.clone();
         self.shared.runtime.spawn(async move {
@@ -802,6 +865,8 @@ enum Action {
     Fetch(Box<Queued>, Fetcher, Option<OwnedSemaphorePermit>),
     CheckRobots(String),
     CheckTdm(String),
+    /// Read a hit from the cache.
+    Serve(Box<Queued>),
     /// Another host's check of the same origin is under way.
     Wait,
 }
@@ -833,6 +898,9 @@ async fn schedule_loop(s: Arc<Shared>) {
                 Action::CheckTdm(origin) => {
                     tokio::spawn(check_tdm(s.clone(), origin));
                 }
+                Action::Serve(q) => {
+                    tokio::spawn(serve(s.clone(), *q));
+                }
                 Action::Wait => {}
             }
         }
@@ -848,15 +916,23 @@ async fn schedule_loop(s: Arc<Shared>) {
     }
 }
 
+/// Whether `request` goes to Chrome. Chrome navigates to a URL; a POST
+/// stays with the HTTP client.
+fn wants_browser(settings: &CrawlSettings, request: &CrawlRequest) -> bool {
+    (request.browser || settings.browser == BrowserMode::Always) && request.outgoing.method == "GET"
+}
+
 /// Queues `request` for `url` (the request's own URL, or where a redirect
-/// led) on its host, and marks the host ready. False if the URL can't be
-/// crawled.
+/// led) on its host, and marks the host ready; or, for a `hit`, on the
+/// queue served from the cache. False if the URL can't be crawled.
 fn enqueue(
     settings: &CrawlSettings,
     state: &mut State,
     mut request: CrawlRequest,
     url: &str,
     hops: usize,
+    keep: Option<Keep>,
+    hit: bool,
 ) -> bool {
     let Ok(parsed) = Url::parse(url) else {
         return false;
@@ -875,9 +951,7 @@ fn enqueue(
     };
     request.url = url.to_string();
     state.seq += 1;
-    // Chrome navigates to a URL; a POST stays with the HTTP client.
-    let in_browser = (request.browser || settings.browser == BrowserMode::Always)
-        && request.outgoing.method == "GET";
+    let in_browser = wants_browser(settings, &request);
     let queued = Queued {
         priority: request.priority,
         seq: state.seq,
@@ -888,31 +962,34 @@ fn enqueue(
         hops,
         attempts: 0,
         in_browser,
+        keep,
         blocked: None,
     };
-    state
-        .hosts
-        .entry(host.clone())
-        .or_insert_with(|| Host {
-            queue: BinaryHeap::new(),
-            in_flight: 0,
-            next_at: Instant::now(),
-            delay: if settings.throttle {
-                settings.start_delay
-            } else {
-                settings.min_delay
-            },
-            floor: Duration::ZERO,
-            listed: false,
-            timer: None,
-            accepted: 0,
-            session: None,
-            recent: VecDeque::new(),
-        })
-        .queue
-        .push(queued);
+    // The host is made either way: it counts the request toward
+    // max_pages_per_domain, and a hit the cache no longer has goes there.
+    let host_entry = state.hosts.entry(host.clone()).or_insert_with(|| Host {
+        queue: BinaryHeap::new(),
+        in_flight: 0,
+        next_at: Instant::now(),
+        delay: if settings.throttle {
+            settings.start_delay
+        } else {
+            settings.min_delay
+        },
+        floor: Duration::ZERO,
+        listed: false,
+        timer: None,
+        accepted: 0,
+        session: None,
+        recent: VecDeque::new(),
+    });
+    if hit {
+        state.hits.push(queued);
+    } else {
+        host_entry.queue.push(queued);
+        state.make_ready(&host);
+    }
     state.stats.queued += 1;
-    state.make_ready(&host);
     true
 }
 
@@ -965,6 +1042,20 @@ fn plan(
         }
     }
     let mut actions = Vec::new();
+    // Hits first: they wait for no host, delay or slot, only for room in
+    // the backlog, and count toward max_pages as a fetch would. One at a
+    // time, as the cache has one connection anyway: they come back in the
+    // order they were queued.
+    if !state.serving
+        && !state.capped(settings)
+        && state.events.len() < backlog_limit(settings)
+        && let Some(q) = state.hits.pop()
+    {
+        state.stats.queued -= 1;
+        state.serving = true;
+        state.sent += 1;
+        actions.push(Action::Serve(Box::new(q)));
+    }
     'hosts: while let Some(name) = state.ready.front().cloned() {
         // Gate fetches count against the limit like any other request.
         if state.stats.in_flight + state.gate_fetches >= settings.concurrency
@@ -1136,7 +1227,36 @@ async fn fetch(shared: Arc<Shared>, mut q: Queued, session: Fetcher) {
         Ok(Hop::Done(r)) => Some(classify(r)),
         _ => None,
     };
+    let reserved = match &result {
+        Ok(Hop::Done(r)) if settings.obey_tdmrep => {
+            page_reserved(&shared.lock(), &q.origin, &q.path, r)
+        }
+        _ => false,
+    };
+    // Kept before its event is out, so a page the caller has is on disk.
+    let mut stored = Ok(false);
+    if let (Some(keep), Some(cache), Ok(Hop::Done(r))) = (&q.keep, &shared.cache, &result)
+        && !reserved
+        && worth_keeping(r, outcome.as_ref())
+    {
+        let (cache, r) = (cache.clone(), r.clone());
+        let (key, redirects) = (keep.key, keep.redirects.clone());
+        stored = tokio::task::spawn_blocking(move || cache.put(&key, &r, &redirects))
+            .await
+            .unwrap_or_else(|e| Err(e.to_string()));
+    }
     let mut state = shared.lock();
+    match stored {
+        Ok(true) => state.stats.cache_stores += 1,
+        Ok(false) => {}
+        Err(e) => cache_failed(
+            &shared,
+            &mut state,
+            "written",
+            &e,
+            "carrying on without it for this page",
+        ),
+    }
     state.stats.in_flight -= 1;
     if let Some(host) = state.hosts.get_mut(&q.host) {
         host.in_flight -= 1;
@@ -1222,7 +1342,7 @@ async fn fetch(shared: Arc<Shared>, mut q: Queued, session: Fetcher) {
             None
         }
         (Ok(Hop::Done(response)), _) => {
-            if settings.obey_tdmrep && page_reserved(&state, &q.origin, &q.path, &response) {
+            if reserved {
                 Some(Event::Dropped {
                     id: q.request.id,
                     reason: DropReason::TdmReserved,
@@ -1239,17 +1359,34 @@ async fn fetch(shared: Arc<Shared>, mut q: Queued, session: Fetcher) {
         // goes through that host's robots.txt, TDMRep and limits. Its URL
         // counts as seen, but is fetched even if seen: this request has to
         // end somewhere.
-        (Ok(Hop::Redirect(next, then)), _) => {
-            if let Some(fp) = fingerprint_with(&then.method, &next, then.body.as_deref()) {
+        (Ok(Hop::Redirect(next, then, cookies)), _) => {
+            let seen = fingerprint_with(&then.method, &next, then.body.as_deref());
+            if let Some(fp) = seen {
                 state.seen.insert(fp);
                 if let Some(cp) = &shared.checkpoint {
                     cp.seen(fp);
                 }
             }
+            // For a hit to do the same, with no hops.
+            if let Some(keep) = &mut q.keep {
+                keep.redirects.push(Redirect {
+                    url: q.request.url.clone(),
+                    cookies,
+                    seen,
+                });
+            }
             let id = q.request.id;
             q.attempts = 0;
             q.request.outgoing = then;
-            if enqueue(settings, &mut state, q.request, &next, q.hops + 1) {
+            if enqueue(
+                settings,
+                &mut state,
+                q.request,
+                &next,
+                q.hops + 1,
+                q.keep,
+                false,
+            ) {
                 None
             } else {
                 Some(Event::Failed {
@@ -1280,6 +1417,109 @@ async fn fetch(shared: Arc<Shared>, mut q: Queued, session: Fetcher) {
     }
     drop(state);
     shared.schedule.notify_one();
+}
+
+/// Whether the cache keeps `r`: an answer that ended the request and will
+/// be the same next time. Never a block, a throttle, a 402, a server error
+/// or a status that would have been retried; nor a 401, a 403 or a 451,
+/// which may be a block no signature knows yet, a 407 from the crawl's own
+/// proxy, or a 304, which only makes sense to the request it answered.
+fn worth_keeping(r: &Response, outcome: Option<&Outcome>) -> bool {
+    matches!(outcome, Some(Outcome::Ok | Outcome::HttpError(_)))
+        && r.status < 500
+        && !RETRY_STATUSES.contains(&r.status)
+        && ![304, 401, 403, 407, 451].contains(&r.status)
+}
+
+/// Hands the caller a hit, read from the cache, as the `Fetched` event a
+/// fetch would have made.
+async fn serve(shared: Arc<Shared>, q: Queued) {
+    let read = match (shared.cache.clone(), q.keep.as_ref().map(|k| k.key)) {
+        (Some(cache), Some(key)) => tokio::task::spawn_blocking(move || cache.get(&key))
+            .await
+            .unwrap_or_else(|e| Err(e.to_string())),
+        _ => Ok(None),
+    };
+    let mut state = shared.lock();
+    state.serving = false;
+    let read = read.unwrap_or_else(|e| {
+        cache_failed(&shared, &mut state, "read", &e, "fetching the page instead");
+        None
+    });
+    match read {
+        Some((mut response, redirects)) => {
+            state.stats.cache_hits += 1;
+            // What the fetch did along the way, done again: each hop's
+            // cookies into the jar its host's requests use, and where each
+            // led marked seen.
+            for r in &redirects {
+                session_for(&shared, &state, &r.url).add_set_cookies(&r.url, &r.cookies);
+                if let Some(fp) = r.seen {
+                    state.seen.insert(fp);
+                    if let Some(cp) = &shared.checkpoint {
+                        cp.seen(fp);
+                    }
+                }
+            }
+            let cookies: Vec<String> = response
+                .headers
+                .iter()
+                .filter(|(k, _)| k == "set-cookie")
+                .map(|(_, v)| v.clone())
+                .collect();
+            session_for(&shared, &state, &response.url).add_set_cookies(&response.url, &cookies);
+            // Kept under a key that ignores fragments and tracking
+            // parameters, so without a redirect the URL is the one asked for,
+            // written as a fetch would write it.
+            if redirects.is_empty() {
+                response.url =
+                    Url::parse(&q.request.url).map_or_else(|_| q.request.url.clone(), String::from);
+            }
+            // `bytes` counts what was downloaded.
+            let size = response.body.len() as u64;
+            let event = Event::Fetched {
+                id: q.request.id,
+                response,
+                page: None,
+            };
+            shared.push_event(&mut state, event);
+            state.stats.bytes -= size;
+        }
+        // Gone or gone stale since it was admitted: fetched after all.
+        None => {
+            state.sent -= 1;
+            requeue(&mut state, q, Duration::ZERO);
+        }
+    }
+    drop(state);
+    shared.schedule.notify_one();
+}
+
+/// The session a request to `url` goes out with: its host's own, after a
+/// block, or the crawl's.
+fn session_for(shared: &Shared, state: &State, url: &str) -> Fetcher {
+    Url::parse(url)
+        .ok()
+        .and_then(|u| state.hosts.get(u.host_str()?)?.session.clone())
+        .unwrap_or_else(|| shared.fetcher.clone())
+}
+
+/// Tells the caller the cache failed, once per crawl: a disk that's full
+/// or a file another hand broke would otherwise say so for every page.
+fn cache_failed(shared: &Shared, state: &mut State, doing: &str, error: &str, instead: &str) {
+    if state.warned_cache {
+        return;
+    }
+    state.warned_cache = true;
+    let path = shared
+        .cache
+        .as_ref()
+        .map(|c| c.path().display().to_string());
+    let message = format!(
+        "the cache at {} couldn't be {doing}: {error}; {instead}",
+        path.unwrap_or_default()
+    );
+    shared.push_event(state, Event::Warning { message });
 }
 
 /// How long a challenge page gets to pass and move on in Chrome.
@@ -2137,6 +2377,7 @@ mod tests {
             hops: 0,
             attempts: 0,
             in_browser: false,
+            keep: None,
             blocked: None,
         };
         let mut heap: BinaryHeap<Queued> =

@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use url::Url;
-use wreq::header::{HeaderName, HeaderValue, LOCATION, OrigHeaderMap};
+use wreq::header::{HeaderName, HeaderValue, LOCATION, OrigHeaderMap, SET_COOKIE};
 use wreq::{Proxy, Uri, Version, redirect};
 
 use crate::decode::decode;
@@ -252,8 +252,9 @@ fn caused_by_tls(e: &wreq::Error) -> bool {
 #[derive(Debug)]
 pub enum Hop {
     Done(Response),
-    /// A redirect, to this absolute URL, and the request to make there.
-    Redirect(String, Outgoing),
+    /// A redirect, to this absolute URL, and the request to make there;
+    /// with the Set-Cookie values it carried, already in the jar.
+    Redirect(String, Outgoing, Vec<String>),
 }
 
 /// What kind of request this is, which decides what the browser sends
@@ -717,6 +718,14 @@ impl Fetcher {
         }
     }
 
+    /// Adds cookies as if a response from `url` had set them with these
+    /// Set-Cookie values.
+    pub fn add_set_cookies(&self, url: &str, values: &[String]) {
+        for value in values {
+            self.jar.add(value.clone(), url.to_string());
+        }
+    }
+
     pub async fn get(
         &self,
         url: &str,
@@ -737,7 +746,7 @@ impl Fetcher {
         for hop in 0..=MAX_REDIRECTS {
             match self.hop_as(&current, &outgoing, headers, hop).await? {
                 Hop::Done(response) => return Ok(response),
-                Hop::Redirect(next, then) => (current, outgoing) = (next, then),
+                Hop::Redirect(next, then, _) => (current, outgoing) = (next, then),
             }
         }
         unreachable!("the last hop returns a response or an error")
@@ -817,7 +826,14 @@ impl Fetcher {
             )));
         }
         let then = outgoing.redirected(status, &current, &next);
-        Ok(Hop::Redirect(next.into(), then))
+        let cookies = response
+            .headers()
+            .get_all(SET_COOKIE)
+            .iter()
+            .filter_map(|v| v.to_str().ok())
+            .map(str::to_string)
+            .collect();
+        Ok(Hop::Redirect(next.into(), then, cookies))
     }
 
     async fn send_typed(

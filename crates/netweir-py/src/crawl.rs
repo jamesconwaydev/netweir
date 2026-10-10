@@ -667,6 +667,7 @@ impl Crawler {
         retries=3, backoff_base=1.0, backoff_max=60.0, proxies=None,
         breaker_window=50, breaker_ratio=0.3, breaker_pause=300.0, checkpoint=None,
         browser="off", browser_pages=4, max_response_size=None, allowed_domains=None,
+        cache=None, cache_expiry=None,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -699,6 +700,8 @@ impl Crawler {
         browser_pages: usize,
         max_response_size: Option<u64>,
         allowed_domains: Option<Vec<String>>,
+        cache: Option<std::path::PathBuf>,
+        cache_expiry: Option<f64>,
     ) -> PyResult<Crawler> {
         let allowed_domains = netweir_core::allowed_domains(&allowed_domains.unwrap_or_default())
             .map_err(PyValueError::new_err)?;
@@ -737,6 +740,13 @@ impl Crawler {
         if min_delay > max_delay {
             return Err(PyValueError::new_err("min_delay must not exceed max_delay"));
         }
+        let cache_expiry = match cache_expiry {
+            Some(s) if s <= 0.0 => {
+                return Err(PyValueError::new_err("cache_expiry must be positive"));
+            }
+            Some(s) => Some(seconds("cache_expiry", s)?),
+            None => None,
+        };
         let settings = CrawlSettings {
             concurrency,
             per_domain,
@@ -763,6 +773,8 @@ impl Crawler {
             browser_pages,
             browser_launch: Default::default(),
             allowed_domains,
+            cache,
+            cache_expiry,
         };
         let mut options = fetch_options(profile, proxy, timeout, verify)?;
         options.max_body = max_response_size;
@@ -1102,6 +1114,8 @@ impl Crawler {
         d.set_item("browser_fetches", s.browser_fetches)?;
         d.set_item("browser_unblocked", s.browser_unblocked)?;
         d.set_item("offsite", s.offsite)?;
+        d.set_item("cache_hits", s.cache_hits)?;
+        d.set_item("cache_stores", s.cache_stores)?;
         Ok(d)
     }
 }

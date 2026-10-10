@@ -88,6 +88,13 @@ class Settings:
     #: again, and items carry an ``_id`` so none is written twice. Delete
     #: the directory to start over.
     checkpoint: str | None = None
+    #: A directory to keep responses in while you write a spider: run it
+    #: again and pages it already has come from there, with no request to
+    #: the site and no delay. Blocks, throttling, server errors and pages
+    #: fetched in Chrome are never kept. Delete the directory to clear it.
+    cache: str | None = None
+    #: Seconds after which a kept response is fetched again; None for never.
+    cache_expiry: float | None = None
     #: How similar (0 to 1) an element must be to count as a tracked
     #: selector's element after the selector stops matching.
     track_threshold: float = 0.75
@@ -123,6 +130,8 @@ class Settings:
                 raise ValueError(f"{field} must be at least 1")
         if self.max_time is not None and self.max_time <= 0:
             raise ValueError("max_time must be positive")
+        if self.cache_expiry is not None and self.cache_expiry <= 0:
+            raise ValueError("cache_expiry must be positive")
         if self.retries < 0 or self.breaker_window < 0:
             raise ValueError("retries and breaker_window must be 0 or more")
         if not 0 < self.backoff_base <= self.backoff_max or self.breaker_pause < 0:
@@ -170,6 +179,8 @@ class Settings:
             checkpoint=self._checkpoint_file(),
             browser=self.browser,
             browser_pages=self.browser_pages,
+            cache=None if self.cache is None else os.path.join(self.cache, "cache.sqlite3"),
+            cache_expiry=self.cache_expiry,
         )
 
     def _checkpoint_file(self) -> str | None:

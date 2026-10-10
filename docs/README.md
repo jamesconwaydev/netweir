@@ -10,5 +10,6 @@
 - [Settings](settings.md): every setting and its default.
 
 The design behind it all is in [design/v0.1.md](design/v0.1.md), the
-browser driver's in [design/browser.md](design/browser.md), and requests
-other than GETs in [design/requests.md](design/requests.md).
+browser driver's in [design/browser.md](design/browser.md), requests
+other than GETs in [design/requests.md](design/requests.md), and the
+development cache in [design/cache.md](design/cache.md).
