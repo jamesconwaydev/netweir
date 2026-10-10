@@ -15,8 +15,8 @@ of those words will mean when it is:
   rotating, backing off or slowing down. Crawls that pick up where they
   stopped after a crash.
 - **Undetectable.** Requests that are byte-for-byte what a real browser
-  sends, from the TLS handshake to the order of the headers, and later a
-  real browser for the pages that need one.
+  sends, from the TLS handshake to the order of the headers, and a real
+  Chrome for the pages that need one.
 
 ## Where it is now
 
@@ -46,9 +46,19 @@ Working today:
   cookies it earns back to the fast HTTP client. `netweir install chrome`
   fetches the Chrome it's tuned for.
 
-Coming next: the 0.1 release. Firefox in the driver
-waits for a Firefox that doesn't announce it's automated. The designs are
-in [docs/design/](docs/design/).
+Coming next: Firefox in the driver, once there's a Firefox that doesn't
+announce it's automated. The designs are in [docs/design/](docs/design/).
+
+## Install
+
+```
+pip install netweir
+```
+
+There are wheels for Linux, macOS and Windows, on Python 3.10 and up,
+free-threaded 3.14 included, so there's nothing to compile. Pages that
+need a real browser want Chrome too: `netweir install chrome` fetches the
+version netweir is tuned for.
 
 ## Quick look
 
