@@ -57,16 +57,29 @@ def _parse_setting(text: str, fields: dict) -> tuple[str, object]:
     if not sep or key not in fields:
         known = ", ".join(sorted(fields))
         raise ValueError(f"unknown setting {key!r}; settings are: {known}")
-    kind = fields[key].type
-    if kind in ("bool", bool):
+    # Settings' annotations are strings, such as "int | None".
+    kind = str(fields[key].type)
+    if kind.endswith(" | None"):
+        if raw.lower() == "none":
+            return key, None
+        kind = kind.removesuffix(" | None")
+    if kind == "bool":
         if raw.lower() not in ("true", "false", "1", "0", "yes", "no"):
             raise ValueError(f"{key} takes true or false, not {raw!r}")
         return key, raw.lower() in ("true", "1", "yes")
-    if kind in ("int", int):
-        return key, int(raw)
-    if kind in ("float", float):
-        return key, float(raw)
-    return key, None if raw.lower() == "none" else raw
+    if kind == "int":
+        try:
+            return key, int(raw)
+        except ValueError:
+            raise ValueError(f"{key} takes a whole number, not {raw!r}") from None
+    if kind == "float":
+        try:
+            return key, float(raw)
+        except ValueError:
+            raise ValueError(f"{key} takes a number, not {raw!r}") from None
+    if kind.startswith("tuple"):
+        return key, tuple(part.strip() for part in raw.split(",") if part.strip())
+    return key, raw
 
 
 def main(argv: list[str] | None = None) -> int:
