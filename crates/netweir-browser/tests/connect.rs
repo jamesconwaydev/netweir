@@ -49,11 +49,16 @@ fn running_with(extra: &[&str]) -> Option<Running> {
         .spawn()
         .unwrap();
     let stderr = BufReader::new(child.stderr.take().unwrap());
+    let mut said = Vec::new();
     let ws = stderr
         .lines()
         .map_while(Result::ok)
-        .find_map(|l| l.strip_prefix("DevTools listening on ").map(str::to_string))
-        .expect("Chrome printed its DevTools URL");
+        .find_map(|l| {
+            let ws = l.strip_prefix("DevTools listening on ").map(str::to_string);
+            said.push(l);
+            ws
+        })
+        .unwrap_or_else(|| panic!("Chrome didn't print its DevTools URL:\n{}", said.join("\n")));
     Some(Running {
         child,
         ws,

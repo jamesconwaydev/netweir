@@ -2,7 +2,8 @@
 
 use std::io::{PipeReader, PipeWriter};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, ChildStderr, Command, Stdio};
+use std::sync::{Arc, Condvar, Mutex};
 
 use crate::{Error, Result};
 
@@ -158,6 +159,58 @@ pub(crate) struct Started {
     pub child: Child,
     pub commands: PipeWriter,
     pub replies: PipeReader,
+    pub said: Said,
+}
+
+/// The last lines Chrome wrote to stderr, so an error can say why it
+/// wouldn't start. Read on a thread of its own until Chrome closes it,
+/// which also keeps a chatty Chrome from filling the pipe and stalling.
+#[derive(Clone, Default)]
+pub(crate) struct Said(Arc<(Mutex<Lines>, Condvar)>);
+
+/// The lines kept, and whether Chrome has closed stderr.
+type Lines = (std::collections::VecDeque<String>, bool);
+
+impl Said {
+    fn read(stderr: ChildStderr) -> Said {
+        let said = Said::default();
+        let writing = said.clone();
+        let _ = std::thread::Builder::new()
+            .name("netweir-chrome-stderr".into())
+            .spawn(move || {
+                use std::io::BufRead;
+                let (lock, done) = &*writing.0;
+                for line in std::io::BufReader::new(stderr)
+                    .lines()
+                    .map_while(|l| l.ok())
+                {
+                    let mut lines = lock.lock().unwrap_or_else(|e| e.into_inner());
+                    if lines.0.len() == 20 {
+                        lines.0.pop_front();
+                    }
+                    lines.0.push_back(line);
+                }
+                lock.lock().unwrap_or_else(|e| e.into_inner()).1 = true;
+                done.notify_all();
+            });
+        said
+    }
+
+    /// `message`, with what Chrome said, if anything, after it. Waits up
+    /// to a second for a Chrome that has just exited to finish saying it;
+    /// only ever on the way to an error.
+    pub(crate) fn explain(&self, message: String) -> String {
+        let (lock, done) = &*self.0;
+        let lines = lock.lock().unwrap_or_else(|e| e.into_inner());
+        let (lines, _) = done
+            .wait_timeout_while(lines, std::time::Duration::from_secs(1), |l| !l.1)
+            .unwrap_or_else(|e| e.into_inner());
+        if lines.0.is_empty() {
+            return message;
+        }
+        let said: Vec<&str> = lines.0.iter().map(String::as_str).collect();
+        format!("{message}; Chrome said:\n{}", said.join("\n"))
+    }
 }
 
 pub(crate) fn start(executable: &Path, args: &[String]) -> Result<Started> {
@@ -177,7 +230,7 @@ pub(crate) fn start(executable: &Path, args: &[String]) -> Result<Started> {
         .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null());
+        .stderr(Stdio::piped());
     // On Windows, Chrome's ends are inheritable from hand_over until they're
     // dropped, and any child started meanwhile would get them too; then a
     // browser's reader would never see its Chrome exit. Launches here take
@@ -191,10 +244,13 @@ pub(crate) fn start(executable: &Path, args: &[String]) -> Result<Started> {
         drop((chrome_reads, chrome_writes));
         child
     };
+    let mut child = child;
+    let said = child.stderr.take().map(Said::read).unwrap_or_default();
     Ok(Started {
         child,
         commands,
         replies,
+        said,
     })
 }
 
