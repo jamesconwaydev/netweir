@@ -488,6 +488,38 @@ mod tests {
     use super::*;
 
     #[test]
+    fn every_profile_knows_every_kind_of_request() {
+        for (name, _) in BUILT_IN {
+            let p = Profile::named(name).unwrap();
+            let shapes = [
+                ("link", &p.link),
+                ("form", &p.form),
+                ("fetch", &p.fetch),
+                ("after_form_redirect", &p.after_form_redirect),
+            ];
+            for (kind, shape) in shapes {
+                let shape = shape
+                    .as_ref()
+                    .unwrap_or_else(|| panic!("{name} has no [{kind}]"));
+                // The values filled per request only hold a place.
+                for (k, v) in &shape.headers {
+                    if [
+                        "referer",
+                        "origin",
+                        "sec-fetch-site",
+                        "cookie",
+                        "content-type",
+                    ]
+                    .contains(&k.to_ascii_lowercase().as_str())
+                    {
+                        assert!(v.is_empty(), "{name} [{kind}] {k} has a value");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn every_built_in_profile_loads_and_builds() {
         for (name, _) in BUILT_IN {
             let p = Profile::named(name).unwrap();

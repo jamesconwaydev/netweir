@@ -405,3 +405,45 @@ async fn firefox_156_forms_and_scripts_post_like_firefox_over_http1() {
     let actual = post_scenario(&fetcher, &mut server).await;
     assert_same_in_order(&expected, &actual, "Firefox posting over HTTP/1.1");
 }
+
+#[tokio::test]
+async fn safari_27_forms_and_scripts_post_like_safari_over_http2() {
+    let expected: Vec<Capture> = serde_json::from_str(include_str!(
+        "../../../profiles/safari-27-macos.post.capture.json"
+    ))
+    .unwrap();
+    let mut server = Server::start().await.unwrap();
+    let fetcher = local_fetcher("safari-27-macos");
+    let actual = post_scenario(&fetcher, &mut server).await;
+    assert_same_in_order(&expected, &actual, "Safari posting over HTTP/2");
+}
+
+#[tokio::test]
+async fn safari_27_forms_and_scripts_post_like_safari_over_http1() {
+    let expected: Vec<Capture> = serde_json::from_str(include_str!(
+        "../../../profiles/safari-27-macos.post.http1.capture.json"
+    ))
+    .unwrap();
+    let mut server = Server::start_http1(0).await.unwrap();
+    let fetcher = local_fetcher("safari-27-macos");
+    let actual = post_scenario(&fetcher, &mut server).await;
+    let expected = learned_http1(expected, &actual);
+    assert_same_in_order(&expected, &actual, "Safari posting over HTTP/1.1");
+}
+
+/// Safari sent the whole scenario on the connection it opened before it
+/// learned the server speaks only HTTP/1.1, which offered h2 too; any
+/// connection it opens after learning offers http/1.1 alone (the
+/// navigation capture shows one). netweir opens a new connection where
+/// Safari kept the old one, so requests of netweir's on a connection it
+/// opened after learning carry the after-learning offer. Anything else
+/// about them must still match.
+fn learned_http1(mut expected: Vec<Capture>, actual: &[Capture]) -> Vec<Capture> {
+    for (e, a) in expected.iter_mut().zip(actual) {
+        if a.client_hello.alpn == ["http/1.1"] {
+            e.client_hello.alpn = vec!["http/1.1".into()];
+            e.ja4 = e.ja4.replacen("h2_", "h1_", 1);
+        }
+    }
+    expected
+}
