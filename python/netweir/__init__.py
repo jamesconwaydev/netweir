@@ -4,7 +4,8 @@ from netweir import export, repair
 from netweir._browser import browser
 from netweir._crawl import Settings, Spider
 from netweir._errors import Blocked, BrowserError, BrowserTimeout, FetchError
-from netweir._fetch import Client, Page, get
+from netweir._fetch import Client, Page, get, post, request, submit
+from netweir._form import Form
 from netweir._native import (
     Browser,
     BrowserContext,
@@ -31,6 +32,7 @@ __all__ = [
     "BrowserTimeout",
     "Client",
     "Follow",
+    "Form",
     "Item",
     "Request",
     "Settings",
@@ -48,6 +50,9 @@ __all__ = [
     "export",
     "get",
     "parse",
+    "post",
     "repair",
+    "request",
+    "submit",
     "xpath",
 ]

@@ -20,6 +20,13 @@ class Request:
     a request a callback yields. ``browser=True`` fetches it in Chrome,
     and the callback's ``page.browser`` is the page, open until the
     callback returns.
+
+    ``method`` and one of ``form``, ``json`` or ``body`` send something
+    other than a GET: ``form`` as a form submission (URL-encoded), ``json``
+    or a raw ``body`` as a page's script would send it. ``referer`` is the
+    page it comes from; ``page.follow`` sets it. A POST or PATCH that gets
+    a server error isn't retried, since the server may have acted on it,
+    unless ``retry_post=True``; nor is it ever handed to Chrome.
     """
 
     url: str
@@ -31,3 +38,54 @@ class Request:
     errback: Callable[..., Any] | str | None = None
     depth: int = 0
     browser: bool = False
+    method: str = "GET"
+    form: Any = None
+    json: Any = None
+    body: bytes | str | None = None
+    referer: str | None = None
+    retry_post: bool = False
+    #: Set from form, json and body: "navigate", "form" or "fetch", and the
+    #: body's Content-Type.
+    kind: str | None = None
+    content_type: str | None = None
+
+    def __post_init__(self) -> None:
+        self.method = self.method.upper()
+        if self.form is not None or self.json is not None or self.kind is None:
+            from netweir._fetch import payload
+
+            how = payload(self.method, self.form, self.json, self.body)
+            self.body = how.get("body")
+            self.kind = how["kind"]
+            self.content_type = how.get("content_type", self.content_type)
+            # Encoded into body: replace() and pickling see one body.
+            self.form = self.json = None
+        if self.browser and (self.method != "GET" or self.body is not None):
+            raise ValueError("only a GET can be fetched in Chrome (browser=True)")
+
+    @classmethod
+    def from_form(
+        cls,
+        page: Any,
+        query: str | None = None,
+        *,
+        data: Any = None,
+        click: str | bool | None = None,
+        formid: str | None = None,
+        formname: str | None = None,
+        formnumber: int = 0,
+        callback: Callable[..., Any] | str | None = None,
+        **kwargs: Any,
+    ) -> Request:
+        """A Request that submits a form on ``page``, as Scrapy's
+        ``FormRequest.from_response`` does; the form is picked and filled
+        as ``page.form()`` does it."""
+        form = page.form(
+            query,
+            data=data,
+            click=click,
+            formid=formid,
+            formname=formname,
+            formnumber=formnumber,
+        )
+        return form.request(callback=callback, **kwargs)

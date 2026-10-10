@@ -327,7 +327,8 @@ class _Run:
             # No checkpoint, or one this crawl has just created.
             return None
         self.delivered = set(saved["items"])
-        for row, url, priority, headers, dont_filter, depth, payload in saved["pending"]:
+        for (row, url, priority, headers, dont_filter, depth, payload), sent in saved["pending"]:
+            method, kind, body, content_type, referer, retry_post = sent
             data = json.loads(payload)
             request = Request(
                 url,
@@ -339,6 +340,12 @@ class _Run:
                 errback=data.get("errback"),
                 depth=depth,
                 browser=data.get("browser", False),
+                method=method,
+                body=body,
+                referer=referer,
+                retry_post=retry_post,
+                kind=kind,
+                content_type=content_type,
             )
             self.submit(request, row=row)
         if saved["pending"] or self.delivered:
@@ -397,6 +404,12 @@ class _Run:
             payload=payload,
             row=row,
             browser=request.browser,
+            method=request.method,
+            kind=request.kind,
+            body=request.body.encode() if isinstance(request.body, str) else request.body,
+            content_type=request.content_type,
+            referer=request.referer,
+            retry_post=request.retry_post,
         )
         if outcome == "queued":
             self.waiting[rid] = request

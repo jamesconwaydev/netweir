@@ -21,7 +21,7 @@ use crate::canonical::Fingerprint;
 
 /// The layout this build writes. Older files are upgraded on open; newer
 /// ones are refused.
-pub const FORMAT: i64 = 1;
+pub const FORMAT: i64 = 2;
 
 /// A request that was saved and not finished.
 #[derive(Debug, Clone, PartialEq)]
@@ -33,6 +33,14 @@ pub struct Pending {
     pub dont_filter: bool,
     pub depth: u32,
     pub payload: String,
+    /// The request's method, its kind ("navigate", "form", "fetch"), body,
+    /// body type and the page it came from. Format 1 had only GETs.
+    pub method: String,
+    pub kind: String,
+    pub body: Option<Vec<u8>>,
+    pub content_type: Option<String>,
+    pub referer: Option<String>,
+    pub retry_post: bool,
 }
 
 /// What a checkpoint held when it was opened.
@@ -95,7 +103,13 @@ const SCHEMA: &str = "
         dont_filter INTEGER NOT NULL,
         depth INTEGER NOT NULL,
         payload TEXT NOT NULL,
-        done INTEGER NOT NULL DEFAULT 0
+        done INTEGER NOT NULL DEFAULT 0,
+        method TEXT NOT NULL DEFAULT 'GET',
+        kind TEXT NOT NULL DEFAULT 'navigate',
+        body BLOB,
+        content_type TEXT,
+        referer TEXT,
+        retry_post INTEGER NOT NULL DEFAULT 0
     );
     CREATE INDEX IF NOT EXISTS pending ON requests (row) WHERE done = 0;
     CREATE TABLE IF NOT EXISTS seen (fingerprint BLOB PRIMARY KEY) WITHOUT ROWID;
@@ -122,6 +136,21 @@ impl Checkpoint {
                 conn.execute(
                     "INSERT INTO meta (key, value) VALUES ('format', ?1)",
                     params![FORMAT.to_string()],
+                )
+                .map_err(sql)?;
+            }
+            Some(Ok(1)) => {
+                // Format 1 had only GETs: every request saved is one.
+                conn.execute_batch(
+                    "BEGIN;
+                     ALTER TABLE requests ADD COLUMN method TEXT NOT NULL DEFAULT 'GET';
+                     ALTER TABLE requests ADD COLUMN kind TEXT NOT NULL DEFAULT 'navigate';
+                     ALTER TABLE requests ADD COLUMN body BLOB;
+                     ALTER TABLE requests ADD COLUMN content_type TEXT;
+                     ALTER TABLE requests ADD COLUMN referer TEXT;
+                     ALTER TABLE requests ADD COLUMN retry_post INTEGER NOT NULL DEFAULT 0;
+                     UPDATE meta SET value = '2' WHERE key = 'format';
+                     COMMIT;",
                 )
                 .map_err(sql)?;
             }
@@ -260,7 +289,8 @@ fn connect(path: &Path) -> rusqlite::Result<Connection> {
 fn read(conn: &Connection) -> rusqlite::Result<Saved> {
     let mut saved = Saved::default();
     let mut stmt = conn.prepare(
-        "SELECT row, url, priority, headers, dont_filter, depth, payload
+        "SELECT row, url, priority, headers, dont_filter, depth, payload,
+                method, kind, body, content_type, referer, retry_post
          FROM requests WHERE done = 0 ORDER BY row",
     )?;
     let rows = stmt.query_map([], |r| {
@@ -273,6 +303,12 @@ fn read(conn: &Connection) -> rusqlite::Result<Saved> {
             dont_filter: r.get(4)?,
             depth: r.get(5)?,
             payload: r.get(6)?,
+            method: r.get(7)?,
+            kind: r.get(8)?,
+            body: r.get(9)?,
+            content_type: r.get(10)?,
+            referer: r.get(11)?,
+            retry_post: r.get(12)?,
         })
     })?;
     for row in rows {
@@ -338,8 +374,9 @@ fn commit(conn: &mut Connection, batch: Vec<Op>) -> rusqlite::Result<()> {
     let tx = conn.transaction()?;
     {
         let mut request = tx.prepare_cached(
-            "INSERT OR REPLACE INTO requests (row, url, priority, headers, dont_filter, depth, payload)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            "INSERT OR REPLACE INTO requests (row, url, priority, headers, dont_filter, depth, payload,
+                 method, kind, body, content_type, referer, retry_post)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
         )?;
         let mut seen = tx.prepare_cached("INSERT OR IGNORE INTO seen (fingerprint) VALUES (?1)")?;
         let mut done = tx.prepare_cached("UPDATE requests SET done = 1 WHERE row = ?1")?;
@@ -360,7 +397,13 @@ fn commit(conn: &mut Connection, batch: Vec<Op>) -> rusqlite::Result<()> {
                         headers,
                         p.dont_filter,
                         p.depth,
-                        p.payload
+                        p.payload,
+                        p.method,
+                        p.kind,
+                        p.body,
+                        p.content_type,
+                        p.referer,
+                        p.retry_post
                     ])?;
                 }
                 Op::Seen(fp) => {
@@ -422,6 +465,12 @@ mod tests {
             dont_filter: false,
             depth: 3,
             payload: r#"{"callback":"parse"}"#.into(),
+            method: "GET".into(),
+            kind: "navigate".into(),
+            body: None,
+            content_type: None,
+            referer: Some("https://e.com/".into()),
+            retry_post: false,
         }
     }
 
@@ -491,6 +540,49 @@ mod tests {
         assert!(err.contains("requests"), "{err}");
         assert!(cp.flush().is_ok(), "reported once");
         drop(cp);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_checkpoint_from_before_methods_and_bodies_is_upgraded() {
+        let dir = std::env::temp_dir().join(format!("netweir-cp-v1-{}", std::process::id()));
+        let path = dir.join("crawl.sqlite3");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // The first format's layout, as 0.1.0 wrote it.
+        Connection::open(&path)
+            .unwrap()
+            .execute_batch(
+                "CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+                 INSERT INTO meta VALUES ('format', '1');
+                 CREATE TABLE requests (row INTEGER PRIMARY KEY, url TEXT NOT NULL,
+                     priority INTEGER NOT NULL, headers TEXT NOT NULL,
+                     dont_filter INTEGER NOT NULL, depth INTEGER NOT NULL,
+                     payload TEXT NOT NULL, done INTEGER NOT NULL DEFAULT 0);
+                 INSERT INTO requests (row, url, priority, headers, dont_filter, depth, payload)
+                     VALUES (4, 'https://e.com/a', 0, '[]', 0, 1, '{}');",
+            )
+            .unwrap();
+        let (cp, saved) = Checkpoint::open(&path).unwrap();
+        let p = &saved.pending[0];
+        assert_eq!(
+            (p.row, p.method.as_str(), p.kind.as_str()),
+            (4, "GET", "navigate")
+        );
+        assert_eq!(
+            (p.body.as_ref(), p.referer.as_ref(), p.retry_post),
+            (None, None, false)
+        );
+        // And it takes requests with bodies from then on.
+        let mut post = pending(5, "https://e.com/search");
+        post.method = "POST".into();
+        post.kind = "form".into();
+        post.body = Some(b"q=rust".to_vec());
+        cp.request([5; 16], post.clone());
+        drop(cp);
+        let (_cp, saved) = Checkpoint::open(&path).unwrap();
+        assert_eq!(saved.pending[1], post);
+        drop(_cp);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

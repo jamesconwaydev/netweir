@@ -262,6 +262,26 @@ pub enum Kind {
     Fetch,
 }
 
+impl Kind {
+    /// "navigate", "form" or "fetch", as a checkpoint saves it.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Kind::Navigate => "navigate",
+            Kind::Form => "form",
+            Kind::Fetch => "fetch",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Kind> {
+        match s {
+            "navigate" => Some(Kind::Navigate),
+            "form" => Some(Kind::Form),
+            "fetch" => Some(Kind::Fetch),
+            _ => None,
+        }
+    }
+}
+
 /// How a request's target relates to the page it comes from, as
 /// Sec-Fetch-Site says it; ordered from closest to furthest.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
@@ -386,6 +406,33 @@ impl Outgoing {
             referer,
             ..Outgoing::navigate()
         }
+    }
+
+    /// The request these parts describe, as `kind`'s constructor makes it.
+    /// A navigation is always a GET without a body.
+    pub fn from_parts(
+        method: &str,
+        kind: Kind,
+        body: Option<Vec<u8>>,
+        content_type: Option<String>,
+        referer: Option<String>,
+    ) -> Outgoing {
+        match kind {
+            Kind::Navigate => Outgoing {
+                referer,
+                ..Outgoing::navigate()
+            },
+            Kind::Form => Outgoing {
+                method: method.to_ascii_uppercase(),
+                ..Outgoing::form(body.unwrap_or_default(), content_type, referer)
+            },
+            Kind::Fetch => Outgoing::fetch(method, body, content_type, referer),
+        }
+    }
+
+    /// Repeating it can't do anything twice: not a POST or a PATCH.
+    pub fn idempotent(&self) -> bool {
+        !matches!(self.method.as_str(), "POST" | "PATCH")
     }
 
     /// Typing an address: the headers the profile lists first.

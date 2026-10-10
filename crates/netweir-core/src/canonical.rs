@@ -63,11 +63,22 @@ pub fn canonical(url: &str) -> Option<String> {
 pub type Fingerprint = [u8; 16];
 
 pub fn fingerprint(method: &str, url: &str) -> Option<Fingerprint> {
+    fingerprint_with(method, url, None)
+}
+
+/// `fingerprint`, with the body too, so two searches for different terms
+/// are two requests. Without a body it's `fingerprint`'s, which keeps a
+/// checkpoint written before bodies existed valid.
+pub fn fingerprint_with(method: &str, url: &str, body: Option<&[u8]>) -> Option<Fingerprint> {
     let canon = canonical(url)?;
     let mut h = Sha256::new();
     h.update(method.to_ascii_uppercase().as_bytes());
     h.update(b" ");
     h.update(canon.as_bytes());
+    if let Some(body) = body {
+        h.update(b" ");
+        h.update(Sha256::digest(body));
+    }
     let digest = h.finalize();
     let mut out = [0u8; 16];
     out.copy_from_slice(&digest[..16]);
@@ -145,5 +156,18 @@ mod tests {
         assert_eq!(a, fingerprint("get", "https://E.com/?a=2&b=1").unwrap());
         assert_ne!(a, fingerprint("POST", "https://e.com/?a=2&b=1").unwrap());
         assert_ne!(a, fingerprint("GET", "https://e.com/?a=3&b=1").unwrap());
+    }
+
+    #[test]
+    fn a_body_tells_requests_apart_and_no_body_changes_nothing() {
+        let url = "https://e.com/search";
+        let rust = fingerprint_with("POST", url, Some(b"q=rust")).unwrap();
+        assert_ne!(rust, fingerprint_with("POST", url, Some(b"q=go")).unwrap());
+        assert_eq!(
+            rust,
+            fingerprint_with("post", url, Some(b"q=rust")).unwrap()
+        );
+        assert_ne!(rust, fingerprint("POST", url).unwrap());
+        assert_eq!(fingerprint_with("GET", url, None), fingerprint("GET", url));
     }
 }

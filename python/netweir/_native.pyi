@@ -267,6 +267,26 @@ class Fetcher:
     ) -> None: ...
     async def get(self, url: str, headers: list[tuple[str, str]] | None = None) -> Response: ...
     def get_blocking(self, url: str, headers: list[tuple[str, str]] | None = None) -> Response: ...
+    async def send(
+        self,
+        url: str,
+        method: str = "GET",
+        kind: Literal["navigate", "form", "fetch"] = "navigate",
+        body: bytes | None = None,
+        content_type: str | None = None,
+        referer: str | None = None,
+        headers: list[tuple[str, str]] | None = None,
+    ) -> Response: ...
+    def send_blocking(
+        self,
+        url: str,
+        method: str = "GET",
+        kind: Literal["navigate", "form", "fetch"] = "navigate",
+        body: bytes | None = None,
+        content_type: str | None = None,
+        referer: str | None = None,
+        headers: list[tuple[str, str]] | None = None,
+    ) -> Response: ...
 
 class Crawler:
     def __init__(
@@ -320,6 +340,12 @@ class Crawler:
         payload: str = "{}",
         row: int | None = None,
         browser: bool = False,
+        method: str = "GET",
+        kind: Literal["navigate", "form", "fetch"] = "navigate",
+        body: bytes | None = None,
+        content_type: str | None = None,
+        referer: str | None = None,
+        retry_post: bool = False,
     ) -> Literal["queued", "duplicate", "invalid", "too_deep", "trap", "domain_full"]: ...
     def resume(self) -> dict[str, Any] | None: ...
     def ack(self) -> None: ...

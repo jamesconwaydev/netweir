@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import asyncio
+import json as _json
 from collections.abc import Iterable, Mapping
-from urllib.parse import urljoin
+from typing import Any
+from urllib.parse import urlencode, urljoin
 
 from netweir import _track
 from netweir._errors import Blocked
+from netweir._form import Form, read_form
 from netweir._native import BrowserPage, Fetcher, Node, Response, Selection
 from netweir._request import Request
 
@@ -18,6 +21,44 @@ def _pairs(headers: Headers) -> list[tuple[str, str]]:
     if isinstance(headers, Mapping):
         return list(headers.items())
     return list(headers)
+
+
+def payload(
+    method: str, form: Any = None, json: Any = None, body: bytes | str | None = None
+) -> dict[str, Any]:
+    """How to send a request with one of ``form``, ``json`` or ``body``:
+    a form is a form submission, URL-encoded; JSON and a raw body are what
+    a page's script sends; none of them, a navigation."""
+    given = [form is not None, json is not None, body is not None]
+    if sum(given) > 1:
+        raise ValueError("pass one of form=, json= and body=, not several")
+    method = method.upper()
+    if form is not None:
+        pairs = form.items() if isinstance(form, Mapping) else form
+        encoded = urlencode(list(pairs), doseq=True).encode()
+        return {"method": method, "kind": "form", "body": encoded}
+    if json is not None:
+        # As a script's JSON.stringify writes it: no spaces, text as is.
+        encoded = _json.dumps(json, separators=(",", ":"), ensure_ascii=False).encode()
+        return {
+            "method": method,
+            "kind": "fetch",
+            "body": encoded,
+            "content_type": "application/json",
+        }
+    if body is not None:
+        encoded = body.encode() if isinstance(body, str) else bytes(body)
+        return {"method": method, "kind": "fetch", "body": encoded}
+    if method == "GET":
+        return {"method": method, "kind": "navigate"}
+    return {"method": method, "kind": "fetch"}
+
+
+def _from_form(form: Form) -> tuple[str, dict[str, Any]]:
+    url, body, content_type = form.encoded()
+    if body is None:
+        return url, {"method": "GET", "kind": "navigate"}
+    return url, {"method": form.method, "kind": "form", "body": body, "content_type": content_type}
 
 
 class Page:
@@ -145,12 +186,43 @@ class Page:
         return urljoin(self._base, str(url))
 
     def follow(self, url: str, callback=None, **kwargs) -> Request:
-        """A Request for ``url``, resolved as ``urljoin`` does."""
+        """A Request for ``url``, resolved as ``urljoin`` does, sent as
+        following a link on this page."""
+        kwargs.setdefault("referer", self.url)
         return Request(self.urljoin(url), callback=callback, **kwargs)
 
     def follow_all(self, urls, callback=None, **kwargs) -> list[Request]:
         """``follow`` for every URL in ``urls`` (a list or a Selection)."""
         return [self.follow(u, callback, **kwargs) for u in urls]
+
+    def form(
+        self,
+        query: str | None = None,
+        *,
+        data: Mapping[str, Any] | Iterable[tuple[str, Any]] | None = None,
+        click: str | bool | None = None,
+        formid: str | None = None,
+        formname: str | None = None,
+        formnumber: int = 0,
+    ) -> Form:
+        """A form on this page, ready to submit as a browser would.
+
+        Pick it with ``query`` (a CSS selector, or an XPath), ``formid``,
+        ``formname`` or ``formnumber``; the first form otherwise. Its fields
+        are what the browser would send: named, enabled controls, checked
+        boxes and radios, selected options. ``data`` replaces or adds
+        fields. ``click`` names the submit button pressed (the first, by
+        default; ``False`` for none)."""
+        return read_form(
+            self.root,
+            self.urljoin(""),
+            query,
+            data=data,
+            click=click,
+            formid=formid,
+            formname=formname,
+            formnumber=formnumber,
+        )
 
     def __getattr__(self, name: str):
         # Everything else a Node offers (find_all, select, get_text ...)
@@ -173,10 +245,52 @@ class Client:
     def __init__(self, profile: str = "chrome", proxy: str | None = None, timeout: float = 30.0):
         self._fetcher = Fetcher(profile, proxy, timeout)
 
-    async def get(self, url: str, headers: Headers = None, raise_on_block: bool = True) -> Page:
+    async def get(
+        self,
+        url: str,
+        headers: Headers = None,
+        raise_on_block: bool = True,
+        referer: str | None = None,
+    ) -> Page:
         """Fetches one page. A block page raises Blocked unless
-        ``raise_on_block=False``."""
-        return _checked(Page(await self._fetcher.get(url, _pairs(headers))), raise_on_block)
+        ``raise_on_block=False``. With ``referer``, it's sent as following a
+        link on that page."""
+        return await self.request(
+            "GET", url, headers=headers, raise_on_block=raise_on_block, referer=referer
+        )
+
+    async def request(
+        self,
+        method: str,
+        url: str,
+        *,
+        form: Any = None,
+        json: Any = None,
+        body: bytes | str | None = None,
+        headers: Headers = None,
+        referer: str | None = None,
+        raise_on_block: bool = True,
+    ) -> Page:
+        """Sends any request. ``form`` is submitted as a form; ``json`` or a
+        raw ``body`` as a page's script would send it. ``referer`` is the
+        page it comes from."""
+        how = payload(method, form, json, body)
+        response = await self._fetcher.send(url, headers=_pairs(headers), referer=referer, **how)
+        return _checked(Page(response), raise_on_block)
+
+    async def post(self, url: str, **kwargs: Any) -> Page:
+        """``request("POST", url, ...)``."""
+        return await self.request("POST", url, **kwargs)
+
+    async def submit(
+        self, form: Form, headers: Headers = None, raise_on_block: bool = True
+    ) -> Page:
+        """Submits a form read with ``page.form()``, from its page."""
+        url, how = _from_form(form)
+        response = await self._fetcher.send(
+            url, headers=_pairs(headers), referer=form.referer, **how
+        )
+        return _checked(Page(response), raise_on_block)
 
     async def get_many(
         self, urls: Iterable[str], headers: Headers = None, return_exceptions: bool = False
@@ -203,14 +317,69 @@ def get(
     proxy: str | None = None,
     timeout: float = 30.0,
     raise_on_block: bool = True,
+    referer: str | None = None,
 ) -> Page:
     """Fetches one page and waits for it. For many pages, use Client.
 
     A page from bot protection (a Cloudflare challenge, a DataDome captcha
     and the like) raises Blocked; pass ``raise_on_block=False`` to get it
-    as a page, with ``page.blocked`` naming the vendor."""
-    page = Page(Fetcher(profile, proxy, timeout).get_blocking(url, _pairs(headers)))
-    return _checked(page, raise_on_block)
+    as a page, with ``page.blocked`` naming the vendor. With ``referer``,
+    it's sent as following a link on that page."""
+    return request(
+        "GET",
+        url,
+        profile=profile,
+        headers=headers,
+        proxy=proxy,
+        timeout=timeout,
+        raise_on_block=raise_on_block,
+        referer=referer,
+    )
+
+
+def request(
+    method: str,
+    url: str,
+    *,
+    form: Any = None,
+    json: Any = None,
+    body: bytes | str | None = None,
+    profile: str = "chrome",
+    headers: Headers = None,
+    proxy: str | None = None,
+    timeout: float = 30.0,
+    raise_on_block: bool = True,
+    referer: str | None = None,
+) -> Page:
+    """Sends any request and waits for the page. ``form`` is submitted as
+    a form (URL-encoded); ``json`` or a raw ``body`` as a page's script
+    would send it. ``referer`` is the page the request comes from; a form
+    or a script without one comes from the root of the target's site."""
+    how = payload(method, form, json, body)
+    fetcher = Fetcher(profile, proxy, timeout)
+    response = fetcher.send_blocking(url, headers=_pairs(headers), referer=referer, **how)
+    return _checked(Page(response), raise_on_block)
+
+
+def post(url: str, **kwargs: Any) -> Page:
+    """``request("POST", url, ...)``: ``form=``, ``json=`` or ``body=``."""
+    return request("POST", url, **kwargs)
+
+
+def submit(
+    form: Form,
+    profile: str = "chrome",
+    headers: Headers = None,
+    proxy: str | None = None,
+    timeout: float = 30.0,
+    raise_on_block: bool = True,
+) -> Page:
+    """Submits a form read with ``page.form()``, from its page. Use a
+    Client's ``submit`` to keep the cookies the page was fetched with."""
+    url, how = _from_form(form)
+    fetcher = Fetcher(profile, proxy, timeout)
+    response = fetcher.send_blocking(url, headers=_pairs(headers), referer=form.referer, **how)
+    return _checked(Page(response), raise_on_block)
 
 
 def _checked(page: Page, raise_on_block: bool) -> Page:
