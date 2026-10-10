@@ -639,6 +639,27 @@ async fn traps_are_refused_at_the_door() {
 }
 
 #[tokio::test]
+async fn max_pages_sends_that_many_requests_and_ends_the_crawl() {
+    let site = Site::start(vec![("/", Page::html("p"))]).await;
+    let c = crawler(CrawlSettings {
+        obey_robots: false,
+        obey_tdmrep: false,
+        concurrency: 3,
+        max_pages: Some(4),
+        ..settings()
+    });
+    for i in 0..10 {
+        c.submit(request(i, site.url(&format!("/p{i}"))));
+    }
+    // Not read until every fetch could have finished: nothing waiting to
+    // be read makes the scheduler start more than the limit.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(fetched(&drain(&c).await).len(), 4);
+    let stats = c.stats();
+    assert_eq!((stats.fetched, stats.queued, stats.in_flight), (4, 6, 0));
+}
+
+#[tokio::test]
 async fn dropping_the_crawler_closes_its_checkpoint() {
     let dir = std::env::temp_dir().join(format!("netweir-crawl-close-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);

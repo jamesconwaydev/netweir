@@ -64,14 +64,13 @@ def test_max_items_stops_at_exactly_that_many(base, tmp_path):
     assert spider.finish_reason == "max_items"
 
 
-def test_max_pages_stops_after_that_many_responses(base):
+def test_max_pages_fetches_and_parses_exactly_that_many(base):
     Endless, parsed = endless(base, max_pages=20, concurrency=4)
     spider = Endless()
     stats = spider.run()
     assert spider.finish_reason == "max_pages"
-    assert len(parsed) <= 20
-    # The requests in flight when it stopped may have been answered too.
-    assert 20 <= stats["fetched"] <= 20 + 4
+    assert stats["fetched"] == 20
+    assert len(parsed) == 20
 
 
 def test_max_errors_stops_after_that_many_callback_errors(base):

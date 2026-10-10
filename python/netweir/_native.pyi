@@ -309,6 +309,7 @@ class Crawler:
         target_concurrency: float = 1.0,
         max_depth: int | None = None,
         max_pages_per_domain: int | None = None,
+        max_pages: int | None = None,
         retries: int = 3,
         backoff_base: float = 1.0,
         backoff_max: float = 60.0,
