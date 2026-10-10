@@ -15,14 +15,17 @@ import itertools
 import json
 import logging
 import os
+import re
 import time
-from collections.abc import AsyncIterator, Callable, Iterable
+from collections.abc import AsyncIterator, Callable, Iterable, Iterator
 from concurrent.futures.process import BrokenProcessPool
 from typing import Any
+from urllib.parse import urlsplit
 
 from netweir import _track
 from netweir._fetch import Page, _pairs
-from netweir._native import Crawler, TrackStore, fingerprint
+from netweir._native import Crawler, TrackStore, _robots_sitemaps, fingerprint
+from netweir._native import _sitemap as _parse_sitemap
 from netweir._request import Request
 from netweir._rules import Follow, _warn_invalid
 
@@ -164,6 +167,11 @@ class Spider:
     """Subclass this. Set ``start_urls`` (or override ``start``), write
     ``parse``, and run it with ``run()`` or ``await crawl()``.
 
+    To crawl a site from its sitemaps, set ``sitemap_urls`` to sitemaps or
+    to its robots.txt, which names them. ``sitemap_rules`` sends each page
+    to a callback by the first pattern (a regex) its URL matches;
+    ``sitemap_follow`` says which sitemaps of an index to read.
+
     A callback receives a Page and yields (or returns) items, which are
     dicts or dataclasses, and Requests to follow. It can be an async
     generator, a generator, a coroutine or a plain function.
@@ -171,6 +179,16 @@ class Spider:
 
     name: str | None = None
     start_urls: list[str] = []
+    #: Sitemaps (XML, gzipped or not, or text), sitemap indexes, or a
+    #: robots.txt whose Sitemap lines name them.
+    sitemap_urls: list[str] = []
+    #: (pattern, callback) pairs: a page goes to the first whose regex its
+    #: URL matches; pages none matches are skipped.
+    sitemap_rules: list[tuple[str, Callable[..., Any] | str]] = [("", "parse")]
+    #: Regexes for which sitemaps of an index to read: all, by default.
+    sitemap_follow: list[str] = [""]
+    #: Also crawl the other-language versions a sitemap lists for a page.
+    sitemap_alternate_links: bool = False
     #: Link rules (``netweir.Follow``), run in Rust. A spider made only of
     #: rules and Items runs no Python per page.
     rules: list[Follow] = []
@@ -188,6 +206,45 @@ class Spider:
         generator or a list works too."""
         for url in self.start_urls:
             yield Request(url)
+        for url in self.sitemap_urls:
+            yield Request(url, callback="_sitemap")
+
+    def sitemap_filter(self, entries: Iterable[dict[str, Any]]) -> Iterable[dict[str, Any]]:
+        """Chooses which sitemap entries to crawl; all of them by default.
+        Each is a dict with ``loc``, ``lastmod``, ``changefreq``,
+        ``priority`` (None where the sitemap doesn't say) and
+        ``alternates``. Applies to an index's entries too."""
+        return entries
+
+    def _sitemap(self, page: Page) -> Iterator[Request]:
+        """Reads a sitemap, an index or a robots.txt, and yields the pages
+        and sitemaps it leads to."""
+        if urlsplit(page.url).path.endswith("/robots.txt"):
+            for url in _robots_sitemaps(page.text):
+                yield Request(page.urljoin(url), callback="_sitemap")
+            return
+        limit = self.settings.max_response_size or 1 << 30
+        try:
+            kind, entries = _parse_sitemap(page.body, limit)
+        except ValueError as e:
+            log.warning("%s: not read as a sitemap: %s", page.url, e)
+            return
+        entries = self.sitemap_filter(entries)
+        if kind == "index":
+            follow = [re.compile(p) for p in self.sitemap_follow]
+            for entry in entries:
+                if any(p.search(entry["loc"]) for p in follow):
+                    yield Request(entry["loc"], callback="_sitemap")
+            return
+        rules = [(re.compile(p), cb) for p, cb in self.sitemap_rules]
+        for entry in entries:
+            urls = [entry["loc"]]
+            if self.sitemap_alternate_links:
+                urls += entry["alternates"]
+            for url in urls:
+                callback = next((cb for p, cb in rules if p.search(url)), None)
+                if callback is not None:
+                    yield Request(url, callback=callback)
 
     def parse(self, page: Page) -> Any:
         raise NotImplementedError(f"{type(self).__name__} needs a parse(self, page) method")

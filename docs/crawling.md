@@ -63,6 +63,58 @@ page after its JavaScript ran, and `page.browser` is the live page for
 clicking and typing until the callback returns. See
 [Browser](browser.md#in-a-crawl).
 
+## Sitemaps
+
+Most sites list their pages in sitemaps, which is often the quickest way to
+reach every product or article. Point `sitemap_urls` at a sitemap, a
+sitemap index, or the site's robots.txt (whose `Sitemap:` lines name them),
+and say which callback each kind of page goes to:
+
+```python
+class Shop(netweir.Spider):
+    sitemap_urls = ["https://example.com/robots.txt"]
+    sitemap_rules = [
+        ("/product/", "product"),  # the first regex a URL matches wins
+        ("/blog/", "post"),
+    ]
+    sitemap_follow = ["/sitemap-products"]  # which sitemaps of an index to read
+
+    def product(self, page):
+        yield {"name": page.css("h1::text").get()}
+
+    def post(self, page):
+        ...
+```
+
+Pages no rule matches are skipped; with the default rules every page goes
+to `parse`. `sitemap_follow` defaults to every sitemap an index lists.
+Sitemaps can be XML (`urlset` or `sitemapindex`), gzipped (`.xml.gz`), or
+plain text with one URL per line. `sitemap_alternate_links = True` also
+crawls the other-language versions a sitemap gives for a page
+(`xhtml:link rel="alternate"`).
+
+To choose entries by what the sitemap says about them, override
+`sitemap_filter`. Each entry is a dict with `loc`, `lastmod`,
+`changefreq`, `priority` (None where the sitemap doesn't say) and
+`alternates`:
+
+```python
+class Recent(netweir.Spider):
+    sitemap_urls = ["https://example.com/sitemap.xml"]
+
+    def sitemap_filter(self, entries):
+        for entry in entries:
+            if (entry["lastmod"] or "") >= "2026-10-01":
+                yield entry
+```
+
+A sitemap that isn't valid, or ends part way through, is logged and
+skipped. Sitemaps are read no further than `max_response_size`, after
+unzipping, and XML entities a sitemap declares are never expanded, so a
+hostile one can't fill memory.
+
+`sitemap_urls` and `start_urls` can be used together.
+
 ## Running
 
 ```python
