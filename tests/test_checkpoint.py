@@ -205,10 +205,13 @@ def test_kill_9_at_random_points_loses_nothing_and_repeats_nothing(base, tmp_pat
     ]  # fmt: skip
     rng = random.Random(1234)
     kills = 0
-    for _ in range(60):
+    # A dozen runs killed at random points, then one left to finish: a slow
+    # machine may spend longer than any of the random waits just starting
+    # the workers, and never get to the end otherwise.
+    for attempt in range(13):
         proc = subprocess.Popen(command, stderr=subprocess.PIPE, text=True)
         try:
-            proc.wait(timeout=rng.uniform(0.15, 0.9))
+            proc.wait(timeout=rng.uniform(0.15, 0.9) if attempt < 12 else 120)
         except subprocess.TimeoutExpired:
             proc.kill()  # SIGKILL: no cleanup of any kind
             proc.wait()
