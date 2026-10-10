@@ -251,15 +251,12 @@ impl Page {
             params["browserContextId"] = Value::from(id.as_str());
         }
         let target = str_of(
-            &conn
-                .call_within(browser.timeout, "", "Target.createTarget", params)
-                .await?,
+            &browser.call("", "Target.createTarget", params).await?,
             "targetId",
         );
         let session = str_of(
-            &conn
-                .call_within(
-                    browser.timeout,
+            &browser
+                .call(
                     "",
                     "Target.attachToTarget",
                     json!({"targetId": target, "flatten": true}),
@@ -394,10 +391,7 @@ impl Page {
             return Err(Error::PageClosed);
         }
         let browser = &self.inner.browser;
-        browser
-            .conn
-            .call_within(browser.timeout, &self.inner.session, method, params)
-            .await
+        browser.call(&self.inner.session, method, params).await
     }
 
     /// `call`, waiting as long as Chrome takes.
@@ -813,9 +807,10 @@ impl Page {
             return Ok(());
         }
         let conn = &self.inner.browser.conn;
-        let closed = conn
-            .call_within(
-                self.inner.browser.timeout,
+        let closed = self
+            .inner
+            .browser
+            .call(
                 "",
                 "Target.closeTarget",
                 json!({"targetId": self.inner.target}),
@@ -825,9 +820,10 @@ impl Page {
         if self.inner.owns_context
             && let Some(id) = &self.inner.context
         {
-            let _ = conn
-                .call_within(
-                    self.inner.browser.timeout,
+            let _ = self
+                .inner
+                .browser
+                .call(
                     "",
                     "Target.disposeBrowserContext",
                     json!({"browserContextId": id}),
