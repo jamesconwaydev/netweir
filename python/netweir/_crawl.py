@@ -127,8 +127,9 @@ class Settings:
         # A list is fine to pass; stored as a tuple, as Settings is frozen.
         object.__setattr__(self, "proxies", tuple(self.proxies))
 
-    def _engine(self) -> Crawler:
+    def _engine(self, allowed_domains: Iterable[str] = ()) -> Crawler:
         return Crawler(
+            allowed_domains=list(allowed_domains),
             profile=self.profile,
             proxy=self.proxy,
             timeout=self.timeout,
@@ -196,6 +197,11 @@ class Spider:
     #: Callables applied to every item in order, sync or async. Each returns
     #: the item (changed or not), or None to drop it.
     pipelines: list[Callable[[Any], Any]] = []
+    #: Domains the crawl may go to, each with its subdomains; a domain with
+    #: a port allows only that port. Requests elsewhere are dropped (and
+    #: counted as "offsite") unless they have dont_filter=True. Empty for
+    #: anywhere.
+    allowed_domains: list[str] = []
     #: Asks for replacement selectors when tracked ones break (see
     #: netweir.repair). Proposals end up in ``repairs`` after a run.
     repair: Any = None
@@ -326,7 +332,7 @@ class _Run:
         self.spider = spider
         self.pipelines = pipelines
         self.settings = spider.settings
-        self.engine = self.settings._engine()
+        self.engine = self.settings._engine(spider.allowed_domains)
         #: Worker processes for callbacks, with Settings.workers > 1.
         self.pool: Any = None
         self.ids = itertools.count()
@@ -340,6 +346,10 @@ class _Run:
                 follow=rule.follow,
                 to_python=rule.callback is not None,
                 priority=rule.priority,
+                allow=rule.allow,
+                deny=rule.deny,
+                allow_domains=rule.allow_domains,
+                deny_domains=rule.deny_domains,
             )
         # parse runs alongside the rules only if the spider writes its own.
         self.has_parse = type(spider).parse is not Spider.parse

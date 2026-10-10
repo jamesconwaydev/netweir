@@ -4,7 +4,8 @@ spider made of them crawls without running Python per page."""
 from __future__ import annotations
 
 import logging
-from collections.abc import Callable
+import re
+from collections.abc import Callable, Iterable
 from typing import Any
 
 from netweir import _track
@@ -183,9 +184,25 @@ class Follow:
     and are passed to ``callback`` if one is given. ``follow`` says whether
     the rules apply again on those pages; it defaults to True for a rule with
     neither ``extract`` nor ``callback``, and False otherwise, as in Scrapy.
+
+    ``allow`` and ``deny`` are regexes matched against each absolute link:
+    a link is taken if it matches one of ``allow`` (or ``allow`` is empty)
+    and none of ``deny``. ``allow_domains`` and ``deny_domains`` do the same
+    by site, a domain covering its subdomains.
     """
 
-    __slots__ = ("callback", "extract", "follow", "kind", "priority", "query")
+    __slots__ = (
+        "allow",
+        "allow_domains",
+        "callback",
+        "deny",
+        "deny_domains",
+        "extract",
+        "follow",
+        "kind",
+        "priority",
+        "query",
+    )
 
     def __init__(
         self,
@@ -196,6 +213,10 @@ class Follow:
         callback: Callable[..., Any] | str | None = None,
         follow: bool | None = None,
         priority: int = 0,
+        allow: Iterable[str] = (),
+        deny: Iterable[str] = (),
+        allow_domains: Iterable[str] = (),
+        deny_domains: Iterable[str] = (),
     ):
         if (css is None) == (xpath is None):
             raise TypeError("Follow takes a css query or an xpath query, not both or neither")
@@ -208,3 +229,24 @@ class Follow:
         self.callback = callback
         self.follow = (extract is None and callback is None) if follow is None else follow
         self.priority = priority
+        self.allow, self.deny = _patterns("allow", allow), _patterns("deny", deny)
+        self.allow_domains = _domains(allow_domains)
+        self.deny_domains = _domains(deny_domains)
+
+
+def _patterns(what: str, patterns: Iterable[str]) -> list[str]:
+    """``patterns`` as a list, each checked to compile, so a typo fails
+    when the rule is written rather than when the crawl starts."""
+    if isinstance(patterns, str):
+        patterns = [patterns]
+    out = list(patterns)
+    for p in out:
+        try:
+            re.compile(p)
+        except re.error as e:
+            raise ValueError(f"{what} pattern {p!r}: {e}") from None
+    return out
+
+
+def _domains(domains: Iterable[str]) -> list[str]:
+    return [domains] if isinstance(domains, str) else list(domains)

@@ -317,6 +317,9 @@ impl Engine {
             for href in extract::links(&rule.selector, root)? {
                 if let Ok(mut url) = base.join(href.trim()) {
                     url.set_fragment(None);
+                    if !rule.takes(&url) {
+                        continue;
+                    }
                     let url: String = url.into();
                     if seen.insert(url.clone()) {
                         out.push((url, at));
@@ -663,7 +666,7 @@ impl Crawler {
         max_depth=None, max_pages_per_domain=None,
         retries=3, backoff_base=1.0, backoff_max=60.0, proxies=None,
         breaker_window=50, breaker_ratio=0.3, breaker_pause=300.0, checkpoint=None,
-        browser="off", browser_pages=4, max_response_size=None,
+        browser="off", browser_pages=4, max_response_size=None, allowed_domains=None,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -694,7 +697,10 @@ impl Crawler {
         browser: &str,
         browser_pages: usize,
         max_response_size: Option<u64>,
+        allowed_domains: Option<Vec<String>>,
     ) -> PyResult<Crawler> {
+        let allowed_domains = netweir_core::allowed_domains(&allowed_domains.unwrap_or_default())
+            .map_err(PyValueError::new_err)?;
         let browser = match browser {
             "off" => BrowserMode::Off,
             "on_block" => BrowserMode::OnBlock,
@@ -754,6 +760,7 @@ impl Crawler {
             browser,
             browser_pages,
             browser_launch: Default::default(),
+            allowed_domains,
         };
         let mut options = fetch_options(profile, proxy, timeout, verify)?;
         options.max_body = max_response_size;
@@ -781,7 +788,10 @@ impl Crawler {
     /// `item` is extracted from the pages it leads to; `follow` applies the
     /// rules to those pages too; `to_python` hands them to Python as
     /// "ruled" events.
-    #[pyo3(signature = (kind, query, item=None, follow=true, to_python=false, priority=0))]
+    /// `allow` and `deny` are regexes for the links to keep and skip;
+    /// `allow_domains` and `deny_domains` limit them by site.
+    #[pyo3(signature = (kind, query, item=None, follow=true, to_python=false, priority=0, allow=None, deny=None, allow_domains=None, deny_domains=None))]
+    #[allow(clippy::too_many_arguments)]
     fn add_rule(
         &self,
         kind: &str,
@@ -790,13 +800,33 @@ impl Crawler {
         follow: bool,
         to_python: bool,
         priority: i32,
+        allow: Option<Vec<String>>,
+        deny: Option<Vec<String>>,
+        allow_domains: Option<Vec<String>>,
+        deny_domains: Option<Vec<String>>,
     ) -> PyResult<usize> {
+        let patterns = |what: &str, list: Option<Vec<String>>| {
+            list.unwrap_or_default()
+                .iter()
+                .map(|p| {
+                    regex::Regex::new(p)
+                        .map_err(|e| PyValueError::new_err(format!("{what} pattern {p:?}: {e}")))
+                })
+                .collect::<PyResult<Vec<_>>>()
+        };
+        let domains = |list: Option<Vec<String>>| {
+            netweir_core::allowed_domains(&list.unwrap_or_default()).map_err(PyValueError::new_err)
+        };
         let rule = Rule {
             selector: selector(kind, query)?,
             item: item.map(|i| i.inner.clone()),
             follow,
             to_python,
             priority,
+            allow: patterns("allow", allow)?,
+            deny: patterns("deny", deny)?,
+            allow_domains: domains(allow_domains)?,
+            deny_domains: domains(deny_domains)?,
         };
         let mut rules = self.engine.rules.lock().unwrap_or_else(|e| e.into_inner());
         let mut next = rules.as_ref().clone();
@@ -878,6 +908,7 @@ impl Crawler {
             Submitted::TooDeep => "too_deep",
             Submitted::Trap => "trap",
             Submitted::DomainFull => "domain_full",
+            Submitted::Offsite => "offsite",
         })
     }
 
@@ -1068,6 +1099,7 @@ impl Crawler {
         d.set_item("breaker_trips", s.breaker_trips)?;
         d.set_item("browser_fetches", s.browser_fetches)?;
         d.set_item("browser_unblocked", s.browser_unblocked)?;
+        d.set_item("offsite", s.offsite)?;
         Ok(d)
     }
 }

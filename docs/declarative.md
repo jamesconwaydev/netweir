@@ -54,6 +54,8 @@ from every page the rules apply to:
 | `callback=` | a spider method (or its name) that also gets those pages |
 | `follow=` | whether the rules apply again on those pages. True by default for a rule with neither `extract` nor `callback`, False otherwise. |
 | `priority=` | the priority of the requests the rule makes |
+| `allow=`, `deny=` | regexes matched against each absolute link: it's taken if it matches one of `allow` (or there are none) and none of `deny` |
+| `allow_domains=`, `deny_domains=` | the same by site; a domain covers its subdomains |
 
 A matched element gives its `href`; a query ending in `::attr(...)` or
 `@attr` gives that value instead. Links are resolved the way a browser

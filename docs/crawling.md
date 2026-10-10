@@ -35,6 +35,20 @@ function. Override `start()` instead of setting `start_urls` when the first
 requests need more than a URL; it can be an async generator, a generator or
 return a list.
 
+`allowed_domains` keeps a crawl on the sites you mean it to visit:
+
+```python
+class Shop(netweir.Spider):
+    start_urls = ["https://example.com/"]
+    allowed_domains = ["example.com"]  # and www.example.com, shop.example.com...
+```
+
+A request to any other site is dropped, counted as `offsite` in the stats,
+and logged once per site. A domain covers its subdomains, and one with a
+port (`"example.com:8443"`) allows only that port. A request with
+`dont_filter=True` goes anywhere. Put domains in the list, not URLs; a URL
+is an error.
+
 ## Requests
 
 ```python
