@@ -3,7 +3,7 @@
 
 mod common;
 
-use common::{browser, html, serve};
+use common::{html, serve};
 use netweir_browser::WaitUntil;
 use serde_json::json;
 
@@ -37,9 +37,24 @@ window.findings = (async () => {
 
 #[tokio::test]
 async fn a_page_finds_no_sign_of_automation() {
-    let Some(browser) = browser().await else {
+    let Some(executable) = common::chrome() else {
         return;
     };
+    // As netweir launches it: Chrome for Testing names itself Chromium
+    // alone, and is given the brands Google Chrome presents (netweir-core
+    // reads them from its profiles; these are their shape).
+    let brands: netweir_browser::Brands = std::sync::Arc::new(|major: &str| {
+        Some(format!(
+            "\"Google Chrome\";v=\"{major}\", \"Chromium\";v=\"{major}\", \"Not)A;Brand\";v=\"24\""
+        ))
+    });
+    let browser = common::launch(netweir_browser::LaunchOptions {
+        executable: Some(executable),
+        brands: Some(brands),
+        timeout: std::time::Duration::from_secs(30),
+        ..Default::default()
+    })
+    .await;
     let mut detect = html(DETECT);
     // Asks for the high-entropy hints on the next request.
     detect
