@@ -540,7 +540,7 @@ async fn a_page_that_never_answers_times_out_instead_of_hanging() {
     };
     let browser = common::launch(netweir_browser::LaunchOptions {
         executable: Some(executable),
-        timeout: Duration::from_secs(2),
+        timeout: Duration::from_secs(5),
         ..Default::default()
     })
     .await;
@@ -551,19 +551,50 @@ async fn a_page_that_never_answers_times_out_instead_of_hanging() {
         html("<p>busy</p><script>setTimeout(() => { for (;;) {} }, 50)</script>"),
     )]);
     let page = browser.new_page().await.unwrap();
-    page.goto(&format!("{}/", server.url), WaitUntil::Load, None)
-        .await
-        .unwrap();
+    // A slow runner may take longer than the timeout to load it.
+    page.goto(
+        &format!("{}/", server.url),
+        WaitUntil::Load,
+        Some(Duration::from_secs(60)),
+    )
+    .await
+    .unwrap();
     tokio::time::sleep(Duration::from_millis(300)).await;
     let started = std::time::Instant::now();
-    let outcome = tokio::time::timeout(Duration::from_secs(20), page.content())
+    let outcome = tokio::time::timeout(Duration::from_secs(40), page.content())
         .await
         .expect("content() waited on Chrome with no end");
     assert!(matches!(outcome, Err(Error::Timeout(_))), "{outcome:?}");
     assert!(
-        started.elapsed() < Duration::from_secs(10),
+        started.elapsed() < Duration::from_secs(20),
         "{:?}",
         started.elapsed()
     );
+    let _ = browser.close().await;
+}
+
+#[tokio::test]
+async fn goto_waits_as_long_as_it_is_told_not_the_browsers_timeout() {
+    let Some(executable) = common::chrome() else {
+        return;
+    };
+    let browser = common::launch(netweir_browser::LaunchOptions {
+        executable: Some(executable),
+        timeout: Duration::from_secs(5),
+        ..Default::default()
+    })
+    .await;
+    let mut slow = html("<p>slow</p>");
+    slow.headers.push(("X-Delay-Ms", "7000".into()));
+    let server = serve(vec![("/slow", slow)]);
+    let page = browser.new_page().await.unwrap();
+    let r = page
+        .goto(
+            &format!("{}/slow", server.url),
+            WaitUntil::Load,
+            Some(Duration::from_secs(30)),
+        )
+        .await;
+    assert_eq!(r.map(|r| r.status).ok(), Some(200));
     let _ = browser.close().await;
 }

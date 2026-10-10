@@ -461,7 +461,9 @@ impl Page {
         timeout: Option<Duration>,
     ) -> Result<Response> {
         let deadline = Instant::now() + self.timeout(timeout);
-        let navigate = self.call("Page.navigate", json!({"url": url}));
+        // Held to this navigation's own deadline, which may be longer than
+        // the browser's timeout.
+        let navigate = self.call_unbounded("Page.navigate", json!({"url": url}));
         let r = tokio::time::timeout_at(deadline, navigate)
             .await
             .map_err(|_| Error::Timeout(format!("navigating to {url}")))??;
