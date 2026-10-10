@@ -95,12 +95,19 @@ pub fn serve(routes: Vec<(&'static str, Reply)>) -> Server {
                     .find(|(p, _)| *p == path)
                     .map(|(_, r)| r)
                     .unwrap_or(&missing);
+                // A test asks for a slow answer with this header, which
+                // isn't sent.
+                let mut reply_headers = reply.headers.clone();
+                if let Some(i) = reply_headers.iter().position(|(k, _)| *k == "X-Delay-Ms") {
+                    let (_, ms) = reply_headers.remove(i);
+                    std::thread::sleep(std::time::Duration::from_millis(ms.parse().unwrap()));
+                }
                 let mut out = format!(
                     "HTTP/1.1 {} X\r\nContent-Length: {}\r\nConnection: close\r\n",
                     reply.status,
                     reply.body.len()
                 );
-                for (k, v) in &reply.headers {
+                for (k, v) in &reply_headers {
                     out.push_str(&format!("{k}: {v}\r\n"));
                 }
                 out.push_str("\r\n");
