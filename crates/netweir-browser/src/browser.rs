@@ -115,7 +115,7 @@ impl Browser {
             // Leaves navigator.webdriver false.
             "--disable-blink-features=AutomationControlled".into(),
         ];
-        args.extend(KEYRING.iter().map(|a| a.to_string()));
+        args.extend(KEYRING.iter().chain(FOREGROUND).map(|a| a.to_string()));
         // Chrome's client hints, when they had to be read before launch.
         let mut hints = None;
         if options.headless {
@@ -509,6 +509,17 @@ const KEYRING: &[&str] = &["--password-store=basic"];
 #[cfg(not(unix))]
 const KEYRING: &[&str] = &[];
 
+/// Keeps every page at full speed. Chrome treats a page that isn't the
+/// visible tab as background, slows its timers, and on macOS asks the OS
+/// to run its renderer at low priority; on a busy machine a new page could
+/// take over 30 seconds to answer at all. Puppeteer and Playwright pass
+/// the same switches.
+const FOREGROUND: &[&str] = &[
+    "--disable-renderer-backgrounding",
+    "--disable-backgrounding-occluded-windows",
+    "--disable-background-timer-throttling",
+];
+
 fn profile_dir() -> std::io::Result<PathBuf> {
     static COUNT: AtomicU64 = AtomicU64::new(0);
     let nanos = std::time::SystemTime::now()
@@ -558,7 +569,7 @@ async fn headless_identity(executable: &Path, extra: &[String]) -> Result<(Strin
         "--no-first-run".into(),
         "--headless".into(),
     ];
-    args.extend(KEYRING.iter().map(|a| a.to_string()));
+    args.extend(KEYRING.iter().chain(FOREGROUND).map(|a| a.to_string()));
     args.extend(extra.iter().cloned());
     args.push("about:blank".into());
     let started = match launch::start(executable, &args) {
