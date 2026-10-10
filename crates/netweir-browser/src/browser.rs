@@ -103,7 +103,8 @@ pub(crate) struct Inner {
 }
 
 impl Browser {
-    pub async fn launch(options: LaunchOptions) -> Result<Browser> {
+    pub async fn launch(mut options: LaunchOptions) -> Result<Browser> {
+        options.args.extend(launch::env_switches());
         let executable = match options.executable.clone() {
             Some(path) => path,
             None => launch::find_chrome()?,
