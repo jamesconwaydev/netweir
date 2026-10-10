@@ -5,7 +5,10 @@
 //! Requests can ask for behaviour through the query string:
 //! `?set=NAME` adds `Set-Cookie: NAME=1; Path=/`, and
 //! `/redirect?to=URL` answers 302 to URL, and `/loop` redirects to itself
-//! with a relative `Location`.
+//! with a relative `Location`. `/form` serves a page whose script submits a
+//! form, POST to `/submitted`; `/fetch` serves one whose script POSTs JSON
+//! to `/api` with `fetch()`. `/form-redirect` is a form that POSTs to a 302
+//! (as a login does), and `/link` a page with a link to `/linked`.
 
 use std::io;
 use std::path::Path;
@@ -37,6 +40,12 @@ pub struct Capture {
     pub http2: Option<Http2>,
     /// Path and query of the request.
     pub path: String,
+    /// "GET", "POST" and so on. Empty in captures made before it was kept.
+    #[serde(default)]
+    pub method: String,
+    /// The request body, as text.
+    #[serde(default)]
+    pub body: String,
     /// Request headers in the order and case they were sent. For HTTP/2
     /// this includes the pseudo-headers.
     pub headers: Vec<(String, String)>,
@@ -181,8 +190,31 @@ fn tls_config(alpn: &[&[u8]], certificate: Option<(Vec<u8>, Vec<u8>)>) -> rustls
     config
 }
 
+/// The page `/form` serves: a form a driver submits by clicking its
+/// button, as a person would, so the browser marks it user-activated.
+const FORM_PAGE: &str = r#"<!doctype html><meta charset="utf-8"><title>form</title>
+<form method="post" action="/submitted"><input name="q" value="rust"><input name="page" value="2"><button id="go" type="submit">Search</button></form>"#;
+
+/// The page `/form-redirect` serves: a form whose POST is answered with a
+/// redirect to `/after`, as a login's is.
+const FORM_REDIRECT_PAGE: &str = r#"<!doctype html><meta charset="utf-8"><title>form</title>
+<form method="post" action="/redirect?to=/after"><input name="user" value="ada"><button id="go" type="submit">Sign in</button></form>"#;
+
+/// The page `/link` serves: a link a driver clicks, as a person would.
+const LINK_PAGE: &str = r#"<!doctype html><meta charset="utf-8"><title>link</title>
+<a id="go" href="/linked">Next page</a>"#;
+
+/// The page `/fetch` serves: its script POSTs JSON as a page's own code
+/// would, then says so in the title.
+const FETCH_PAGE: &str = r#"<!doctype html><meta charset="utf-8"><title>fetch</title>
+<script>fetch("/api", {method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify({q: "rust", page: 2})}).then(() => { document.title = "posted" })</script>"#;
+
+/// The status, the headers, and a body of its own, or `None` to echo the
+/// capture as JSON.
+type Answer = (u16, Vec<(&'static str, String)>, Option<Vec<u8>>);
+
 /// What to answer a request with, from its path and query.
-fn route(path: &str) -> (u16, Vec<(&'static str, String)>, bool) {
+fn route(path: &str) -> Answer {
     let (route, query) = path.split_once('?').unwrap_or((path, ""));
     let param = |name: &str| {
         query
@@ -197,18 +229,38 @@ fn route(path: &str) -> (u16, Vec<(&'static str, String)>, bool) {
     if let Some(cookie) = param("set") {
         headers.push(("set-cookie", format!("{cookie}=1; Path=/")));
     }
+    let html = |headers: &mut Vec<(&'static str, String)>, page: &str| {
+        headers.push(("content-type", "text/html; charset=utf-8".to_string()));
+        Some(page.as_bytes().to_vec())
+    };
     match (route, param("to")) {
         ("/redirect", Some(to)) => {
             headers.push(("location", to));
-            (302, headers, false)
+            (302, headers, Some(Vec::new()))
         }
         ("/loop", _) => {
             headers.push(("location", "/loop".to_string()));
-            (302, headers, false)
+            (302, headers, Some(Vec::new()))
+        }
+        ("/form", _) => {
+            let page = html(&mut headers, FORM_PAGE);
+            (200, headers, page)
+        }
+        ("/fetch", _) => {
+            let page = html(&mut headers, FETCH_PAGE);
+            (200, headers, page)
+        }
+        ("/form-redirect", _) => {
+            let page = html(&mut headers, FORM_REDIRECT_PAGE);
+            (200, headers, page)
+        }
+        ("/link", _) => {
+            let page = html(&mut headers, LINK_PAGE);
+            (200, headers, page)
         }
         _ => {
             headers.push(("content-type", "application/json".to_string()));
-            (200, headers, true)
+            (200, headers, None)
         }
     }
 }
@@ -250,7 +302,11 @@ async fn handle(
         _ => "http/1.1",
     };
     let mut request = 0u32;
-    let mut capture_of = |http2: Option<Http2>, path: String, headers: Vec<(String, String)>| {
+    let mut capture_of = |http2: Option<Http2>,
+                          method: String,
+                          path: String,
+                          headers: Vec<(String, String)>,
+                          body: Vec<u8>| {
         let capture = Capture {
             connection,
             request,
@@ -259,6 +315,8 @@ async fn handle(
             protocol: protocol.to_string(),
             http2,
             path,
+            method,
+            body: String::from_utf8_lossy(&body).into_owned(),
             headers,
         };
         request += 1;
@@ -267,35 +325,41 @@ async fn handle(
 
     if protocol == "h2" {
         h2::serve(&mut tls, |req| {
-            let path = req
-                .headers
-                .iter()
-                .find(|(k, _)| k == ":path")
-                .map(|(_, v)| v.clone())
-                .unwrap_or_default();
-            let capture = capture_of(Some(req.http2), path.clone(), req.headers);
-            let (status, headers, with_body) = route(&path);
-            let body = if with_body {
-                serde_json::to_vec(&capture).expect("capture serialises")
-            } else {
-                Vec::new()
+            let pseudo = |name: &str| {
+                req.headers
+                    .iter()
+                    .find(|(k, _)| k == name)
+                    .map(|(_, v)| v.clone())
+                    .unwrap_or_default()
             };
+            let (method, path) = (pseudo(":method"), pseudo(":path"));
+            let capture = capture_of(Some(req.http2), method, path.clone(), req.headers, req.body);
+            let (status, headers, page) = route(&path);
+            let body =
+                page.unwrap_or_else(|| serde_json::to_vec(&capture).expect("capture serialises"));
             let _ = tx.send(capture);
             (status, headers, body)
         })
         .await
     } else {
         loop {
-            let Some((path, headers)) = read_http1_head(&mut tls).await? else {
+            let Some((method, path, headers)) = read_http1_head(&mut tls).await? else {
                 return Ok(());
             };
-            let capture = capture_of(None, path.clone(), headers);
-            let (status, mut reply_headers, with_body) = route(&path);
-            let body = if with_body {
-                serde_json::to_vec(&capture).expect("capture serialises")
-            } else {
-                Vec::new()
-            };
+            let length = headers
+                .iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case("content-length"))
+                .and_then(|(_, v)| v.parse::<usize>().ok())
+                .unwrap_or(0);
+            if length > 1 << 20 {
+                return Err(io::ErrorKind::InvalidData.into());
+            }
+            let mut request_body = vec![0u8; length];
+            tls.read_exact(&mut request_body).await?;
+            let capture = capture_of(None, method, path.clone(), headers, request_body);
+            let (status, mut reply_headers, page) = route(&path);
+            let body =
+                page.unwrap_or_else(|| serde_json::to_vec(&capture).expect("capture serialises"));
             let _ = tx.send(capture);
             reply_headers.push(("content-length", body.len().to_string()));
             let reason = if status == 302 { "Found" } else { "OK" };
@@ -315,7 +379,7 @@ async fn handle(
 /// between requests.
 async fn read_http1_head<S: AsyncRead + Unpin>(
     stream: &mut S,
-) -> io::Result<Option<(String, Vec<(String, String)>)>> {
+) -> io::Result<Option<(String, String, Vec<(String, String)>)>> {
     let mut head = Vec::new();
     let mut byte = [0u8; 1];
     while !head.ends_with(b"\r\n\r\n") {
@@ -333,16 +397,14 @@ async fn read_http1_head<S: AsyncRead + Unpin>(
     }
     let text = String::from_utf8_lossy(&head);
     let mut lines = text.split("\r\n");
-    let path = lines
-        .next()
-        .and_then(|l| l.split(' ').nth(1))
-        .unwrap_or("/")
-        .to_string();
+    let mut first = lines.next().unwrap_or_default().split(' ');
+    let method = first.next().unwrap_or("GET").to_string();
+    let path = first.next().unwrap_or("/").to_string();
     let headers = lines
         .filter_map(|line| line.split_once(':'))
         .map(|(k, v)| (k.to_string(), v.trim().to_string()))
         .collect();
-    Ok(Some((path, headers)))
+    Ok(Some((method, path, headers)))
 }
 
 /// Serves `prefix` before reading from `inner`, so the TLS handshake sees
