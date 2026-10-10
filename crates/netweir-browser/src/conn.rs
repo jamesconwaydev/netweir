@@ -147,6 +147,26 @@ impl Connection {
         rx.await.unwrap_or(Err(Error::Closed))
     }
 
+    /// `call`, but an error naming `method` if Chrome hasn't answered within
+    /// `limit`: a renderer kept busy by a page's script, or a Chrome that
+    /// has stopped responding, may never answer at all.
+    pub(crate) async fn call_within(
+        &self,
+        limit: std::time::Duration,
+        session: &str,
+        method: &str,
+        params: Value,
+    ) -> Result<Value> {
+        tokio::time::timeout(limit, self.call(session, method, params))
+            .await
+            .unwrap_or_else(|_| {
+                Err(Error::Timeout(format!(
+                    "Chrome didn't answer {method} within {}s",
+                    limit.as_secs_f64()
+                )))
+            })
+    }
+
     /// Sends without waiting for the reply, for the reader thread, which
     /// can't wait: answering a request Chrome is holding, say.
     pub(crate) fn send(&self, session: &str, method: &str, params: Value) {

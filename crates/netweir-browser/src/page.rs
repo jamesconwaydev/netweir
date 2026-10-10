@@ -251,12 +251,15 @@ impl Page {
             params["browserContextId"] = Value::from(id.as_str());
         }
         let target = str_of(
-            &conn.call("", "Target.createTarget", params).await?,
+            &conn
+                .call_within(browser.timeout, "", "Target.createTarget", params)
+                .await?,
             "targetId",
         );
         let session = str_of(
             &conn
-                .call(
+                .call_within(
+                    browser.timeout,
                     "",
                     "Target.attachToTarget",
                     json!({"targetId": target, "flatten": true}),
@@ -383,7 +386,22 @@ impl Page {
             .unwrap_or_else(|e| e.into_inner())
     }
 
+    /// Sends `method` to the page and waits for Chrome's answer, for no
+    /// longer than the browser's timeout: a renderer kept busy by the
+    /// page's own script may never answer at all.
     async fn call(&self, method: &str, params: Value) -> Result<Value> {
+        if self.inner.closed.load(Ordering::Relaxed) {
+            return Err(Error::PageClosed);
+        }
+        let browser = &self.inner.browser;
+        browser
+            .conn
+            .call_within(browser.timeout, &self.inner.session, method, params)
+            .await
+    }
+
+    /// `call`, waiting as long as Chrome takes.
+    async fn call_unbounded(&self, method: &str, params: Value) -> Result<Value> {
         if self.inner.closed.load(Ordering::Relaxed) {
             return Err(Error::PageClosed);
         }
@@ -528,7 +546,7 @@ impl Page {
             .call("Page.createIsolatedWorld", json!({"frameId": frame}))
             .await?;
         let id = r["executionContextId"].as_i64().unwrap_or_default();
-        self.run(Some(id), HELPERS).await?;
+        self.run(Some(id), HELPERS, true).await?;
         *world = Some((loader, id));
         Ok(id)
     }
@@ -536,19 +554,20 @@ impl Page {
     /// Runs `expression` in netweir's isolated world, awaiting a promise.
     async fn helper(&self, expression: &str) -> Result<Value> {
         let id = self.world(false).await?;
-        match self.run(Some(id), expression).await {
+        match self.run(Some(id), expression, true).await {
             // The document changed under it; once more in the new one.
             Err(Error::Protocol { message, .. }) if message.contains("context") => {
                 let id = self.world(true).await?;
-                self.run(Some(id), expression).await
+                self.run(Some(id), expression, true).await
             }
             other => other,
         }
     }
 
     /// `Runtime.evaluate`, which works without `Runtime.enable`. With no
-    /// context, it runs in the main world.
-    async fn run(&self, context: Option<i64>, expression: &str) -> Result<Value> {
+    /// context, it runs in the main world. `bounded` holds it to the
+    /// browser's timeout.
+    async fn run(&self, context: Option<i64>, expression: &str, bounded: bool) -> Result<Value> {
         let mut params = json!({
             "expression": expression,
             "awaitPromise": true,
@@ -557,7 +576,11 @@ impl Page {
         if let Some(id) = context {
             params["contextId"] = Value::from(id);
         }
-        let r = self.call("Runtime.evaluate", params).await?;
+        let r = if bounded {
+            self.call("Runtime.evaluate", params).await?
+        } else {
+            self.call_unbounded("Runtime.evaluate", params).await?
+        };
         if let Some(details) = r.get("exceptionDetails") {
             let message = details["exception"]["description"]
                 .as_str()
@@ -580,7 +603,9 @@ impl Page {
         let expression = format!(
             "(async () => {{ const v = ({js}\n); return typeof v === 'function' ? await v() : await v; }})()"
         );
-        self.run(None, &expression).await
+        // No timeout of its own, as documented: the caller's script may
+        // rightly take as long as it likes.
+        self.run(None, &expression, false).await
     }
 
     /// The document as Chrome now has it, doctype included.
@@ -787,7 +812,8 @@ impl Page {
         }
         let conn = &self.inner.browser.conn;
         let closed = conn
-            .call(
+            .call_within(
+                self.inner.browser.timeout,
                 "",
                 "Target.closeTarget",
                 json!({"targetId": self.inner.target}),
@@ -798,7 +824,8 @@ impl Page {
             && let Some(id) = &self.inner.context
         {
             let _ = conn
-                .call(
+                .call_within(
+                    self.inner.browser.timeout,
                     "",
                     "Target.disposeBrowserContext",
                     json!({"browserContextId": id}),

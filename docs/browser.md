@@ -51,7 +51,7 @@ The options:
 | `executable` | `None` | the Chrome to start, instead of searching |
 | `headless` | `True` | `False` opens a window |
 | `args` | `()` | more Chrome command-line switches; with your own `--user-agent=`, pages say that and keep Chrome's behaviour under the flag: high-entropy client hints empty, and Chrome's own brands even where netweir would present Google Chrome's |
-| `timeout` | `30.0` | the default limit, in seconds, for navigations and actions |
+| `timeout` | `30.0` | the default limit, in seconds, for navigations and actions, and for Chrome to answer anything netweir asks it |
 | `proxy` | `None` | an `http://`, `https://` or `socks5://` proxy for everything Chrome fetches; for an HTTP(S) proxy, a username and password in it are given when it asks (Chrome can't log in to a SOCKS proxy) |
 | `connect` | `None` | drive a browser that's already running, instead of starting one: a `ws://` DevTools URL, or `http://host:port` |
 
