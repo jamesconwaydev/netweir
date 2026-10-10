@@ -535,12 +535,31 @@ def test_command_line_spiders_can_use_dataclasses(base, tmp_path):
     assert json.loads(out.read_text(encoding="utf-8")) == {"url": f"{base}/book/x"}
 
 
+def test_settings_on_the_command_line_get_their_types():
+    import dataclasses
+
+    from netweir._cli import _parse_setting
+
+    fields = {f.name: f for f in dataclasses.fields(netweir.Settings)}
+    assert _parse_setting("max_depth=3", fields) == ("max_depth", 3)
+    assert _parse_setting("max_depth=none", fields) == ("max_depth", None)
+    assert _parse_setting("max_delay=2.5", fields) == ("max_delay", 2.5)
+    assert _parse_setting("timeout=10", fields) == ("timeout", 10.0)
+    assert _parse_setting("proxy=http://p:8080", fields) == ("proxy", "http://p:8080")
+    assert _parse_setting("proxies=http://a:1,http://b:2", fields) == (
+        "proxies",
+        ("http://a:1", "http://b:2"),
+    )
+
+
 @pytest.mark.parametrize(
     "args, message",
     [
         (["-s", "profile=netscape"], "netscape"),
         (["-o", "/nonexistent/dir/x.jsonl"], "nonexistent"),
         (["-o", "out.xml"], "xml"),
+        (["-s", "max_depth=deep"], "max_depth takes a whole number"),
+        (["-s", "timeout=soon"], "timeout takes a number"),
     ],
 )
 def test_command_line_errors_are_one_line(base, tmp_path, args, message):
