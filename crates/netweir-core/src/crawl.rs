@@ -1175,19 +1175,26 @@ async fn browser_fetch(shared: Arc<Shared>, mut q: Queued, permit: OwnedSemaphor
     // Set if robots.txt or TDMRep stopped a document Chrome was about to
     // fetch: a redirect hop, or a navigation the page's script started.
     let refused: Refusal = Arc::default();
+    // What render is doing, for the error if it runs out of time.
+    let doing: Doing = Arc::new(Mutex::new("starting"));
     let work = render(
         shared.clone(),
         q.request.url.clone(),
         q.blocked.is_some(),
         permit,
         refused.clone(),
+        doing.clone(),
     );
     let rendered = guarded(
         async move {
             tokio::time::timeout(limit, work).await.unwrap_or_else(|_| {
                 Err(FetchError {
                     kind: FetchErrorKind::Timeout,
-                    message: format!("Chrome took more than {}s", limit.as_secs()),
+                    message: format!(
+                        "Chrome took more than {}s, and was still {}",
+                        limit.as_secs(),
+                        doing.lock().unwrap_or_else(|e| e.into_inner())
+                    ),
                 })
             })
         },
@@ -1360,7 +1367,10 @@ async fn render(
     cookies: bool,
     permit: OwnedSemaphorePermit,
     refused: Refusal,
+    doing: Doing,
 ) -> Result<Rendered, FetchError> {
+    let now = |what: &'static str| *doing.lock().unwrap_or_else(|e| e.into_inner()) = what;
+    now("waiting for Chrome to start");
     let browser = {
         let mut slot = shared.browser.lock().await;
         let start = match &*slot {
@@ -1379,6 +1389,7 @@ async fn render(
         message: format!("can't start Chrome: {e}"),
     })?;
     let guarded = shared.settings.obey_robots || shared.settings.obey_tdmrep;
+    now("opening a page");
     let page = if guarded {
         // Chrome follows redirects, and the page's scripts navigate, by
         // itself; each document is checked against its site's robots.txt
@@ -1418,6 +1429,7 @@ async fn render(
     } else {
         timeout
     };
+    now("loading the page");
     let mut document = page
         .goto(&url, WaitUntil::Load, Some(load_limit))
         .await
@@ -1428,6 +1440,7 @@ async fn render(
         // A script may already have moved the page on (a challenge that
         // passes at once does): read the newest document, once loaded.
         if page.response().loader != document.loader {
+            now("loading the page a script moved on to");
             let left = deadline.saturating_duration_since(Instant::now());
             match page
                 .wait_for_navigation(&document, WaitUntil::Load, Some(left))
@@ -1438,6 +1451,7 @@ async fn render(
                 Err(e) => return Err(browser_error(e)),
             }
         }
+        now("reading the page");
         let response = rendered(&document, content(&page).await?);
         let challenged = matches!(
             classify(&response),
@@ -1450,6 +1464,7 @@ async fn render(
         if !challenged || left.is_zero() {
             break response;
         }
+        now("waiting for a challenge to pass");
         match page
             .wait_for_navigation(&document, WaitUntil::Load, Some(left))
             .await
@@ -1458,6 +1473,7 @@ async fn render(
             // Out of time. One last look, for a challenge that swaps the
             // page's content without navigating.
             Err(netweir_browser::Error::Timeout(_)) => {
+                now("reading the page");
                 break rendered(&page.response(), content(&page).await?);
             }
             Err(e) => return Err(browser_error(e)),
@@ -1473,6 +1489,7 @@ async fn render(
             message: "Chrome was refused the page it was going to".into(),
         });
     }
+    now("reading its cookies");
     let cookies = if cookies {
         page.cookies().await.map_err(browser_error)?
     } else {
@@ -1490,6 +1507,9 @@ async fn render(
 /// Why a document Chrome is about to fetch may not be: robots.txt or
 /// TDMRep, if the crawl obeys them.
 type Refusal = Arc<Mutex<Option<DropReason>>>;
+
+/// What a Chrome fetch is doing, in words that finish "still ...".
+type Doing = Arc<Mutex<&'static str>>;
 
 /// A URL's origin and path (with its query), as the scheduler keys them.
 fn origin_and_path(url: &str) -> Option<(String, String)> {
