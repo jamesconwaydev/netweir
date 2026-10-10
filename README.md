@@ -25,6 +25,10 @@ Working today:
 - Fetching that is indistinguishable from Chrome 154, Firefox 156 or
   Safari 27 on the wire, over HTTP/2 and HTTP/1.1, with cookies and
   redirects. Below: how that's proved, and the one known exception.
+- Forms, logins and JSON APIs: POST and any other method, sent the way
+  Chrome or Firefox sends a form or a page's own script, and forms read off
+  a page the way a browser submits them. See
+  [docs/forms.md](docs/forms.md).
 - A parser that keeps pace with selectolax, the one to beat in Python, and
   pulls data out of the page faster.
 - CSS queries with Scrapy's `::text` and `::attr()`, all of XPath 1.0, and
