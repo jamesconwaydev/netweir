@@ -57,6 +57,20 @@ sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
 That lasts until the machine restarts. Passing `--no-sandbox` in `args`
 also works, but leaves pages less contained than Chrome means them to be.
 
+`$NETWEIR_CHROME_ARGS` adds switches to every Chrome netweir starts,
+separated by spaces, on top of `args`. It's for what a machine needs
+whatever the code says. On a macOS virtual machine, such as a cloud Mac or
+a CI runner, the virtual GPU now and then hangs on Chrome's work and macOS
+stops taking any more from it; Chrome then stops answering, and netweir's
+error says it "didn't answer". Software rendering avoids the GPU:
+
+```
+export NETWEIR_CHROME_ARGS=--disable-gpu
+```
+
+A page can tell software rendering from a real GPU through WebGL, so leave
+it off where the GPU works.
+
 The options:
 
 | Option | Default | Does |
