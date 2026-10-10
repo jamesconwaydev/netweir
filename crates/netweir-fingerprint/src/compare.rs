@@ -9,7 +9,7 @@ use crate::server::Capture;
 /// resumed (the pre_shared_key extension, which also changes JA4), since
 /// that depends on connection history, not on the browser. The `:authority`,
 /// `:path` and `Host` values are ignored because they name the test server
-/// and its port.
+/// and its port, and so is the port in `Origin` and `Referer`.
 /// For a browser that sends its TLS extensions in a fixed order (Firefox,
 /// Safari), whether the order matches too. `differences` compares them as a
 /// set, since Chrome shuffles them.
@@ -131,9 +131,55 @@ pub fn differences(expected: &Capture, actual: &Capture) -> Vec<String> {
         format!("{:?}", names(actual)),
     );
     for ((k, ev), (_, av)) in expected.headers.iter().zip(&actual.headers) {
-        if !matches!(k.as_str(), ":authority" | ":path") && !k.eq_ignore_ascii_case("host") {
+        if matches!(k.as_str(), ":authority" | ":path") || k.eq_ignore_ascii_case("host") {
+            continue;
+        }
+        if k.eq_ignore_ascii_case("origin") || k.eq_ignore_ascii_case("referer") {
+            check(&format!("header {k}"), portless(ev), portless(av));
+        } else {
             check(&format!("header {k}"), ev.clone(), av.clone());
         }
     }
+    // Captures from before the method and body were kept have neither.
+    if !expected.method.is_empty() {
+        check("method", expected.method.clone(), actual.method.clone());
+        check("body", expected.body.clone(), actual.body.clone());
+    }
     out
+}
+
+/// `value` with the port after a host removed: the test server's port
+/// changes with every run.
+fn portless(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    let mut chars = value.chars().peekable();
+    while let Some(c) = chars.next() {
+        out.push(c);
+        if c == ':' && chars.peek().is_some_and(char::is_ascii_digit) && !out.ends_with("://") {
+            out.pop();
+            while chars.peek().is_some_and(char::is_ascii_digit) {
+                chars.next();
+            }
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn ports_are_dropped_from_origins_and_referers() {
+        assert_eq!(
+            super::portless("https://localhost:8443"),
+            "https://localhost"
+        );
+        assert_eq!(
+            super::portless("https://127.0.0.1:50211/form?x=1"),
+            "https://127.0.0.1/form?x=1"
+        );
+        assert_eq!(
+            super::portless("https://example.com/a:b"),
+            "https://example.com/a:b"
+        );
+    }
 }

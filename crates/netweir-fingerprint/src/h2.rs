@@ -27,6 +27,9 @@ const PRIORITY_FLAG: u8 = 0x20;
 /// A stream dependency: (exclusive, depends on, weight as on the wire).
 type Dependency = (bool, u32, u8);
 
+/// A request whose headers have arrived and whose body is still coming.
+type Pending = (Option<Dependency>, Vec<(String, String)>, Vec<u8>);
+
 /// What the client said about the connection, plus the priority it put on
 /// one request's HEADERS frame.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -48,6 +51,8 @@ pub struct Http2 {
 pub struct Request {
     pub http2: Http2,
     pub headers: Vec<(String, String)>,
+    /// The DATA frames' payload, for a request that has one.
+    pub body: Vec<u8>,
 }
 
 /// A response to send on a stream.
@@ -145,7 +150,9 @@ where
     let mut seen_request = false;
     // HPACK state lives for the whole connection.
     let mut decoder = fluke_hpack::Decoder::new();
-    let mut open: HashMap<u32, (Option<Dependency>, Vec<u8>)> = HashMap::new();
+    let mut open: HashMap<u32, (Option<Dependency>, Vec<u8>, bool)> = HashMap::new();
+    // Requests whose headers have arrived and whose body hasn't finished.
+    let mut bodies: HashMap<u32, Pending> = HashMap::new();
 
     loop {
         let f = match read_frame(s).await {
@@ -192,8 +199,51 @@ where
             GOAWAY => return Ok(()),
             HEADERS => {
                 let (priority, fragment) = header_fragment(&f)?;
-                open.insert(f.stream, (priority, fragment.to_vec()));
+                let ends = f.flags & END_STREAM != 0;
+                open.insert(f.stream, (priority, fragment.to_vec(), ends));
                 (f.flags & END_HEADERS != 0).then_some(f.stream)
+            }
+            DATA => {
+                let mut p = &f.payload[..];
+                if f.flags & PADDED != 0 {
+                    let pad = *p.first().ok_or_else(|| invalid("short padded frame"))? as usize;
+                    p = p
+                        .get(1..p.len().saturating_sub(pad))
+                        .ok_or_else(|| invalid("padding longer than frame"))?;
+                }
+                if let Some(entry) = bodies.get_mut(&f.stream) {
+                    entry.2.extend_from_slice(p);
+                }
+                // Keeps a long body coming: the window it used is open again.
+                if !p.is_empty() {
+                    let n = (p.len() as u32).to_be_bytes();
+                    s.write_all(&frame(WINDOW_UPDATE, 0, 0, &n)).await?;
+                    s.write_all(&frame(WINDOW_UPDATE, 0, f.stream, &n)).await?;
+                }
+                if f.flags & END_STREAM != 0
+                    && let Some((priority, headers, body)) = bodies.remove(&f.stream)
+                {
+                    let r = request_of(
+                        &settings,
+                        window_update,
+                        &priority_frames,
+                        priority,
+                        headers,
+                        body,
+                    );
+                    let (status, reply_headers, body) = on_request(r);
+                    respond(
+                        s,
+                        f.stream,
+                        &Reply {
+                            status,
+                            headers: &reply_headers,
+                            body: &body,
+                        },
+                    )
+                    .await?;
+                }
+                None
             }
             CONTINUATION => {
                 let entry = open
@@ -205,7 +255,7 @@ where
             _ => None,
         };
         let Some(stream) = complete else { continue };
-        let (headers_priority, block) = open.remove(&stream).unwrap_or_default();
+        let (headers_priority, block, ends) = open.remove(&stream).unwrap_or_default();
         let headers: Vec<(String, String)> = decoder
             .decode(&block)
             .map_err(|_| invalid("bad HPACK block"))?
@@ -218,18 +268,19 @@ where
             })
             .collect();
         seen_request = true;
-        let settings_now = settings.clone().unwrap_or_default();
-        let akamai = akamai(&settings_now, window_update, &priority_frames, &headers);
-        let request = Request {
-            http2: Http2 {
-                settings: settings_now,
-                window_update,
-                priority_frames: priority_frames.clone(),
-                headers_priority,
-                akamai,
-            },
+        if !ends {
+            // Answered once the body has all arrived.
+            bodies.insert(stream, (headers_priority, headers, Vec::new()));
+            continue;
+        }
+        let request = request_of(
+            &settings,
+            window_update,
+            &priority_frames,
+            headers_priority,
             headers,
-        };
+            Vec::new(),
+        );
         let (status, reply_headers, body) = on_request(request);
         respond(
             s,
@@ -241,6 +292,29 @@ where
             },
         )
         .await?;
+    }
+}
+
+fn request_of(
+    settings: &Option<Vec<(u16, u32)>>,
+    window_update: u32,
+    priority_frames: &[(u32, bool, u32, u8)],
+    headers_priority: Option<Dependency>,
+    headers: Vec<(String, String)>,
+    body: Vec<u8>,
+) -> Request {
+    let settings_now = settings.clone().unwrap_or_default();
+    let akamai = akamai(&settings_now, window_update, priority_frames, &headers);
+    Request {
+        http2: Http2 {
+            settings: settings_now,
+            window_update,
+            priority_frames: priority_frames.to_vec(),
+            headers_priority,
+            akamai,
+        },
+        headers,
+        body,
     }
 }
 

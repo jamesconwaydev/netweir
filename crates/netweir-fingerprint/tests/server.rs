@@ -179,6 +179,41 @@ async fn hangs_up_on_anything_that_is_not_tls() {
     );
 }
 
+#[tokio::test]
+async fn records_the_method_and_body_of_a_post() {
+    let mut server = Server::start_http1(0).await.unwrap();
+    let mut tls = connect(server.port).await;
+    let body = "q=rust&page=2";
+    let request = format!(
+        "POST /submitted HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\n\r\n{body}",
+        body.len()
+    );
+    tls.write_all(request.as_bytes()).await.unwrap();
+    // The answer comes once the body has arrived, and the connection
+    // carries on.
+    let mut answer = [0u8; 15];
+    tls.read_exact(&mut answer).await.unwrap();
+    assert_eq!(&answer, b"HTTP/1.1 200 OK");
+    let capture = server.next().await.unwrap();
+    assert_eq!(capture.method, "POST");
+    assert_eq!(capture.body, body);
+    assert_eq!(capture.path, "/submitted");
+}
+
+#[tokio::test]
+async fn serves_pages_whose_scripts_post() {
+    let server = Server::start().await.unwrap();
+    let mut tls = connect(server.port).await;
+    let form = exchange(&mut tls, "/form").await;
+    assert!(form.contains("content-type: text/html"), "{form}");
+    assert!(
+        form.contains(r#"<form method="post" action="/submitted""#),
+        "{form}"
+    );
+    let fetch = exchange(&mut tls, "/fetch").await;
+    assert!(fetch.contains("fetch(\"/api\""), "{fetch}");
+}
+
 #[test]
 fn grease_values() {
     for v in [0x0a0a, 0x1a1a, 0xfafa] {
