@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import dataclasses
+import re
 import secrets
 import string
 from collections.abc import Iterable, Mapping
@@ -38,13 +39,15 @@ class Form:
     def encoded(self) -> tuple[str, bytes | None, str | None]:
         """The URL, body and Content-Type the browser would send: a GET
         form's fields go in the query string, replacing any there."""
+        # Line breaks go as CRLF, whatever the page had.
+        fields = [(_crlf(k), _crlf(v)) for k, v in self.fields]
         if self.method == "GET":
             parts = urlsplit(self.action)
-            query = urlencode(self.fields)
+            query = urlencode(fields)
             return urlunsplit(parts._replace(query=query, fragment="")), None, None
         if self.enctype == MULTIPART:
-            return self.action, *_multipart(self.fields)
-        return self.action, urlencode(self.fields).encode(), URLENCODED
+            return self.action, *_multipart(fields)
+        return self.action, urlencode(fields).encode(), URLENCODED
 
     def request(self, callback: Any = None, **kwargs: Any) -> Request:
         """A crawl Request that submits this form."""
@@ -65,9 +68,14 @@ class Form:
         )
 
 
+def _crlf(text: str) -> str:
+    return re.sub(r"\r\n|\r|\n", "\r\n", text)
+
+
 def read_form(
     root: Node,
     page_url: str,
+    base_url: str,
     query: str | None = None,
     *,
     data: Mapping[str, Any] | Iterable[tuple[str, Any]] | None = None,
@@ -80,17 +88,26 @@ def read_form(
     XPath when it starts with ``/`` or ``(``), ``formid``, ``formname``, or
     else its position, ``formnumber``."""
     form = _pick(root, query, formid, formname, formnumber)
-    method = (form.attr("method") or "get").strip().upper()
+    button = _button(form, click)
+
+    def attr(name: str) -> str | None:
+        # The pressed button's formmethod, formaction and formenctype win.
+        if button is not None and button.attr("form" + name) is not None:
+            return button.attr("form" + name)
+        return form.attr(name)
+
+    method = (attr("method") or "get").strip().upper()
     if method not in ("GET", "POST"):
         method = "GET"
-    action = urljoin(page_url, (form.attr("action") or "").strip() or page_url)
-    enctype = (form.attr("enctype") or "").strip().lower()
+    # Relative to <base href>; an empty action is the page itself.
+    action = (attr("action") or "").strip()
+    action = urljoin(base_url, action) if action else page_url
+    enctype = (attr("enctype") or "").strip().lower()
     if enctype not in (URLENCODED, MULTIPART):
         enctype = URLENCODED
     fields = _successful(form)
-    button = _button(form, click)
-    if button is not None:
-        fields.append(button)
+    if button is not None and button.attr("name"):
+        fields.append((button.attr("name"), button.attr("value") or ""))
     if data:
         fields = _merged(fields, data)
     return Form(method, action, fields, enctype, page_url)
@@ -124,15 +141,17 @@ def _successful(form: Node) -> list[tuple[str, str]]:
     """The controls the HTML standard says a submission includes, in
     document order."""
     fields: list[tuple[str, str]] = []
+    radios: dict[str, int] = {}
     for control in form.select("input, select, textarea"):
         name = control.attr("name")
-        if not name or control.attr("disabled") is not None:
+        if not name or _disabled(control):
             continue
         if control.tag == "select":
             options = [o for o in control.select("option") if o.attr("disabled") is None]
             chosen = [o for o in options if o.attr("selected") is not None]
-            if not chosen and control.attr("multiple") is None and options:
-                chosen = options[:1]
+            if control.attr("multiple") is None:
+                # One option is selected: the last marked, or the first.
+                chosen = chosen[-1:] or options[:1]
             fields.extend((name, _option_value(o)) for o in chosen)
         elif control.tag == "textarea":
             fields.append((name, control.text))
@@ -142,11 +161,32 @@ def _successful(form: Node) -> list[tuple[str, str]]:
                 continue
             if kind in ("checkbox", "radio"):
                 if control.attr("checked") is not None:
-                    fields.append((name, control.attr("value") or "on"))
+                    value = control.attr("value")
+                    if kind == "radio" and name in radios:
+                        # One radio per group is checked: the last marked.
+                        fields[radios[name]] = (name, value if value is not None else "on")
+                        continue
+                    if kind == "radio":
+                        radios[name] = len(fields)
+                    fields.append((name, value if value is not None else "on"))
             else:
                 # Text, hidden and the like; an unknown type is text too.
                 fields.append((name, control.attr("value") or ""))
     return fields
+
+
+def _disabled(control: Node) -> bool:
+    """Disabled itself, or inside a disabled fieldset but not in that
+    fieldset's first legend."""
+    if control.attr("disabled") is not None:
+        return True
+    path = [control, *control.parents]
+    for i, ancestor in enumerate(path[1:], 1):
+        if ancestor.tag == "fieldset" and ancestor.attr("disabled") is not None:
+            legends = [c for c in ancestor.children if c.tag == "legend"]
+            if not (legends and path[i - 1] == legends[0]):
+                return True
+    return False
 
 
 def _option_value(option: Node) -> str:
@@ -154,7 +194,7 @@ def _option_value(option: Node) -> str:
     return value if value is not None else " ".join(option.text.split())
 
 
-def _button(form: Node, click: str | bool | None) -> tuple[str, str] | None:
+def _button(form: Node, click: str | bool | None) -> Node | None:
     """The submit button pressed: the one named ``click``, none for
     ``click=False``, or else the first."""
     if click is False:
@@ -162,7 +202,7 @@ def _button(form: Node, click: str | bool | None) -> tuple[str, str] | None:
     buttons = [
         b
         for b in form.select("input, button")
-        if b.attr("disabled") is None
+        if not _disabled(b)
         and (
             (b.tag == "input" and (b.attr("type") or "").strip().lower() == "submit")
             or (b.tag == "button" and (b.attr("type") or "submit").strip().lower() == "submit")
@@ -172,12 +212,8 @@ def _button(form: Node, click: str | bool | None) -> tuple[str, str] | None:
         named = [b for b in buttons if b.attr("name") == click]
         if not named:
             raise ValueError(f"no submit button named {click!r} in the form")
-        return click, named[0].attr("value") or ""
-    # The first submit button is the one pressed; without a name it adds
-    # nothing.
-    if buttons and buttons[0].attr("name"):
-        return buttons[0].attr("name"), buttons[0].attr("value") or ""
-    return None
+        return named[0]
+    return buttons[0] if buttons else None
 
 
 def _merged(

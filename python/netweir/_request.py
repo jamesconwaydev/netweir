@@ -38,7 +38,8 @@ class Request:
     errback: Callable[..., Any] | str | None = None
     depth: int = 0
     browser: bool = False
-    method: str = "GET"
+    #: GET, or POST when there's a form, json or body.
+    method: str | None = None
     form: Any = None
     json: Any = None
     body: bytes | str | None = None
@@ -50,7 +51,8 @@ class Request:
     content_type: str | None = None
 
     def __post_init__(self) -> None:
-        self.method = self.method.upper()
+        has_body = self.form is not None or self.json is not None or self.body is not None
+        self.method = (self.method or ("POST" if has_body else "GET")).upper()
         if self.form is not None or self.json is not None or self.kind is None:
             from netweir._fetch import payload
 
