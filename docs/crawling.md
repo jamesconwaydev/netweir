@@ -44,16 +44,19 @@ netweir.Request(
     errback="lost",             # called with (request, error) if no response arrives
     meta={"category": "tools"}, # comes back as page.meta
     priority=5,                 # higher first, among one site's requests
-    headers={"Referer": "https://example.com/"},
+    headers={"Accept-Language": "de-DE"},
     dont_filter=False,          # True fetches it even if seen before
     browser=False,              # True fetches it in Chrome
+    method="GET",               # or POST, PUT...; with one of form=, json=, body=
+    referer="https://example.com/",  # the page it comes from; page.follow sets it
 )
 ```
 
 `page.depth` is how many links the crawl followed from a start page to get
-here. A request the same as one already seen (same method and URL, ignoring
-fragments, query order and tracking parameters such as `utm_*`) is dropped
-unless `dont_filter=True`.
+here. A request the same as one already seen (same method, URL and body,
+ignoring fragments, query order and tracking parameters such as `utm_*`) is
+dropped unless `dont_filter=True`. Forms, JSON and other bodies are in
+[Forms, logins and APIs](forms.md).
 
 A request with `browser=True` is loaded in Chrome, so the callback sees the
 page after its JavaScript ran, and `page.browser` is the live page for
