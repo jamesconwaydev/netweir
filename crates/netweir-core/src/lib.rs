@@ -4,6 +4,7 @@
 //! [`Profile`]'s browser sends: the same TLS ClientHello, HTTP/2 settings
 //! and header order.
 
+mod cache;
 pub mod canonical;
 pub mod checkpoint;
 pub mod classify;

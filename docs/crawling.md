@@ -172,6 +172,48 @@ With a [checkpoint](self-healing.md#checkpoints), running a stopped crawl again 
 from where it stopped, and the limits count afresh: `max_items=500` gives
 the next 500.
 
+## Caching while you develop
+
+You'll run a spider you're writing thirty times before it's right. Without
+a cache, that's thirty crawls of the same pages: thirty waits for every
+polite delay, and thirty rounds of load on a site that never asked for any.
+Give the crawl a directory and it keeps what it fetched:
+
+```
+netweir crawl quotes.py -s cache=.cache
+```
+
+or `settings = netweir.Settings(cache=".cache")` on the spider. Run it
+again and every page it already has comes off your disk. No request goes
+out, not even for robots.txt, and nothing waits. Your callback gets the
+same page as before: URL, status, headers and body. A page that redirected
+comes back as where it ended up, with no hops.
+
+What's kept is what you'd want back. A block, a 401, 403 or 451, a 429, a
+server error or a request that failed is never kept, so the next run asks
+the site again rather than replaying the bad answer. Pages fetched in
+Chrome aren't kept either: their callback gets a live page, and a stored
+one can't stand in for that. Cookies a cached page set, on the way through
+a redirect too, still reach the crawl's session, so a cached login keeps
+you logged in.
+
+A page is looked up by its method, URL and body, never its headers: two
+POSTs with different bodies are two entries, but the same URL fetched with
+two different `Accept-Language` headers is one. A page cached by a run that
+ignored robots.txt or TDMRep isn't served to one that obeys them; that run
+fetches it again.
+
+Pages from the cache count in the stats as `cache_hits` (and in `fetched`,
+since your callback got them, but not in `bytes`, since nothing was
+downloaded), and toward `max_pages`, so a cached rerun of a 20-page crawl
+still stops at 20. A checkpoint works with it as without.
+
+A kept page stays until you clear it. Set `cache_expiry=3600` to fetch
+anything older than an hour again. To start afresh, delete the directory.
+Nothing is ever evicted, so the cache grows with every new page: fine for
+the few hundred pages a spider in progress sees, not something to leave on
+for a crawl of the whole site.
+
 ## Callbacks in worker processes
 
 The engine fetches and parses in Rust, but a spider's callbacks take turns

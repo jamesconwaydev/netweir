@@ -322,6 +322,8 @@ class Crawler:
         browser_pages: int = 4,
         max_response_size: int | None = None,
         allowed_domains: list[str] | None = None,
+        cache: str | None = None,
+        cache_expiry: float | None = None,
     ) -> None: ...
     def add_rule(
         self,
