@@ -44,6 +44,19 @@ client does. `--headless-shell` installs `chrome-headless-shell` instead,
 which is lighter and faster but easier to tell from a real browser; pass
 its path as `executable` to use it.
 
+On Ubuntu 23.10 and later, Chrome for Testing may not start at all:
+Ubuntu stops the user namespaces its sandbox needs unless an AppArmor
+profile allows them, and only the Google Chrome package installs one. If
+Chrome won't start, the error ends with what Chrome said, such as "No
+usable sandbox". Allowing user namespaces keeps the sandbox on:
+
+```
+sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+```
+
+That lasts until the machine restarts. Passing `--no-sandbox` in `args`
+also works, but leaves pages less contained than Chrome means them to be.
+
 The options:
 
 | Option | Default | Does |

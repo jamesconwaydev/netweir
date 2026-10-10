@@ -55,3 +55,29 @@ async fn a_browser_that_dies_reads_as_closed() {
     browser.close().await.unwrap();
     assert!(!browser.profile_dir().unwrap().exists());
 }
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_chrome_that_wont_start_says_why() {
+    use std::os::unix::fs::PermissionsExt;
+    // Stands in for a Chrome that can't start, and says so on stderr, as a
+    // Chrome without a usable sandbox does.
+    let dir = std::env::temp_dir().join(format!("netweir-nochrome-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let fake = dir.join("chrome");
+    std::fs::write(
+        &fake,
+        "#!/bin/sh\necho 'starting up' >&2\necho 'FATAL: No usable sandbox!' >&2\nexit 1\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let err = Browser::launch(LaunchOptions {
+        executable: Some(fake),
+        ..LaunchOptions::default()
+    })
+    .await
+    .err()
+    .unwrap();
+    std::fs::remove_dir_all(&dir).unwrap();
+    assert!(err.to_string().contains("No usable sandbox"), "{err}");
+}

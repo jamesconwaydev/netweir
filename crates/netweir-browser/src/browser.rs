@@ -148,6 +148,7 @@ impl Browser {
                 return Err(e);
             }
         };
+        let said = started.said.clone();
         let conn = Connection::new(started.replies, started.commands);
         let inner = Inner {
             conn,
@@ -159,7 +160,12 @@ impl Browser {
             timeout: options.timeout,
             proxy_login,
         };
-        Browser::finish(inner, &options, &executable.display().to_string(), hints).await
+        Browser::finish(inner, &options, &executable.display().to_string(), hints)
+            .await
+            .map_err(|e| match e {
+                Error::Launch(message) => Error::Launch(said.explain(message)),
+                other => other,
+            })
     }
 
     /// Drives a browser that's already running: a `ws://` DevTools URL, as
@@ -579,6 +585,7 @@ async fn headless_identity(executable: &Path, extra: &[String]) -> Result<(Strin
             return Err(e);
         }
     };
+    let said = started.said.clone();
     let probe = Browser {
         inner: Arc::new(Inner {
             conn: Connection::new(started.replies, started.commands),
@@ -606,7 +613,10 @@ async fn headless_identity(executable: &Path, extra: &[String]) -> Result<(Strin
     .await;
     // What it said counts even if it then wouldn't close cleanly.
     let _ = probe.close().await;
-    let known = asked?;
+    let known = asked.map_err(|e| match e {
+        Error::Launch(message) => Error::Launch(said.explain(message)),
+        other => other,
+    })?;
     KNOWN
         .lock()
         .unwrap_or_else(|e| e.into_inner())
