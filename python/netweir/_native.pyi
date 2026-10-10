@@ -319,6 +319,7 @@ class Crawler:
         browser: str = "off",
         browser_pages: int = 4,
         max_response_size: int | None = None,
+        allowed_domains: list[str] | None = None,
     ) -> None: ...
     def add_rule(
         self,
@@ -328,6 +329,10 @@ class Crawler:
         follow: bool = True,
         to_python: bool = False,
         priority: int = 0,
+        allow: list[str] | None = None,
+        deny: list[str] | None = None,
+        allow_domains: list[str] | None = None,
+        deny_domains: list[str] | None = None,
     ) -> int: ...
     def submit(
         self,
@@ -348,7 +353,9 @@ class Crawler:
         content_type: str | None = None,
         referer: str | None = None,
         retry_post: bool = False,
-    ) -> Literal["queued", "duplicate", "invalid", "too_deep", "trap", "domain_full"]: ...
+    ) -> Literal[
+        "queued", "duplicate", "invalid", "too_deep", "trap", "domain_full", "offsite"
+    ]: ...
     def resume(self) -> dict[str, Any] | None: ...
     def ack(self) -> None: ...
     def set_tracks(self, store: TrackStore, threshold: float) -> None: ...
@@ -511,3 +518,4 @@ class BrowserResponse:
 
 def _sitemap(body: bytes, max: int) -> tuple[Literal["urlset", "index"], list[dict[str, Any]]]: ...
 def _robots_sitemaps(body: str) -> list[str]: ...
+def _offsite(url: str, allowed: list[str]) -> bool: ...

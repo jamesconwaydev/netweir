@@ -286,6 +286,24 @@ pub(crate) struct Rule {
     /// Hand those pages to a Python callback.
     pub to_python: bool,
     pub priority: i32,
+    /// Links are kept only if they match one of `allow` (when it isn't
+    /// empty) and none of `deny`, and are within `allow_domains` (when it
+    /// isn't empty) and outside `deny_domains`.
+    pub allow: Vec<regex::Regex>,
+    pub deny: Vec<regex::Regex>,
+    pub allow_domains: Vec<String>,
+    pub deny_domains: Vec<String>,
+}
+
+impl Rule {
+    /// Whether this rule takes the link to `url`.
+    pub fn takes(&self, url: &url::Url) -> bool {
+        let s = url.as_str();
+        (self.allow.is_empty() || self.allow.iter().any(|r| r.is_match(s)))
+            && !self.deny.iter().any(|r| r.is_match(s))
+            && !netweir_core::offsite(url, &self.allow_domains)
+            && (self.deny_domains.is_empty() || netweir_core::offsite(url, &self.deny_domains))
+    }
 }
 
 /// How much the element `query` finds below `node` looks like the one in

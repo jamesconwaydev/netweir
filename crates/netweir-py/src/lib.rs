@@ -102,6 +102,16 @@ fn _sitemap<'py>(
     Ok((kind, entries))
 }
 
+/// Whether `url` is outside `allowed`, as `allowed_domains` judges it.
+#[pyfunction]
+fn _offsite(url: &str, allowed: Vec<String>) -> PyResult<bool> {
+    let allowed =
+        netweir_core::allowed_domains(&allowed).map_err(pyo3::exceptions::PyValueError::new_err)?;
+    let url = url::Url::parse(url)
+        .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("{url:?}: {e}")))?;
+    Ok(netweir_core::offsite(&url, &allowed))
+}
+
 /// The sitemap URLs a robots.txt names, as written.
 #[pyfunction]
 fn _robots_sitemaps(body: &str) -> Vec<String> {
@@ -117,6 +127,7 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(fingerprint, m)?)?;
     m.add_function(wrap_pyfunction!(_sitemap, m)?)?;
     m.add_function(wrap_pyfunction!(_robots_sitemaps, m)?)?;
+    m.add_function(wrap_pyfunction!(_offsite, m)?)?;
     m.add_class::<Node>()?;
     m.add_class::<Selection>()?;
     m.add("SelectorError", m.py().get_type::<SelectorError>())?;

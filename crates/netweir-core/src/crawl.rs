@@ -66,6 +66,10 @@ pub struct CrawlSettings {
     pub browser_pages: usize,
     /// How Chrome is started, the first time a request needs it.
     pub browser_launch: LaunchOptions,
+    /// Domains requests may go to, with their subdomains, normalised by
+    /// `allowed_domains`; empty for any. A request elsewhere is dropped
+    /// unless it has `dont_filter`.
+    pub allowed_domains: Vec<String>,
 }
 
 /// Which requests a crawl fetches in Chrome.
@@ -106,6 +110,7 @@ impl Default for CrawlSettings {
             browser: BrowserMode::Off,
             browser_pages: 4,
             browser_launch: LaunchOptions::default(),
+            allowed_domains: Vec::new(),
         }
     }
 }
@@ -145,6 +150,8 @@ pub enum Submitted {
     Trap,
     /// The host already has `max_pages_per_domain` requests.
     DomainFull,
+    /// Outside `allowed_domains`.
+    Offsite,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -274,6 +281,8 @@ pub struct Stats {
     pub browser_fetches: u64,
     /// Requests blocked over HTTP that Chrome got through.
     pub browser_unblocked: u64,
+    /// Requests dropped for going outside `allowed_domains`.
+    pub offsite: u64,
 }
 
 /// A crawl in progress. Dropping it stops the scheduler; fetches already
@@ -314,6 +323,9 @@ struct State {
     rows: HashMap<u64, i64>,
     next_row: i64,
     seen: HashSet<Fingerprint>,
+    /// Hosts outside allowed_domains that requests were dropped for, so
+    /// each is warned about once.
+    offsite_hosts: HashSet<String>,
     hosts: HashMap<String, Host>,
     origins: HashMap<String, Origin>,
     events: VecDeque<Event>,
@@ -545,6 +557,22 @@ impl Crawler {
         };
         let settings = &self.shared.settings;
         let mut state = self.shared.lock();
+        if !request.dont_filter && offsite(&parsed, &settings.allowed_domains) {
+            state.stats.offsite += 1;
+            let host = parsed.host_str().unwrap_or_default().to_string();
+            if state.offsite_hosts.insert(host.clone()) {
+                // Once per site, as there may be thousands of links to it.
+                self.shared.push_event(
+                    &mut state,
+                    Event::Warning {
+                        message: format!(
+                            "requests to {host} are dropped: it isn't in allowed_domains"
+                        ),
+                    },
+                );
+            }
+            return Submitted::Offsite;
+        }
         if settings.max_depth.is_some_and(|max| request.depth > max) {
             state.stats.skipped_depth += 1;
             return Submitted::TooDeep;
@@ -700,6 +728,58 @@ impl Shared {
         state.events.push_back(event);
         self.events.notify_waiters();
     }
+}
+
+/// `domains`, made ready for `offsite`: lowercase, international names in
+/// their ASCII form, an optional port kept. A URL rather than a domain is an
+/// error, since it would match nothing.
+pub fn allowed_domains(domains: &[String]) -> Result<Vec<String>, String> {
+    domains
+        .iter()
+        .map(|d| {
+            let d = d.trim();
+            let parsed = (!d.is_empty() && !d.contains(['/', '?', '#', '@']))
+                .then(|| Url::parse(&format!("http://{d}/")).ok())
+                .flatten()
+                .filter(|u| u.host_str().is_some());
+            let Some(u) = parsed else {
+                return Err(format!(
+                    "allowed_domains takes domains such as example.com, not {d:?}"
+                ));
+            };
+            let host = u
+                .host_str()
+                .unwrap_or_default()
+                .trim_end_matches('.')
+                .to_string();
+            Ok(match u.port() {
+                Some(port) => format!("{host}:{port}"),
+                None => host,
+            })
+        })
+        .collect()
+}
+
+/// Whether `url` is outside `allowed` (from `allowed_domains`): not one of
+/// them or a subdomain of one, or not the port a domain names. Nothing is
+/// outside an empty list.
+pub fn offsite(url: &Url, allowed: &[String]) -> bool {
+    if allowed.is_empty() {
+        return false;
+    }
+    let host = url.host_str().unwrap_or_default().trim_end_matches('.');
+    let port = url.port_or_known_default();
+    !allowed.iter().any(|d| {
+        let (domain, want) = match d.rsplit_once(':').filter(|(_, p)| p.parse::<u16>().is_ok()) {
+            Some((h, p)) => (h, p.parse::<u16>().ok()),
+            None => (d.as_str(), None),
+        };
+        let within = host == domain
+            || (host.len() > domain.len()
+                && host.ends_with(domain)
+                && host.as_bytes()[host.len() - domain.len() - 1] == b'.');
+        within && want.is_none_or(|w| port == Some(w))
+    })
 }
 
 /// Whether a submitted request is new to the checkpoint or read back from it.

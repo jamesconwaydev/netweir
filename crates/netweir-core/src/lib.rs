@@ -20,7 +20,7 @@ pub mod traps;
 
 pub use crawl::{
     BrowserMode, CrawlRequest, CrawlSettings, Crawler, DropReason, Event, LivePage, Stats,
-    Submitted,
+    Submitted, allowed_domains, offsite,
 };
 pub use decode::{decode, meta_content};
 pub use fetch::{FetchError, FetchErrorKind, FetchOptions, Fetcher, Hop, Kind, Outgoing, Response};
