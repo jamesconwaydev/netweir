@@ -64,6 +64,34 @@ pub struct Profile {
     /// to it offer only `http/1.1` in ALPN (Safari).
     #[serde(default)]
     pub remembers_http1: bool,
+    /// Following a link from a page.
+    #[serde(default)]
+    pub link: Option<Shape>,
+    /// Submitting a form: a navigation that sends a body.
+    #[serde(default)]
+    pub form: Option<Shape>,
+    /// A page's own script sending a request with `fetch()`.
+    #[serde(default)]
+    pub fetch: Option<Shape>,
+    /// The GET after a form submission is answered with a redirect.
+    #[serde(default)]
+    pub after_form_redirect: Option<Shape>,
+}
+
+/// What the browser sends for one kind of request, captured as `headers`
+/// and `http2_headers` are for typing an address. Empty values are filled
+/// per request: Host, Content-Length, Content-Type, Origin, Referer,
+/// Sec-Fetch-Site and Cookie.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Shape {
+    pub headers: Vec<(String, String)>,
+    #[serde(default)]
+    pub http2_headers: Vec<(String, String)>,
+    /// The HTTP/2 HEADERS frame's priority, where this kind of request
+    /// has one of its own.
+    #[serde(default)]
+    pub headers_priority: Option<HeadersPriority>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -192,6 +220,15 @@ impl Profile {
     }
 
     pub(crate) fn emulation(&self) -> Result<Emulation, ProfileError> {
+        self.emulation_with(None)
+    }
+
+    /// `emulation`, with `priority` for every request's HEADERS frame in
+    /// place of the profile's.
+    pub(crate) fn emulation_with(
+        &self,
+        priority: Option<&HeadersPriority>,
+    ) -> Result<Emulation, ProfileError> {
         let bad = |what: &str, v: &str| {
             ProfileError(format!("profile {}: unknown {what} {v:?}", self.name))
         };
@@ -323,7 +360,7 @@ impl Profile {
             .initial_connection_window_size(65_535 + h.window_update)
             .settings_order(order.build())
             .headers_pseudo_order(PseudoOrder::builder().extend(pseudo).build());
-        if let Some(p) = &h.headers_priority {
+        if let Some(p) = priority.or(h.headers_priority.as_ref()) {
             http2 = http2.headers_stream_dependency(StreamDependency::new(
                 StreamId::from(p.depends_on),
                 p.weight,

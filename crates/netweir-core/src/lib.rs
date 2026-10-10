@@ -22,5 +22,5 @@ pub use crawl::{
     Submitted,
 };
 pub use decode::{decode, meta_content};
-pub use fetch::{FetchError, FetchErrorKind, FetchOptions, Fetcher, Hop, Response};
+pub use fetch::{FetchError, FetchErrorKind, FetchOptions, Fetcher, Hop, Kind, Outgoing, Response};
 pub use profile::{DEFAULT as DEFAULT_PROFILE, Profile, ProfileError};

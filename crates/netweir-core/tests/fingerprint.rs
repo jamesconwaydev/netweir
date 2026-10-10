@@ -6,7 +6,7 @@
 //! revisit that sends it, a redirect to another site, and a redirect within
 //! the site. Here netweir does the same four and every request is compared.
 
-use netweir_core::{FetchOptions, Fetcher, Profile};
+use netweir_core::{FetchOptions, Fetcher, Outgoing, Profile};
 use netweir_fingerprint::{Capture, Server, differences, extension_order_differs};
 
 fn local_fetcher(profile: &str) -> Fetcher {
@@ -282,4 +282,97 @@ fn either_pooled_connection(mut expected: Vec<Capture>, actual: &[Capture]) -> V
         }
     }
     expected
+}
+
+/// What Chrome did after the navigations, in the post captures: submitted
+/// a form, posted JSON from a script, signed in through a form answered
+/// with a redirect, and followed a link. Each on the page that started it.
+async fn post_scenario(fetcher: &Fetcher, server: &mut Server) -> Vec<Capture> {
+    let base = format!("https://localhost:{}", server.port);
+    let page = |path: &str| format!("{base}{path}");
+    // The cookie the captured requests carry.
+    fetcher.get(&page("/?set=nw"), &[]).await.unwrap();
+    server.next().await.unwrap();
+    let steps = [
+        (
+            "/submitted",
+            Outgoing::form(b"q=rust&page=2".to_vec(), None, Some(page("/form"))),
+            1,
+        ),
+        (
+            "/api",
+            Outgoing::fetch(
+                "POST",
+                Some(br#"{"q":"rust","page":2}"#.to_vec()),
+                Some("application/json".into()),
+                Some(page("/fetch")),
+            ),
+            1,
+        ),
+        (
+            "/redirect?to=/after",
+            Outgoing::form(b"user=ada".to_vec(), None, Some(page("/form-redirect"))),
+            2,
+        ),
+        ("/linked", Outgoing::link(page("/link")), 1),
+    ];
+    let mut seen = Vec::new();
+    for (path, outgoing, requests) in steps {
+        let response = fetcher.send(&page(path), &outgoing, &[]).await.unwrap();
+        assert_eq!(response.status, 200, "{path}");
+        for _ in 0..requests {
+            seen.push(server.next().await.unwrap());
+        }
+    }
+    seen
+}
+
+#[tokio::test]
+async fn chrome_154_forms_and_scripts_post_like_chrome_over_http2() {
+    let expected: Vec<Capture> = serde_json::from_str(include_str!(
+        "../../../profiles/chrome-154-macos.post.capture.json"
+    ))
+    .unwrap();
+    let mut server = Server::start().await.unwrap();
+    let fetcher = local_fetcher("chrome-154-macos");
+    let actual = post_scenario(&fetcher, &mut server).await;
+    assert_same(&expected, &actual, "Chrome posting over HTTP/2");
+}
+
+#[tokio::test]
+async fn chrome_154_forms_and_scripts_post_like_chrome_over_http1() {
+    let expected: Vec<Capture> = serde_json::from_str(include_str!(
+        "../../../profiles/chrome-154-macos.post.http1.capture.json"
+    ))
+    .unwrap();
+    let mut server = Server::start_http1(0).await.unwrap();
+    let fetcher = local_fetcher("chrome-154-macos");
+    // As for the navigations: let netweir meet the host first, so it knows
+    // there's no HTTP/2 to offer.
+    let warm = [format!("https://localhost:{}/warm", server.port)];
+    run(&fetcher, &mut server, &warm).await;
+    let actual = post_scenario(&fetcher, &mut server).await;
+    assert_same(&expected, &actual, "Chrome posting over HTTP/1.1");
+}
+
+#[tokio::test]
+async fn a_form_from_another_site_says_so_and_gives_only_its_origin() {
+    let mut server = Server::start().await.unwrap();
+    let fetcher = local_fetcher("chrome-154-macos");
+    let page = "https://shop.example/basket?id=7#items";
+    let outgoing = Outgoing::form(b"a=1".to_vec(), None, Some(page.into()));
+    let url = format!("https://localhost:{}/submitted", server.port);
+    fetcher.send(&url, &outgoing, &[]).await.unwrap();
+    let capture = server.next().await.unwrap();
+    let header = |name: &str| {
+        capture
+            .headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case(name))
+            .map(|(_, v)| v.as_str())
+    };
+    assert_eq!(header("sec-fetch-site"), Some("cross-site"));
+    assert_eq!(header("origin"), Some("https://shop.example"));
+    assert_eq!(header("referer"), Some("https://shop.example/"));
+    assert_eq!((capture.method.as_str(), capture.body.as_str()), ("POST", "a=1"));
 }

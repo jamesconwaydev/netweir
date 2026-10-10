@@ -11,7 +11,7 @@ use wreq::header::{HeaderName, HeaderValue, LOCATION, OrigHeaderMap};
 use wreq::{Proxy, Uri, Version, redirect};
 
 use crate::decode::decode;
-use crate::profile::Profile;
+use crate::profile::{Profile, Shape};
 
 #[derive(Debug, Clone)]
 pub struct FetchOptions {
@@ -106,6 +106,8 @@ impl wreq::cookie::CookieStore for OrderedJar {
 #[derive(Clone)]
 pub struct Fetcher {
     client: wreq::Client,
+    /// For a script's requests, where they have a priority of their own.
+    script_client: Option<wreq::Client>,
     http2_headers: Arc<Vec<(HeaderName, HeaderValue)>>,
     /// Header order for a navigation's first request, and after a redirect.
     navigation_order: Arc<Vec<String>>,
@@ -116,6 +118,17 @@ pub struct Fetcher {
     jar: Arc<wreq::cookie::Jar>,
     /// Whether to offer only http/1.1 to origins known to answer with it.
     remembers_http1: bool,
+    /// The headers of requests other than typing an address.
+    shapes: Arc<Shapes>,
+}
+
+/// A profile's captured shapes, and its name to say which is missing.
+struct Shapes {
+    profile: String,
+    link: Option<Shape>,
+    form: Option<Shape>,
+    fetch: Option<Shape>,
+    after_form_redirect: Option<Shape>,
 }
 
 #[derive(Debug, Clone)]
@@ -231,8 +244,194 @@ fn caused_by_tls(e: &wreq::Error) -> bool {
 #[derive(Debug)]
 pub enum Hop {
     Done(Response),
-    /// A redirect, to this absolute URL.
-    Redirect(String),
+    /// A redirect, to this absolute URL, and the request to make there.
+    Redirect(String, Outgoing),
+}
+
+/// What kind of request this is, which decides what the browser sends
+/// with it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Kind {
+    /// A navigation: typing the address, or, with a referer, following a
+    /// link from that page.
+    #[default]
+    Navigate,
+    /// Submitting a form on the referer page.
+    Form,
+    /// The referer page's own script sending a request with `fetch()`.
+    Fetch,
+}
+
+/// How a request's target relates to the page it comes from, as
+/// Sec-Fetch-Site says it; ordered from closest to furthest.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
+enum Relation {
+    #[default]
+    SameOrigin,
+    SameSite,
+    CrossSite,
+}
+
+impl Relation {
+    fn between(from: &Url, to: &Url) -> Relation {
+        if from.origin() == to.origin() {
+            Relation::SameOrigin
+        } else if from.scheme() == to.scheme() && site(from) == site(to) {
+            Relation::SameSite
+        } else {
+            Relation::CrossSite
+        }
+    }
+
+    fn header(self) -> &'static str {
+        match self {
+            Relation::SameOrigin => "same-origin",
+            Relation::SameSite => "same-site",
+            Relation::CrossSite => "cross-site",
+        }
+    }
+}
+
+/// The registrable domain (`example.co.uk` for `www.example.co.uk`), or the
+/// host itself for an IP address or a name with no public suffix.
+fn site(url: &Url) -> String {
+    let host = url.host_str().unwrap_or_default().to_ascii_lowercase();
+    if url
+        .host()
+        .is_some_and(|h| !matches!(h, url::Host::Domain(_)))
+    {
+        return host;
+    }
+    psl::domain_str(&host).map_or_else(|| host.clone(), str::to_string)
+}
+
+/// A request beyond typing an address: its method, body and kind, and the
+/// page it comes from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Outgoing {
+    pub method: String,
+    pub kind: Kind,
+    pub body: Option<Vec<u8>>,
+    /// The body's Content-Type.
+    pub content_type: Option<String>,
+    /// The page the request comes from. A form or a script without one
+    /// comes from the root of the target's own origin.
+    pub referer: Option<String>,
+    /// The GET a form's submission turned into when redirected.
+    after_form: bool,
+    /// How far from the referer the redirects so far have led.
+    furthest: Relation,
+}
+
+impl Default for Outgoing {
+    fn default() -> Outgoing {
+        Outgoing::navigate()
+    }
+}
+
+impl Outgoing {
+    /// Typing the address: what `Fetcher::get` sends.
+    pub fn navigate() -> Outgoing {
+        Outgoing {
+            method: "GET".into(),
+            kind: Kind::Navigate,
+            body: None,
+            content_type: None,
+            referer: None,
+            after_form: false,
+            furthest: Relation::SameOrigin,
+        }
+    }
+
+    /// Following a link on `referer`.
+    pub fn link(referer: String) -> Outgoing {
+        Outgoing {
+            referer: Some(referer),
+            ..Outgoing::navigate()
+        }
+    }
+
+    /// Submitting a form: a POST of `body`, URL-encoded unless
+    /// `content_type` says otherwise.
+    pub fn form(body: Vec<u8>, content_type: Option<String>, referer: Option<String>) -> Outgoing {
+        Outgoing {
+            method: "POST".into(),
+            kind: Kind::Form,
+            body: Some(body),
+            content_type: Some(
+                content_type.unwrap_or_else(|| "application/x-www-form-urlencoded".into()),
+            ),
+            referer,
+            ..Outgoing::navigate()
+        }
+    }
+
+    /// A script's request. A body without a type is sent as text, as
+    /// `fetch()` sends a string.
+    pub fn fetch(
+        method: &str,
+        body: Option<Vec<u8>>,
+        content_type: Option<String>,
+        referer: Option<String>,
+    ) -> Outgoing {
+        let content_type = content_type.or_else(|| {
+            body.is_some()
+                .then(|| "text/plain;charset=UTF-8".to_string())
+        });
+        Outgoing {
+            method: method.to_ascii_uppercase(),
+            kind: Kind::Fetch,
+            body,
+            content_type,
+            referer,
+            ..Outgoing::navigate()
+        }
+    }
+
+    /// Typing an address: the headers the profile lists first.
+    fn typed(&self) -> bool {
+        self.kind == Kind::Navigate
+            && self.referer.is_none()
+            && !self.after_form
+            && self.method == "GET"
+            && self.body.is_none()
+    }
+
+    /// The request a `status` redirect from `from` to `to` makes of this
+    /// one, as browsers follow them: 303, and 301 or 302 after a POST,
+    /// turn it into a GET without a body; 307 and 308 repeat it.
+    fn redirected(&self, status: u16, from: &Url, to: &Url) -> Outgoing {
+        let mut next = self.clone();
+        if status == 303 || (matches!(status, 301 | 302) && self.method == "POST") {
+            next.method = "GET".into();
+            next.body = None;
+            next.content_type = None;
+            if self.kind == Kind::Form {
+                next.kind = Kind::Navigate;
+                next.after_form = true;
+            }
+        }
+        if let Some(referer) = self.referer_url(from) {
+            next.furthest = self.furthest.max(Relation::between(&referer, to));
+        }
+        next
+    }
+
+    /// The page the request comes from, as a URL.
+    fn referer_url(&self, target: &Url) -> Option<Url> {
+        match &self.referer {
+            Some(r) => Url::parse(r).ok(),
+            None if self.kind != Kind::Navigate => {
+                Url::parse(&target.origin().ascii_serialization())
+                    .ok()
+                    .map(|mut u| {
+                        u.set_path("/");
+                        u
+                    })
+            }
+            None => None,
+        }
+    }
 }
 
 /// Chrome follows at most 20 redirects.
@@ -245,28 +444,48 @@ impl Fetcher {
         let emulation = profile
             .emulation()
             .map_err(|e| FetchError::invalid(e.to_string()))?;
-        let mut builder = wreq::Client::builder()
-            .emulation(emulation)
-            .timeout(options.timeout)
-            .cookie_provider(Arc::new(OrderedJar {
-                jar: jar.clone(),
-                newest_first: profile.cookies_newest_first,
-            }))
-            .gzip(true)
-            .brotli(true)
-            .zstd(true)
-            .deflate(true)
-            // Redirects are followed in `get`, one request per hop, so each
-            // hop gets its own cookies, header order and HTTP/2-only headers.
-            .redirect(redirect::Policy::none())
-            .tls_cert_verification(options.verify_certificates);
-        if let Some(proxy) = &options.proxy {
-            builder = builder
-                .proxy(Proxy::all(proxy.as_str()).map_err(|e| FetchError::invalid(e.to_string()))?);
-        }
-        let client = builder
-            .build()
-            .map_err(|e| FetchError::invalid(FetchError::from(e).message))?;
+        let build = |emulation| -> Result<wreq::Client, FetchError> {
+            let mut builder = wreq::Client::builder()
+                .emulation(emulation)
+                .timeout(options.timeout)
+                .cookie_provider(Arc::new(OrderedJar {
+                    jar: jar.clone(),
+                    newest_first: profile.cookies_newest_first,
+                }))
+                .gzip(true)
+                .brotli(true)
+                .zstd(true)
+                .deflate(true)
+                // Redirects are followed in `send`, one request per hop, so
+                // each hop gets its own cookies, header order and HTTP/2-only
+                // headers.
+                .redirect(redirect::Policy::none())
+                .tls_cert_verification(options.verify_certificates);
+            if let Some(proxy) = &options.proxy {
+                builder = builder.proxy(
+                    Proxy::all(proxy.as_str()).map_err(|e| FetchError::invalid(e.to_string()))?,
+                );
+            }
+            builder
+                .build()
+                .map_err(|e| FetchError::invalid(FetchError::from(e).message))
+        };
+        let client = build(emulation)?;
+        // HTTP/2 sets a request's priority for the whole connection, so a
+        // script's requests, which Chrome sends at a lower one, go on
+        // connections of their own; the cookies are the same.
+        let script_priority = profile
+            .fetch
+            .as_ref()
+            .and_then(|f| f.headers_priority.as_ref());
+        let script_client = match script_priority {
+            Some(priority) => Some(build(
+                profile
+                    .emulation_with(Some(priority))
+                    .map_err(|e| FetchError::invalid(e.to_string()))?,
+            )?),
+            None => None,
+        };
         let http2_headers = profile
             .http2_headers
             .iter()
@@ -280,12 +499,20 @@ impl Fetcher {
             .collect::<Result<Vec<_>, _>>()?;
         Ok(Fetcher {
             client,
+            script_client,
             http2_headers: Arc::new(http2_headers),
             navigation_order: Arc::new(profile.header_order(false)),
             redirect_order: Arc::new(profile.header_order(true)),
             http1_hosts: Arc::default(),
             jar,
             remembers_http1: profile.remembers_http1,
+            shapes: Arc::new(Shapes {
+                profile: profile.name.clone(),
+                link: profile.link.clone(),
+                form: profile.form.clone(),
+                fetch: profile.fetch.clone(),
+                after_form_redirect: profile.after_form_redirect.clone(),
+            }),
         })
     }
 
@@ -357,11 +584,22 @@ impl Fetcher {
         url: &str,
         headers: &[(String, String)],
     ) -> Result<Response, FetchError> {
-        let mut current = url.to_string();
+        self.send(url, &Outgoing::navigate(), headers).await
+    }
+
+    /// Sends `outgoing` to `url`, following redirects as the browser
+    /// would.
+    pub async fn send(
+        &self,
+        url: &str,
+        outgoing: &Outgoing,
+        headers: &[(String, String)],
+    ) -> Result<Response, FetchError> {
+        let (mut current, mut outgoing) = (url.to_string(), outgoing.clone());
         for hop in 0..=MAX_REDIRECTS {
-            match self.hop(&current, headers, hop).await? {
+            match self.hop_as(&current, &outgoing, headers, hop).await? {
                 Hop::Done(response) => return Ok(response),
-                Hop::Redirect(next) => current = next,
+                Hop::Redirect(next, then) => (current, outgoing) = (next, then),
             }
         }
         unreachable!("the last hop returns a response or an error")
@@ -378,6 +616,17 @@ impl Fetcher {
         headers: &[(String, String)],
         hop: usize,
     ) -> Result<Hop, FetchError> {
+        self.hop_as(url, &Outgoing::navigate(), headers, hop).await
+    }
+
+    /// `hop` for any request.
+    pub async fn hop_as(
+        &self,
+        url: &str,
+        outgoing: &Outgoing,
+        headers: &[(String, String)],
+        hop: usize,
+    ) -> Result<Hop, FetchError> {
         let mut caller = Vec::with_capacity(headers.len());
         for (k, v) in headers {
             let name = HeaderName::from_bytes(k.as_bytes())
@@ -391,7 +640,13 @@ impl Fetcher {
             .as_str()
             .parse()
             .map_err(|_| FetchError::invalid(format!("bad URL {url:?}")))?;
-        let response = self.send(&uri, &caller, hop > 0).await?;
+        let response = if outgoing.typed() {
+            self.send_typed(&uri, &caller, hop > 0).await?
+        } else {
+            self.send_shaped(&uri, &current, outgoing, &caller, hop > 0)
+                .await?
+        };
+        let status = response.status().as_u16();
         self.note_version(&uri, response.version());
         let location = response
             .status()
@@ -418,10 +673,11 @@ impl Fetcher {
                 "redirect to an unsupported URL {next}"
             )));
         }
-        Ok(Hop::Redirect(next.into()))
+        let then = outgoing.redirected(status, &current, &next);
+        Ok(Hop::Redirect(next.into(), then))
     }
 
-    async fn send(
+    async fn send_typed(
         &self,
         uri: &Uri,
         caller: &[(&str, HeaderName, HeaderValue)],
@@ -456,6 +712,130 @@ impl Fetcher {
         }
         for (_, name, value) in caller {
             request = request.header(name.clone(), value.clone());
+        }
+        Ok(request.send().await?)
+    }
+
+    /// Any request but typing an address: the headers of the profile's
+    /// captured shape for it, with the per-request ones filled in as the
+    /// browser fills them.
+    async fn send_shaped(
+        &self,
+        uri: &Uri,
+        target: &Url,
+        outgoing: &Outgoing,
+        caller: &[(&str, HeaderName, HeaderValue)],
+        redirected: bool,
+    ) -> Result<wreq::Response, FetchError> {
+        let shapes = &self.shapes;
+        let (shape, what, without) = match outgoing.kind {
+            Kind::Form => (&shapes.form, "a form submission", None),
+            Kind::Fetch => (&shapes.fetch, "a script's request", None),
+            Kind::Navigate if outgoing.after_form => (
+                &shapes.after_form_redirect,
+                "the redirect after a form submission",
+                None,
+            ),
+            // Not captured: a link's redirect is taken to be the one after
+            // a form, without the form's Cache-Control.
+            Kind::Navigate if redirected => (
+                &shapes.after_form_redirect,
+                "the redirect after a form submission",
+                Some("cache-control"),
+            ),
+            Kind::Navigate => (&shapes.link, "following a link", None),
+        };
+        let shape = shape.as_ref().ok_or_else(|| {
+            FetchError::invalid(format!(
+                "the {} profile has no capture of {what} yet",
+                shapes.profile
+            ))
+        })?;
+        let referer = outgoing.referer_url(target);
+        let relation = referer
+            .as_ref()
+            .map(|r| outgoing.furthest.max(Relation::between(r, target)));
+        let method = wreq::Method::from_bytes(outgoing.method.as_bytes())
+            .map_err(|_| FetchError::invalid(format!("bad method {:?}", outgoing.method)))?;
+        let mut order = OrigHeaderMap::new();
+        let client = match (&self.script_client, outgoing.kind) {
+            (Some(script), Kind::Fetch) => script,
+            _ => &self.client,
+        };
+        let mut request = client.request(method, uri.clone()).default_headers(false);
+        let overridden = |name: &str| caller.iter().any(|(_, n, _)| n.as_str() == name);
+        for (raw, value) in &shape.headers {
+            let name = raw.to_ascii_lowercase();
+            if without == Some(name.as_str()) {
+                continue;
+            }
+            order.insert(raw.clone());
+            let value = match name.as_str() {
+                // Host comes from the URL, Content-Length from the body and
+                // Cookie from the jar; here they only hold their places.
+                "host" | "content-length" | "cookie" => None,
+                "content-type" => outgoing.body.as_ref().and(outgoing.content_type.clone()),
+                // Sent with a body, and by a script to another origin.
+                "origin" => referer
+                    .as_ref()
+                    .filter(|_| outgoing.body.is_some() || relation != Some(Relation::SameOrigin))
+                    .map(|r| r.origin().ascii_serialization()),
+                // The whole URL within the origin, and only the origin
+                // across one: Chrome's default referrer policy.
+                "referer" => referer.as_ref().map(|r| match relation {
+                    Some(Relation::SameOrigin) => {
+                        let mut r = r.clone();
+                        r.set_fragment(None);
+                        r.to_string()
+                    }
+                    _ => format!("{}/", r.origin().ascii_serialization()),
+                }),
+                "sec-fetch-site" => Some(relation.map_or("none", Relation::header).to_string()),
+                _ if value.is_empty() => None,
+                _ => Some(value.clone()),
+            };
+            if let Some(value) = value
+                && !overridden(&name)
+            {
+                let value = HeaderValue::from_str(&value)
+                    .map_err(|_| FetchError::invalid(format!("bad value for header {raw}")))?;
+                request = request.header(
+                    HeaderName::from_bytes(name.as_bytes())
+                        .map_err(|_| FetchError::invalid(format!("bad header name {raw}")))?,
+                    value,
+                );
+            }
+        }
+        for (raw, name, _) in caller {
+            if !shape
+                .headers
+                .iter()
+                .any(|(k, _)| k.eq_ignore_ascii_case(name.as_str()))
+            {
+                order.insert(raw.to_string());
+            }
+        }
+        if self.expects_http2(uri) {
+            for (raw, value) in &shape.http2_headers {
+                order.insert(raw.clone());
+                let name = HeaderName::from_bytes(raw.to_ascii_lowercase().as_bytes())
+                    .map_err(|_| FetchError::invalid(format!("bad header name {raw}")))?;
+                if !overridden(name.as_str()) {
+                    let value = HeaderValue::from_str(value)
+                        .map_err(|_| FetchError::invalid(format!("bad value for header {raw}")))?;
+                    request = request.header(name, value);
+                }
+            }
+        }
+        request = request.orig_headers(order);
+        if self.remembers_http1 && uri.scheme_str() == Some("https") && !self.expects_http2(uri) {
+            request = request.version(Version::HTTP_11);
+        }
+        for (_, name, value) in caller {
+            request = request.header(name.clone(), value.clone());
+        }
+        if let Some(body) = &outgoing.body {
+            request = request.body(body.clone());
         }
         Ok(request.send().await?)
     }
@@ -532,6 +912,85 @@ mod tests {
         // Another port on the same host is another server.
         assert!(f.expects_http2(&"https://example.com:8443/".parse().unwrap()));
         assert!(!f.expects_http2(&"http://example.com/".parse().unwrap()));
+    }
+
+    #[test]
+    fn sites_are_told_apart_by_registrable_domain_and_scheme() {
+        let rel = |a: &str, b: &str| Relation::between(&a.parse().unwrap(), &b.parse().unwrap());
+        assert_eq!(
+            rel("https://a.example.com/x", "https://a.example.com/y"),
+            Relation::SameOrigin
+        );
+        assert_eq!(
+            rel("https://a.example.com/", "https://b.example.com/"),
+            Relation::SameSite
+        );
+        assert_eq!(
+            rel("https://shop.example.co.uk/", "https://www.example.co.uk/"),
+            Relation::SameSite
+        );
+        // co.uk is a public suffix: these are two different sites.
+        assert_eq!(
+            rel("https://example.co.uk/", "https://other.co.uk/"),
+            Relation::CrossSite
+        );
+        assert_eq!(
+            rel("http://example.com/", "https://example.com/"),
+            Relation::CrossSite
+        );
+        assert_eq!(
+            rel("https://127.0.0.1/", "https://localhost/"),
+            Relation::CrossSite
+        );
+        assert_eq!(
+            rel("https://example.com:8443/", "https://example.com/"),
+            Relation::SameSite
+        );
+    }
+
+    #[test]
+    fn redirects_turn_posts_into_gets_as_browsers_do() {
+        let (from, to): (Url, Url) = (
+            "https://example.com/login".parse().unwrap(),
+            "https://example.com/home".parse().unwrap(),
+        );
+        let form = Outgoing::form(b"a=1".to_vec(), None, Some("https://example.com/".into()));
+        for status in [301, 302, 303] {
+            let next = form.redirected(status, &from, &to);
+            assert_eq!(next.method, "GET", "{status}");
+            assert_eq!((next.body, next.content_type), (None, None), "{status}");
+            assert!(next.after_form && next.kind == Kind::Navigate, "{status}");
+            assert_eq!(
+                next.referer, form.referer,
+                "the form's page stays the referer"
+            );
+        }
+        for status in [307, 308] {
+            assert_eq!(form.redirected(status, &from, &to), form, "{status}");
+        }
+        let script = Outgoing::fetch("POST", Some(b"{}".to_vec()), None, None);
+        let next = script.redirected(303, &from, &to);
+        assert_eq!((next.method.as_str(), next.kind), ("GET", Kind::Fetch));
+        // A GET's redirect is a GET whatever the status.
+        let link = Outgoing::link("https://example.com/".into());
+        assert_eq!(link.redirected(302, &from, &to).method, "GET");
+        // Sec-Fetch-Site after a redirect is the furthest the chain went.
+        let away: Url = "https://other.org/".parse().unwrap();
+        let next = link
+            .redirected(302, &from, &away)
+            .redirected(302, &away, &to);
+        assert_eq!(next.furthest, Relation::CrossSite);
+    }
+
+    #[test]
+    fn a_script_body_without_a_type_is_text() {
+        let script = Outgoing::fetch("post", Some(b"hi".to_vec()), None, None);
+        assert_eq!(script.method, "POST");
+        assert_eq!(
+            script.content_type.as_deref(),
+            Some("text/plain;charset=UTF-8")
+        );
+        assert_eq!(Outgoing::fetch("GET", None, None, None).content_type, None);
     }
 
     #[test]

@@ -1121,7 +1121,7 @@ async fn fetch(shared: Arc<Shared>, mut q: Queued, session: Fetcher) {
         // goes through that host's robots.txt, TDMRep and limits. Its URL
         // counts as seen, but is fetched even if seen: this request has to
         // end somewhere.
-        (Ok(Hop::Redirect(next)), _) => {
+        (Ok(Hop::Redirect(next, _)), _) => {
             if let Some(fp) = fingerprint("GET", &next) {
                 state.seen.insert(fp);
                 if let Some(cp) = &shared.checkpoint {
