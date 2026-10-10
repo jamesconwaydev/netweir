@@ -237,7 +237,12 @@ class Pool:
         )
 
     def submit(self, name: str, response: Any, request: Request) -> asyncio.Future:
-        return asyncio.wrap_future(self._executor.submit(run, name, response, request))
+        job = asyncio.wrap_future(self._executor.submit(run, name, response, request))
+        # A crawl that stops early never awaits the jobs still running, and
+        # their BrokenProcessPool, once close() ends the workers, would be
+        # reported as an error nobody handled. Awaiting a job still raises.
+        job.add_done_callback(_seen)
+        return job
 
     def close(self, abandon: bool = False) -> None:
         """Waits for the workers to finish, or, abandoning the crawl (an
@@ -251,6 +256,11 @@ class Pool:
         else:
             self._executor.shutdown(wait=True, cancel_futures=True)
         self._listener.stop()
+
+
+def _seen(job: asyncio.Future) -> None:
+    if not job.cancelled():
+        job.exception()
 
 
 class _Forward(logging.Handler):

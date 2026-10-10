@@ -61,6 +61,14 @@ class Settings:
     max_depth: int | None = None
     #: Requests accepted for one host beyond which more are dropped.
     max_pages_per_domain: int | None = None
+    #: The crawl stops once it has delivered this many items, received
+    #: this many responses, had this many errors in callbacks or
+    #: pipelines, or run for this many seconds. With a checkpoint, running
+    #: it again carries on from where it stopped.
+    max_items: int | None = None
+    max_pages: int | None = None
+    max_errors: int | None = None
+    max_time: float | None = None
     #: Further tries after a server error, a network error, throttling or
     #: a block. Retry n waits a random time up to backoff_base * 2**n
     #: seconds, capped at backoff_max.
@@ -110,6 +118,11 @@ class Settings:
             raise ValueError("max_depth must be 0 or more")
         if self.max_pages_per_domain is not None and self.max_pages_per_domain < 1:
             raise ValueError("max_pages_per_domain must be at least 1")
+        for field in ("max_items", "max_pages", "max_errors"):
+            if getattr(self, field) is not None and getattr(self, field) < 1:
+                raise ValueError(f"{field} must be at least 1")
+        if self.max_time is not None and self.max_time <= 0:
+            raise ValueError("max_time must be positive")
         if self.retries < 0 or self.breaker_window < 0:
             raise ValueError("retries and breaker_window must be 0 or more")
         if not 0 < self.backoff_base <= self.backoff_max or self.breaker_pause < 0:
@@ -206,6 +219,10 @@ class Spider:
     #: netweir.repair). Proposals end up in ``repairs`` after a run.
     repair: Any = None
     repairs: list[Any] = []
+    #: Why the last run ended: "finished" when it ran out of requests, or
+    #: the setting that stopped it ("max_items", "max_pages", "max_errors",
+    #: "max_time").
+    finish_reason: str | None = None
 
     async def start(self) -> AsyncIterator[Request]:
         """The first requests. An async generator by default; a plain
@@ -301,7 +318,9 @@ class Spider:
                     stage.start(append=size is not None)
                 started.append(stage)
             stats = await run.go()
-            run.completed = True
+            # Stopped by a limit part way through a batch: the batch is
+            # fetched again by a resumed run.
+            run.completed = self.finish_reason == "finished"
             return stats
         finally:
             await run.engine.close_browser()
@@ -312,6 +331,15 @@ class Spider:
                 if callable(close):
                     close()
             run.finish()
+
+
+class _Stop(BaseException):
+    """A limit was reached. A BaseException, so that the callback or
+    pipeline it's raised under doesn't take it for its own error."""
+
+    def __init__(self, reason: str):
+        super().__init__(reason)
+        self.reason = reason
 
 
 def _warn_if_priced(page: Page) -> None:
@@ -374,6 +402,9 @@ class _Run:
         self.tracks = (store, self.settings.track_threshold)
         self.engine.set_tracks(store, self.settings.track_threshold)
         spider.repairs = []
+        spider.finish_reason = None
+        #: When the crawl started, for max_time.
+        self.started = time.monotonic()
         #: Repairs to ask for once the crawl is done, one per site and name.
         self.repair_jobs: list[Any] = []
         self.repair_asked: set[tuple[str, str]] = set()
@@ -533,8 +564,38 @@ class _Run:
                 self.spider.repairs.append(proposal)
                 self.counts["repair_proposals"] += 1
 
+    def check_limits(self) -> None:
+        """Raises _Stop if the crawl has reached one of its limits."""
+        settings = self.settings
+        if settings.max_items is not None and self.counts["items"] >= settings.max_items:
+            raise _Stop("max_items")
+        if (
+            settings.max_errors is not None
+            and self.counts["callback_errors"] >= settings.max_errors
+        ):
+            raise _Stop("max_errors")
+        if settings.max_time is not None and self.time_left() <= 0:
+            raise _Stop("max_time")
+        if settings.max_pages is not None and self.engine.stats()["fetched"] >= settings.max_pages:
+            raise _Stop("max_pages")
+
+    def time_left(self) -> float | None:
+        if self.settings.max_time is None:
+            return None
+        return self.settings.max_time - (time.monotonic() - self.started)
+
+    async def next_events(self) -> list[tuple]:
+        """The next batch, waiting no longer than max_time allows."""
+        left = self.time_left()
+        if left is None:
+            return await self.engine.next(256)
+        try:
+            return await asyncio.wait_for(self.engine.next(256), max(left, 0))
+        except TimeoutError:
+            raise _Stop("max_time") from None
+
     async def crawl(self) -> dict[str, int]:
-        started = time.monotonic()
+        started = self.started
         if not self.settings.obey_robots:
             log.warning("obey_robots is off: robots.txt is not being checked")
         abandoned = True
@@ -553,16 +614,22 @@ class _Run:
             else:
                 for request in start:
                     self.submit(request)
-            while True:
-                events = await self.engine.next(256)
-                if not events:
-                    break
-                # With workers, the batch's callbacks all start now; their
-                # results are dealt with below, in the batch's order.
-                jobs = [self.send(event) for event in events]
-                await self.dispatch_batch(events, jobs)
-                self.settle()
-            abandoned = False
+            try:
+                while True:
+                    self.check_limits()
+                    events = await self.next_events()
+                    if not events:
+                        break
+                    # With workers, the batch's callbacks all start now; their
+                    # results are dealt with below, in the batch's order.
+                    jobs = [self.send(event) for event in events]
+                    await self.dispatch_batch(events, jobs)
+                    self.settle()
+                self.spider.finish_reason = "finished"
+                abandoned = False
+            except _Stop as stop:
+                self.spider.finish_reason = stop.reason
+                log.info("stopping the crawl: %s reached", stop.reason)
         finally:
             if self.pool is not None:
                 # Stopping early (fail_fast, an interrupt) doesn't wait for
@@ -686,6 +753,7 @@ class _Run:
     async def _dispatch_all(self, events: list[tuple], jobs: list[Any]) -> None:
         for event, job in zip(events, jobs, strict=True):
             await self.dispatch(event, job)
+            self.check_limits()
 
     def send(self, event: tuple) -> Any:
         """Starts the event's callback in a worker, if there are workers
@@ -892,6 +960,8 @@ class _Run:
         if item_id is not None:
             self.delivered.add(item_id)
             self.unrecorded.append(item_id)
+        if self.settings.max_items is not None and self.counts["items"] >= self.settings.max_items:
+            raise _Stop("max_items")
 
 
 #: Iterable, but one result rather than many.

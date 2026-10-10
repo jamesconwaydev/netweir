@@ -8,8 +8,9 @@ class Books(netweir.Spider):
     settings = netweir.Settings(concurrency=16, max_depth=3)
 ```
 
-or from the shell with `-s name=value`. A misspelt name is an error, not
-ignored. Times are in seconds.
+or from the shell with `-s name=value` (`-s max_depth=none` for `None`,
+and commas between the proxies of `-s proxies=...`). A misspelt name is an
+error, not ignored. Times are in seconds.
 
 ## Fetching
 
@@ -42,6 +43,10 @@ ignored. Times are in seconds.
 |---|---|---|
 | `max_depth` | `None` | links from a start page beyond which requests are dropped |
 | `max_pages_per_domain` | `None` | requests accepted for one site beyond which more are dropped |
+| `max_items` | `None` | stop the crawl once it has delivered this many items |
+| `max_pages` | `None` | stop the crawl once it has received this many responses |
+| `max_errors` | `None` | stop the crawl after this many errors in callbacks and pipelines |
+| `max_time` | `None` | stop the crawl after this many seconds |
 
 ## Recovery
 
