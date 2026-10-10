@@ -17,10 +17,9 @@ A browser sends a POST in one of two ways, and a server can tell them apart:
   navigation carries, and orders the rest differently.
 
 `form=` sends the first kind; `json=` and `body=` send the second. Chrome
-154 and Firefox 156 were recorded doing both, and netweir's tests check its
-requests match them byte for byte, header order included. Safari 27 hasn't
-been recorded doing either yet, so a POST with `profile="safari"` raises
-`FetchError` rather than guess.
+154, Firefox 156 and Safari 27 were recorded doing both, and following a
+link, and loading the page a login redirects to; netweir's tests check its
+requests match them byte for byte, header order included.
 
 ## Sending data
 
@@ -40,7 +39,8 @@ page = netweir.post("https://example.com/upload", body=b"a,b\n1,2", headers={"Co
 page = netweir.request("PUT", "https://example.com/api/items/7", json={"price": 9})
 ```
 
-Pass one of `form=`, `json=` and `body=`. `referer=` names the page the
+Pass one of `form=`, `json=` and `body=`, with a method that carries a body:
+a GET or HEAD with one is a `ValueError`. `referer=` names the page the
 request comes from, which sets `Referer`, `Origin` and `Sec-Fetch-Site` as
 the browser would; without it, a form or a script's request comes from the
 root of the target's site. A GET with `referer=` looks like following a
@@ -91,7 +91,8 @@ aren't supported yet.
 
 ## In a crawl
 
-`Request` takes the same arguments, and `Request.from_form(page, ...)`
+`Request` takes the same arguments, and its method is POST when there's a
+form, JSON or a body and GET otherwise. `Request.from_form(page, ...)`
 submits a form on a page, as Scrapy's `FormRequest.from_response` does:
 
 ```python
@@ -125,9 +126,9 @@ something twice (place an order, post a comment):
 
 - A POST or PATCH that gets a server error (500, 502, 504 and the like), or
   loses its connection after it was sent, isn't retried. Pass
-  `retry_post=True` on the request if repeating it is safe. A 429, or a 503
-  with `Retry-After`, says the request wasn't processed, so it's retried as
-  any other.
+  `retry_post=True` on the request if repeating it is safe. A 429, a 503
+  with `Retry-After`, or a block page from bot protection says the site
+  never acted on it, so it's retried as any other.
 - It's never handed to Chrome. With `browser="on_block"`, a blocked POST
   goes to your `on_block` handler instead, and `browser=True` on a POST is a
   `ValueError`.

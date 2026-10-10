@@ -236,11 +236,6 @@ def test_a_multipart_form_is_sent_as_multipart(base):
     assert got["body"].endswith(f"--{boundary}--\r\n")
 
 
-def test_a_profile_without_a_capture_says_so(base):
-    with pytest.raises(netweir.FetchError, match="no capture of a form submission"):
-        netweir.post(f"{base}/echo", form={"a": 1}, profile="safari")
-
-
 FAST = netweir.Settings(
     throttle=False, start_delay=0, obey_robots=False, backoff_base=0.01, backoff_max=0.02
 )
@@ -365,3 +360,63 @@ def test_an_interrupted_crawl_sends_its_posts_again_as_posts(base, tmp_path):
     )
     spider.run()
     assert sorted(seen_bodies) == [("POST", "one"), ("POST", "three"), ("POST", "two")]
+
+
+EDGE_FORM = """<!doctype html><html><head><base href="https://cdn.example/assets/"></head><body>
+<form method="post">
+  <fieldset disabled><input name="locked" value="1"><legend><input name="legend" value="2"></legend></fieldset>
+  <input type="checkbox" name="empty" value="" checked>
+  <select name="one"><option selected>a</option><option selected>b</option></select>
+  <input type="radio" name="r" value="x" checked><input type="radio" name="r" value="y" checked>
+  <textarea name="lines">a
+b</textarea>
+  <button type="submit" name="go" value="1" formaction="/elsewhere" formmethod="get">Go</button>
+</form>
+</body></html>"""
+
+
+def edge_page(url="https://shop.example/basket"):
+    return _page(EDGE_FORM, url)
+
+
+def _page(html, url):
+    from netweir._native import _response
+
+    return netweir.Page(
+        _response(url, 200, "HTTP/1.1", [("content-type", "text/html")], html.encode())
+    )
+
+
+def test_form_reading_follows_the_html_standard_at_the_edges():
+    page = edge_page()
+    form = page.form(click=False)
+    fields = form.fields
+    # A disabled fieldset disables its controls, except in its first legend.
+    assert ("locked", "1") not in fields and ("legend", "2") in fields
+    # A checked box with an empty value sends the empty value.
+    assert ("empty", "") in fields
+    # One option per single select, and one radio per group: the last.
+    assert [v for k, v in fields if k == "one"] == ["b"]
+    assert [v for k, v in fields if k == "r"] == ["y"]
+    # An empty action is the page's own URL, not <base href>'s.
+    assert form.action == "https://shop.example/basket"
+    assert form.referer == "https://shop.example/basket"
+
+
+def test_line_breaks_are_sent_as_crlf():
+    form = edge_page().form(click=False)
+    _, body, _ = form.encoded()
+    assert b"lines=a%0D%0Ab" in body
+
+
+def test_the_pressed_buttons_formaction_and_formmethod_win():
+    form = edge_page().form(click="go")
+    assert (form.method, form.action) == ("GET", "https://cdn.example/elsewhere")
+
+
+def test_a_body_needs_a_method_that_can_carry_one():
+    with pytest.raises(ValueError, match="POST"):
+        netweir.Request("https://example.com/", method="GET", form={"a": 1})
+    # Leaving the method out with a body means POST.
+    assert netweir.Request("https://example.com/", form={"a": 1}).method == "POST"
+    assert netweir.Request("https://example.com/").method == "GET"

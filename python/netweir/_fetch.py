@@ -33,6 +33,8 @@ def payload(
     if sum(given) > 1:
         raise ValueError("pass one of form=, json= and body=, not several")
     method = method.upper()
+    if any(given) and method in ("GET", "HEAD"):
+        raise ValueError(f"a {method} carries no body: use POST, or put the data in the URL")
     if form is not None:
         pairs = form.items() if isinstance(form, Mapping) else form
         encoded = urlencode(list(pairs), doseq=True).encode()
@@ -215,6 +217,7 @@ class Page:
         default; ``False`` for none)."""
         return read_form(
             self.root,
+            self.url,
             self.urljoin(""),
             query,
             data=data,
