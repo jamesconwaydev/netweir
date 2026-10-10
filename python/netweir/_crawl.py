@@ -591,7 +591,8 @@ class _Run:
             return await self.engine.next(256)
         try:
             return await asyncio.wait_for(self.engine.next(256), max(left, 0))
-        except TimeoutError:
+        # Not the builtin TimeoutError before Python 3.11.
+        except asyncio.TimeoutError:
             raise _Stop("max_time") from None
 
     async def crawl(self) -> dict[str, int]:
