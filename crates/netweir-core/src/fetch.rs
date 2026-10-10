@@ -312,6 +312,11 @@ impl Relation {
     }
 }
 
+/// From an https page to an http URL, where browsers send no Referer.
+fn downgrade(from: &Url, to: &Url) -> bool {
+    from.scheme() == "https" && to.scheme() == "http"
+}
+
 /// The registrable domain (`example.co.uk` for `www.example.co.uk`), or the
 /// host itself for an IP address or a name with no public suffix.
 fn site(url: &Url) -> String {
@@ -341,6 +346,11 @@ pub struct Outgoing {
     after_form: bool,
     /// How far from the referer the redirects so far have led.
     furthest: Relation,
+    /// Repeated, body and all, to another origin by a 307 or 308: browsers
+    /// then send `Origin: null`.
+    tainted: bool,
+    /// The origin of the first URL, once a redirect has moved on from it.
+    started: Option<String>,
 }
 
 impl Default for Outgoing {
@@ -360,6 +370,8 @@ impl Outgoing {
             referer: None,
             after_form: false,
             furthest: Relation::SameOrigin,
+            tainted: false,
+            started: None,
         }
     }
 
@@ -449,7 +461,19 @@ impl Outgoing {
     /// turn it into a GET without a body; 307 and 308 repeat it.
     fn redirected(&self, status: u16, from: &Url, to: &Url) -> Outgoing {
         let mut next = self.clone();
-        if status == 303 || (matches!(status, 301 | 302) && self.method == "POST") {
+        next.started = Some(
+            self.started
+                .clone()
+                .unwrap_or_else(|| from.origin().ascii_serialization()),
+        );
+        // A form or a script's request with no page named came from its
+        // own site's root; the request the redirect makes still does.
+        if next.referer.is_none() && self.kind != Kind::Navigate {
+            next.referer = self.referer_url(from).map(String::from);
+        }
+        if (status == 303 && self.method != "HEAD")
+            || (matches!(status, 301 | 302) && self.method == "POST")
+        {
             next.method = "GET".into();
             next.body = None;
             next.content_type = None;
@@ -458,10 +482,36 @@ impl Outgoing {
                 next.after_form = true;
             }
         }
+        if matches!(status, 307 | 308) && next.body.is_some() && from.origin() != to.origin() {
+            next.tainted = true;
+        }
         if let Some(referer) = self.referer_url(from) {
             next.furthest = self.furthest.max(Relation::between(&referer, to));
         }
         next
+    }
+
+    /// The caller's headers for the request to `url`, without what a
+    /// browser drops on the way there: the body's Content-Type once a
+    /// redirect has dropped the body, and Authorization once one has left
+    /// the first origin.
+    pub(crate) fn callers_headers(
+        &self,
+        headers: &[(String, String)],
+        url: &Url,
+    ) -> Vec<(String, String)> {
+        let Some(started) = &self.started else {
+            return headers.to_vec();
+        };
+        let left = *started != url.origin().ascii_serialization();
+        headers
+            .iter()
+            .filter(|(k, _)| {
+                !(self.body.is_none() && k.eq_ignore_ascii_case("content-type"))
+                    && !(left && k.eq_ignore_ascii_case("authorization"))
+            })
+            .cloned()
+            .collect()
     }
 
     /// The page the request comes from, as a URL.
@@ -674,6 +724,11 @@ impl Fetcher {
         headers: &[(String, String)],
         hop: usize,
     ) -> Result<Hop, FetchError> {
+        let headers = match Url::parse(url) {
+            Ok(u) => outgoing.callers_headers(headers, &u),
+            Err(_) => headers.to_vec(),
+        };
+        let headers = headers.as_slice();
         let mut caller = Vec::with_capacity(headers.len());
         for (k, v) in headers {
             let name = HeaderName::from_bytes(k.as_bytes())
@@ -822,21 +877,35 @@ impl Fetcher {
                 // Cookie from the jar; here they only hold their places.
                 "host" | "content-length" | "cookie" => None,
                 "content-type" => outgoing.body.as_ref().and(outgoing.content_type.clone()),
-                // Sent with a body, and by a script to another origin.
+                // Sent with a body, and by a script to another origin;
+                // "null" once a redirect has repeated the body to another
+                // origin, or from https to http.
                 "origin" => referer
                     .as_ref()
                     .filter(|_| outgoing.body.is_some() || relation != Some(Relation::SameOrigin))
-                    .map(|r| r.origin().ascii_serialization()),
-                // The whole URL within the origin, and only the origin
-                // across one: Chrome's default referrer policy.
-                "referer" => referer.as_ref().map(|r| match relation {
-                    Some(Relation::SameOrigin) => {
-                        let mut r = r.clone();
-                        r.set_fragment(None);
-                        r.to_string()
-                    }
-                    _ => format!("{}/", r.origin().ascii_serialization()),
-                }),
+                    .map(|r| {
+                        if outgoing.tainted || downgrade(r, target) {
+                            "null".to_string()
+                        } else {
+                            r.origin().ascii_serialization()
+                        }
+                    }),
+                // The whole URL within the origin, only the origin across
+                // one, and nothing from https to http: browsers' default
+                // referrer policy.
+                "referer" => {
+                    referer
+                        .as_ref()
+                        .filter(|r| !downgrade(r, target))
+                        .map(|r| match relation {
+                            Some(Relation::SameOrigin) => {
+                                let mut r = r.clone();
+                                r.set_fragment(None);
+                                r.to_string()
+                            }
+                            _ => format!("{}/", r.origin().ascii_serialization()),
+                        })
+                }
                 "sec-fetch-site" => Some(relation.map_or("none", Relation::header).to_string()),
                 _ if value.is_empty() => None,
                 _ => Some(value.clone()),
@@ -1013,7 +1082,17 @@ mod tests {
             );
         }
         for status in [307, 308] {
-            assert_eq!(form.redirected(status, &from, &to), form, "{status}");
+            let next = form.redirected(status, &from, &to);
+            assert_eq!(
+                (next.method, next.kind, next.body, next.content_type),
+                (
+                    form.method.clone(),
+                    form.kind,
+                    form.body.clone(),
+                    form.content_type.clone()
+                ),
+                "{status}"
+            );
         }
         let script = Outgoing::fetch("POST", Some(b"{}".to_vec()), None, None);
         let next = script.redirected(303, &from, &to);
@@ -1027,6 +1106,67 @@ mod tests {
             .redirected(302, &from, &away)
             .redirected(302, &away, &to);
         assert_eq!(next.furthest, Relation::CrossSite);
+    }
+
+    #[test]
+    fn a_form_without_a_referer_keeps_its_origin_through_a_redirect() {
+        let (from, to): (Url, Url) = (
+            "https://example.com/login".parse().unwrap(),
+            "https://example.com/home".parse().unwrap(),
+        );
+        let next = Outgoing::form(b"a=1".to_vec(), None, None).redirected(302, &from, &to);
+        assert_eq!(next.referer.as_deref(), Some("https://example.com/"));
+    }
+
+    #[test]
+    fn a_head_stays_a_head_after_a_303() {
+        let (from, to): (Url, Url) = (
+            "https://example.com/a".parse().unwrap(),
+            "https://example.com/b".parse().unwrap(),
+        );
+        let head = Outgoing::fetch("HEAD", None, None, None);
+        assert_eq!(head.redirected(303, &from, &to).method, "HEAD");
+    }
+
+    #[test]
+    fn a_post_repeated_to_another_origin_is_tainted() {
+        let (from, to): (Url, Url) = (
+            "https://example.com/a".parse().unwrap(),
+            "https://other.org/b".parse().unwrap(),
+        );
+        let form = Outgoing::form(b"a=1".to_vec(), None, Some("https://example.com/".into()));
+        assert!(form.redirected(307, &from, &to).tainted);
+        assert!(!form.redirected(307, &from, &from).tainted);
+        // A 302 makes it a GET, which carries no Origin to taint.
+        assert!(!form.redirected(302, &from, &to).tainted);
+    }
+
+    #[test]
+    fn what_a_redirect_strips_from_the_callers_headers() {
+        let start: Url = "https://example.com/a".parse().unwrap();
+        let headers = vec![
+            ("Content-Type".to_string(), "text/csv".to_string()),
+            ("Authorization".to_string(), "Bearer x".to_string()),
+            ("X-Keep".to_string(), "1".to_string()),
+        ];
+        let names = |o: &Outgoing, at: &str| -> Vec<String> {
+            o.callers_headers(&headers, &at.parse().unwrap())
+                .into_iter()
+                .map(|(k, _)| k)
+                .collect()
+        };
+        let post = Outgoing::fetch("POST", Some(b"a".to_vec()), None, None);
+        assert_eq!(names(&post, "https://example.com/a").len(), 3);
+        let got = post.redirected(303, &start, &"https://example.com/b".parse().unwrap());
+        assert_eq!(
+            names(&got, "https://example.com/b"),
+            ["Authorization", "X-Keep"]
+        );
+        let away = post.redirected(307, &start, &"https://other.org/".parse().unwrap());
+        assert_eq!(
+            names(&away, "https://other.org/"),
+            ["Content-Type", "X-Keep"]
+        );
     }
 
     #[test]
