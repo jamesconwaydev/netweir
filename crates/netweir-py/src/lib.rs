@@ -73,11 +73,50 @@ fn fingerprint(url: &str) -> Option<String> {
         .map(|fp| fp.iter().map(|b| format!("{b:02x}")).collect())
 }
 
+/// A sitemap's kind ("urlset" or "index") and its entries, as dicts with
+/// loc, lastmod, changefreq, priority and alternates. Gzip is unzipped, to
+/// at most `max` bytes. ValueError if it isn't a sitemap.
+#[pyfunction]
+fn _sitemap<'py>(
+    py: Python<'py>,
+    body: &[u8],
+    max: usize,
+) -> PyResult<(&'static str, Vec<Bound<'py, pyo3::types::PyDict>>)> {
+    let map = py
+        .detach(|| netweir_core::sitemap::parse(body, max))
+        .map_err(pyo3::exceptions::PyValueError::new_err)?;
+    let kind = match map.kind {
+        netweir_core::sitemap::Kind::Urlset => "urlset",
+        netweir_core::sitemap::Kind::Index => "index",
+    };
+    let mut entries = Vec::with_capacity(map.entries.len());
+    for e in map.entries {
+        let d = pyo3::types::PyDict::new(py);
+        d.set_item("loc", e.loc)?;
+        d.set_item("lastmod", e.lastmod)?;
+        d.set_item("changefreq", e.changefreq)?;
+        d.set_item("priority", e.priority)?;
+        d.set_item("alternates", e.alternates)?;
+        entries.push(d);
+    }
+    Ok((kind, entries))
+}
+
+/// The sitemap URLs a robots.txt names, as written.
+#[pyfunction]
+fn _robots_sitemaps(body: &str) -> Vec<String> {
+    netweir_core::robots::Robots::parse(body)
+        .sitemaps()
+        .to_vec()
+}
+
 #[pymodule]
 fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
     m.add_function(wrap_pyfunction!(parse, m)?)?;
     m.add_function(wrap_pyfunction!(fingerprint, m)?)?;
+    m.add_function(wrap_pyfunction!(_sitemap, m)?)?;
+    m.add_function(wrap_pyfunction!(_robots_sitemaps, m)?)?;
     m.add_class::<Node>()?;
     m.add_class::<Selection>()?;
     m.add("SelectorError", m.py().get_type::<SelectorError>())?;

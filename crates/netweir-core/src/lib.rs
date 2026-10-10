@@ -13,6 +13,7 @@ mod fetch;
 pub mod install;
 mod profile;
 pub mod robots;
+pub mod sitemap;
 pub mod tdmrep;
 pub mod tracks;
 pub mod traps;
