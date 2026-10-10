@@ -159,10 +159,12 @@ A crawl that should end before it runs out of pages takes a limit:
 netweir crawl quotes.py -o quotes.jsonl -s max_items=500 -s max_time=600
 ```
 
-`max_items` stops it once that many items are written, exactly that many;
-`max_pages` once that many responses have come back; `max_errors` once
-callbacks and pipelines have raised that many exceptions; `max_time` after
-that many seconds. Requests still in flight are dropped, not waited for.
+`max_items` stops it once that many items are written, exactly that many.
+`max_pages` sends that many requests, a retry counting as one, and stops
+once their pages have been through the callbacks. `max_errors` stops it
+once callbacks and pipelines have raised that many exceptions, and
+`max_time` after that many seconds; requests still in flight when one of
+those three stops it are dropped, not waited for.
 After a run, `spider.finish_reason` says why it ended: `"finished"` when
 there was nothing left to fetch, or the name of the limit.
 

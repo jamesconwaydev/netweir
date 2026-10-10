@@ -61,10 +61,10 @@ class Settings:
     max_depth: int | None = None
     #: Requests accepted for one host beyond which more are dropped.
     max_pages_per_domain: int | None = None
-    #: The crawl stops once it has delivered this many items, received
-    #: this many responses, had this many errors in callbacks or
-    #: pipelines, or run for this many seconds. With a checkpoint, running
-    #: it again carries on from where it stopped.
+    #: The crawl stops once it has delivered this many items, sent this
+    #: many requests (each retry among them), had this many errors in
+    #: callbacks or pipelines, or run for this many seconds. With a
+    #: checkpoint, running it again carries on from where it stopped.
     max_items: int | None = None
     max_pages: int | None = None
     max_errors: int | None = None
@@ -159,6 +159,7 @@ class Settings:
             target_concurrency=self.target_concurrency,
             max_depth=self.max_depth,
             max_pages_per_domain=self.max_pages_per_domain,
+            max_pages=self.max_pages,
             retries=self.retries,
             backoff_base=self.backoff_base,
             backoff_max=self.backoff_max,
@@ -576,8 +577,6 @@ class _Run:
             raise _Stop("max_errors")
         if settings.max_time is not None and self.time_left() <= 0:
             raise _Stop("max_time")
-        if settings.max_pages is not None and self.engine.stats()["fetched"] >= settings.max_pages:
-            raise _Stop("max_pages")
 
     def time_left(self) -> float | None:
         if self.settings.max_time is None:
@@ -620,6 +619,10 @@ class _Run:
                     self.check_limits()
                     events = await self.next_events()
                     if not events:
+                        # The engine stops sending at max_pages, and ends
+                        # the crawl with requests still queued.
+                        if self.engine.stats()["queued"]:
+                            raise _Stop("max_pages")
                         break
                     # With workers, the batch's callbacks all start now; their
                     # results are dealt with below, in the batch's order.

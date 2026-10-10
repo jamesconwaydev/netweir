@@ -42,6 +42,10 @@ pub struct CrawlSettings {
     pub max_depth: Option<u32>,
     /// Requests accepted for one host beyond which more are refused.
     pub max_pages_per_domain: Option<u64>,
+    /// Requests sent, each retry among them, beyond which none is started
+    /// and the crawl ends once those under way finish. What was still
+    /// queued stays in the checkpoint for a later run.
+    pub max_pages: Option<u64>,
     /// Further tries after a server error, a network error, throttling or
     /// a block.
     pub retries: u32,
@@ -99,6 +103,7 @@ impl Default for CrawlSettings {
             target_concurrency: 1.0,
             max_depth: None,
             max_pages_per_domain: None,
+            max_pages: None,
             retries: 3,
             backoff_base: Duration::from_secs(1),
             backoff_max: Duration::from_secs(60),
@@ -336,6 +341,8 @@ struct State {
     timers: BinaryHeap<Reverse<(Instant, String)>>,
     /// robots.txt and tdmrep.json fetches under way.
     gate_fetches: usize,
+    /// Requests sent so far, retries among them, for `max_pages`.
+    sent: u64,
     stats: Stats,
     closed: bool,
     /// Whether the crawl was told no HTTP profile matches its Chrome.
@@ -677,7 +684,8 @@ async fn next_events(shared: Arc<Shared>, max: usize) -> Vec<Event> {
                 shared.schedule.notify_one();
                 return batch;
             }
-            if state.stats.queued == 0 && state.stats.in_flight == 0 && state.gate_fetches == 0 {
+            let idle = state.stats.in_flight == 0 && state.gate_fetches == 0;
+            if idle && (state.stats.queued == 0 || state.capped(&shared.settings)) {
                 return Vec::new();
             }
         }
@@ -909,6 +917,11 @@ fn enqueue(
 }
 
 impl State {
+    /// Whether `max_pages` requests have been sent.
+    fn capped(&self, settings: &CrawlSettings) -> bool {
+        settings.max_pages.is_some_and(|max| self.sent >= max)
+    }
+
     fn make_ready(&mut self, name: &str) {
         if let Some(host) = self.hosts.get_mut(name)
             && !host.listed
@@ -956,6 +969,7 @@ fn plan(
         // Gate fetches count against the limit like any other request.
         if state.stats.in_flight + state.gate_fetches >= settings.concurrency
             || state.events.len() >= backlog_limit(settings)
+            || state.capped(settings)
         {
             break;
         }
@@ -964,6 +978,9 @@ fn plan(
             host.listed = false;
         }
         loop {
+            if state.capped(settings) {
+                break 'hosts;
+            }
             if state.stats.in_flight + state.gate_fetches >= settings.concurrency {
                 // Still has work: back in line for when a slot frees.
                 state.make_ready(&name);
@@ -1074,6 +1091,7 @@ fn plan(
             host.next_at = now + host.delay.max(host.floor);
             state.stats.queued -= 1;
             state.stats.in_flight += 1;
+            state.sent += 1;
             let session = host
                 .session
                 .clone()
