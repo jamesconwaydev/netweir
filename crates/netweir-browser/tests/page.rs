@@ -532,3 +532,38 @@ async fn a_guard_sees_every_hop_and_can_stop_one_before_it_is_fetched() {
     );
     browser.close().await.unwrap();
 }
+
+#[tokio::test]
+async fn a_page_that_never_answers_times_out_instead_of_hanging() {
+    let Some(executable) = common::chrome() else {
+        return;
+    };
+    let browser = common::launch(netweir_browser::LaunchOptions {
+        executable: Some(executable),
+        timeout: Duration::from_secs(2),
+        ..Default::default()
+    })
+    .await;
+    // Once loaded, the page's script never lets go of the renderer, so
+    // nothing more is ever run in it, netweir's helpers included.
+    let server = serve(vec![(
+        "/",
+        html("<p>busy</p><script>setTimeout(() => { for (;;) {} }, 50)</script>"),
+    )]);
+    let page = browser.new_page().await.unwrap();
+    page.goto(&format!("{}/", server.url), WaitUntil::Load, None)
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let started = std::time::Instant::now();
+    let outcome = tokio::time::timeout(Duration::from_secs(20), page.content())
+        .await
+        .expect("content() waited on Chrome with no end");
+    assert!(matches!(outcome, Err(Error::Timeout(_))), "{outcome:?}");
+    assert!(
+        started.elapsed() < Duration::from_secs(10),
+        "{:?}",
+        started.elapsed()
+    );
+    let _ = browser.close().await;
+}

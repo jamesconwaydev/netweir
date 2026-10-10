@@ -382,7 +382,8 @@ impl Browser {
             .inner
             .conn
             // Gone when the connection is, however netweir lets go of it.
-            .call(
+            .call_within(
+                self.inner.timeout,
                 "",
                 "Target.createBrowserContext",
                 json!({"disposeOnDetach": true}),
@@ -842,7 +843,8 @@ impl Context {
         match self
             .browser
             .conn
-            .call(
+            .call_within(
+                self.browser.timeout,
                 "",
                 "Target.disposeBrowserContext",
                 json!({"browserContextId": self.id}),
@@ -862,7 +864,10 @@ pub(crate) async fn context_cookies(browser: &Inner, context: Option<&str>) -> R
     if let Some(id) = context {
         params["browserContextId"] = Value::from(id);
     }
-    let r = browser.conn.call("", "Storage.getCookies", params).await?;
+    let r = browser
+        .conn
+        .call_within(browser.timeout, "", "Storage.getCookies", params)
+        .await?;
     Ok(cookies_from(&r["cookies"]))
 }
 
@@ -875,7 +880,10 @@ pub(crate) async fn set_context_cookies(
     if let Some(id) = context {
         params["browserContextId"] = Value::from(id);
     }
-    browser.conn.call("", "Storage.setCookies", params).await?;
+    browser
+        .conn
+        .call_within(browser.timeout, "", "Storage.setCookies", params)
+        .await?;
     Ok(())
 }
 
