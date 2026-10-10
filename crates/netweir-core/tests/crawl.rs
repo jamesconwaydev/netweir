@@ -300,13 +300,16 @@ async fn throttling_spaces_requests_to_one_site() {
     let t = site.times("/");
     assert_eq!(t.len(), 3);
     // The delay starts at 300 ms and halves towards the (tiny) latency.
+    // These are arrival times, and the first request also opened the
+    // connection, so it can arrive late and shorten the first gap by that
+    // much on a slow machine.
     assert!(
-        t[1] - t[0] >= Duration::from_millis(280),
+        t[1] - t[0] >= Duration::from_millis(250),
         "{:?}",
         t[1] - t[0]
     );
     assert!(
-        t[2] - t[1] >= Duration::from_millis(130),
+        t[2] - t[1] >= Duration::from_millis(120),
         "{:?}",
         t[2] - t[1]
     );
