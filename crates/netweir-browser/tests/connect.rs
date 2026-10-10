@@ -43,6 +43,12 @@ fn running_with(extra: &[&str]) -> Option<Running> {
             &format!("--user-data-dir={}", profile.display()),
         ])
         .args(extra)
+        // As netweir's own launches take them.
+        .args(
+            std::env::var("NETWEIR_CHROME_ARGS")
+                .unwrap_or_default()
+                .split_whitespace(),
+        )
         .arg("about:blank")
         .stdout(Stdio::null())
         .stderr(Stdio::piped())

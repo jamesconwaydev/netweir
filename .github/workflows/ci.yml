@@ -47,6 +47,10 @@ jobs:
     env:
       # Chrome is installed below, so the browser tests run, not skip.
       NETWEIR_REQUIRE_CHROME: "1"
+      # The macOS runners are virtual machines whose GPU now and then hangs
+      # on Chrome's work, until the kernel stops taking any from it and
+      # Chrome waits for good. Software rendering never touches it.
+      NETWEIR_CHROME_ARGS: ${{ matrix.os == 'macos-latest' && '--disable-gpu' || '' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:

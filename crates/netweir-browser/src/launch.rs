@@ -71,6 +71,24 @@ pub(crate) fn installed_chrome(home: &Path) -> Option<PathBuf> {
         .find(|p| p.is_file())
 }
 
+/// More Chrome switches, from `$NETWEIR_CHROME_ARGS`, for every Chrome
+/// netweir launches: what a machine needs whatever the code says, such as
+/// `--disable-gpu` on a virtual Mac whose GPU hangs.
+pub(crate) fn env_switches() -> Vec<String> {
+    switches_from(std::env::var_os("NETWEIR_CHROME_ARGS"))
+}
+
+fn switches_from(value: Option<std::ffi::OsString>) -> Vec<String> {
+    value
+        .map(|v| {
+            v.to_string_lossy()
+                .split_whitespace()
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// The Chrome to launch: `$NETWEIR_CHROME`, then the newest one
 /// `netweir install chrome` installed, then the usual install paths
 /// (Chrome, Chrome for Testing, Chromium). The error lists where it
@@ -328,6 +346,16 @@ fn hand_over(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn switches_from_the_environment_are_split_on_whitespace() {
+        assert_eq!(
+            switches_from(Some("--disable-gpu  --no-sandbox\n".into())),
+            ["--disable-gpu", "--no-sandbox"]
+        );
+        assert!(switches_from(Some("   ".into())).is_empty());
+        assert!(switches_from(None).is_empty());
+    }
 
     #[test]
     fn the_newest_installed_chrome_is_found() {
