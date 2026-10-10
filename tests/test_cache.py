@@ -5,6 +5,7 @@ import contextlib
 import shutil
 import sqlite3
 import threading
+import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import pytest
@@ -38,7 +39,9 @@ class Handler(BaseHTTPRequestHandler):
         n = Handler.served[self.path]
         prefix, _, last = self.path.rpartition("/")
         if self.path.startswith("/go"):
-            self.answer(302, b"", [("Location", "/there" + self.path[3:])])
+            # Quoted, so nothing in the path can end the header early.
+            there = "/there" + urllib.parse.quote(self.path[3:], safe="/?=&")
+            self.answer(302, b"", [("Location", there)])
         elif self.path.startswith("/busy"):
             self.answer(503, b"busy")
         elif self.path.startswith("/blocked"):
