@@ -103,3 +103,34 @@ Two differences, both on purpose:
 Give a query a name with `track=`, and netweir remembers what its element
 looked like. When a redesign breaks the query, netweir finds the most
 similar element instead. See [Self-healing](self-healing.md#tracked-selectors).
+
+## Structured data
+
+Many pages describe themselves for search engines and social networks:
+a product's name, price and rating in JSON-LD, an article's title and image
+in Open Graph tags, reviews marked up as microdata. When it's there, it's
+usually the cleanest copy of the data on the page, and `page.metadata()`
+reads all of it at once:
+
+```python
+meta = page.metadata()
+
+for thing in meta["json_ld"]:  # every <script type="application/ld+json">
+    if thing.get("@type") == "Product":
+        price = thing["offers"]["price"]
+
+meta["microdata"]   # [{"type": "https://schema.org/Review", "properties": {...}}]
+meta["opengraph"]   # {"og:title": "...", "og:image": [...], "product:price:amount": "..."}
+meta["twitter"]     # {"twitter:card": "summary_large_image", ...}
+meta["dublin_core"] # {"dc.title": "...", ...}
+```
+
+JSON-LD comes as written, with a block that's a list giving its items one
+by one; a block that isn't valid JSON is skipped. Microdata follows the
+HTML standard: nested items, `itemref`, several names in one `itemprop`,
+and each element's value where the standard says to find it (`content`,
+`href` and `src` made absolute against the page, `datetime`, `value`, or
+the text). In the meta tag sections and in microdata, a key given more than
+once has a list of its values. A parsed document has it too:
+`netweir.parse(html).metadata(base_url)`.
+

@@ -197,6 +197,15 @@ class Page:
         """``follow`` for every URL in ``urls`` (a list or a Selection)."""
         return [self.follow(u, callback, **kwargs) for u in urls]
 
+    def metadata(self) -> dict:
+        """The structured data the page carries about itself: a dict with
+        ``json_ld`` (a list of the JSON-LD blocks), ``microdata`` (a list
+        of items, each with ``type``, ``id`` and ``properties``),
+        ``opengraph``, ``twitter`` and ``dublin_core`` (dicts of their meta
+        tags; a key given more than once has a list). Relative URLs are
+        resolved against the page."""
+        return self.root.metadata(self.urljoin(""))
+
     def form(
         self,
         query: str | None = None,
