@@ -151,6 +151,25 @@ defines several; `-q` shows only warnings and errors. A mistake on the
 command line (an unknown setting, a bad value, a path that can't be
 written) exits with status 2 and one line saying why.
 
+### Stopping early
+
+A crawl that should end before it runs out of pages takes a limit:
+
+```
+netweir crawl quotes.py -o quotes.jsonl -s max_items=500 -s max_time=600
+```
+
+`max_items` stops it once that many items are written, exactly that many;
+`max_pages` once that many responses have come back; `max_errors` once
+callbacks and pipelines have raised that many exceptions; `max_time` after
+that many seconds. Requests still in flight are dropped, not waited for.
+After a run, `spider.finish_reason` says why it ended: `"finished"` when
+there was nothing left to fetch, or the name of the limit.
+
+With a [checkpoint](self-healing.md#checkpoints), running a stopped crawl again carries on
+from where it stopped, and the limits count afresh: `max_items=500` gives
+the next 500.
+
 ## Callbacks in worker processes
 
 The engine fetches and parses in Rust, but a spider's callbacks take turns

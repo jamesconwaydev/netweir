@@ -112,6 +112,32 @@ def test_a_callback_that_breaks_in_a_worker_is_counted_and_logged(base, caplog):
     assert "ValueError: broke on" in caplog.text
 
 
+def test_a_limit_stops_a_crawl_in_workers_exactly(base, tmp_path):
+    script = tmp_path / "limited.py"
+    script.write_text(
+        "import netweir\n"
+        "class Limited(netweir.Spider):\n"
+        f"    start_urls = ['{base}/']\n"
+        "    def parse(self, page):\n"
+        "        for href in page.css('a.item::attr(href)').getall():\n"
+        "            yield page.follow(href, callback='item')\n"
+        "    def item(self, page):\n"
+        "        yield {'name': page.css('h1::text').get()}\n",
+        encoding="utf-8",
+    )
+    out = tmp_path / "items.jsonl"
+    done = subprocess.run(
+        [sys.executable, "-m", "netweir", "crawl", str(script), "-q", "-o", str(out),
+         "-s", "workers=2", "-s", "max_items=5", "-s", "throttle=false",
+         "-s", "start_delay=0", "-s", "obey_robots=false", "-s", "obey_tdmrep=false"],
+        capture_output=True, text=True, timeout=120,
+    )  # fmt: skip
+    assert done.returncode == 0, done.stderr
+    assert len(out.read_text(encoding="utf-8").splitlines()) == 5
+    # The callbacks it stopped waiting for aren't reported as unhandled.
+    assert "never retrieved" not in done.stderr, done.stderr
+
+
 def test_fail_fast_stops_the_crawl_with_the_workers_exception(base):
     with pytest.raises(ValueError, match="broke on"):
         crawl(worker_spiders.Breaks, base + "/", workers=2, fail_fast=True)
