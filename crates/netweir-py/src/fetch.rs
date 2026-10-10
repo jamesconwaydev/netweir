@@ -93,6 +93,54 @@ impl Fetcher {
         })
     }
 
+    /// Awaitable request of any kind. Resolves to a Response.
+    #[pyo3(signature = (url, method="GET", kind="navigate", body=None, content_type=None, referer=None, headers=None))]
+    #[allow(clippy::too_many_arguments)]
+    fn send<'py>(
+        &self,
+        py: Python<'py>,
+        url: String,
+        method: &str,
+        kind: &str,
+        body: Option<Vec<u8>>,
+        content_type: Option<String>,
+        referer: Option<String>,
+        headers: Option<Vec<(String, String)>>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let fetcher = self.inner.clone();
+        let outgoing = outgoing(method, kind, body, content_type, referer)?;
+        let headers = headers.unwrap_or_default();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let response = fetcher
+                .send(&url, &outgoing, &headers)
+                .await
+                .map_err(fetch_error)?;
+            Ok(Response::from(response))
+        })
+    }
+
+    /// `send` that blocks the calling thread (with the GIL released).
+    #[pyo3(signature = (url, method="GET", kind="navigate", body=None, content_type=None, referer=None, headers=None))]
+    #[allow(clippy::too_many_arguments)]
+    fn send_blocking(
+        &self,
+        py: Python<'_>,
+        url: String,
+        method: &str,
+        kind: &str,
+        body: Option<Vec<u8>>,
+        content_type: Option<String>,
+        referer: Option<String>,
+        headers: Option<Vec<(String, String)>>,
+    ) -> PyResult<Response> {
+        let outgoing = outgoing(method, kind, body, content_type, referer)?;
+        let headers = headers.unwrap_or_default();
+        let runtime = pyo3_async_runtimes::tokio::get_runtime();
+        py.detach(|| runtime.block_on(self.inner.send(&url, &outgoing, &headers)))
+            .map(Response::from)
+            .map_err(fetch_error)
+    }
+
     /// GET that blocks the calling thread (with the GIL released).
     #[pyo3(signature = (url, headers=None))]
     fn get_blocking(
@@ -107,6 +155,36 @@ impl Fetcher {
             .map(Response::from)
             .map_err(fetch_error)
     }
+}
+
+/// The request `send` describes: `kind` is "navigate" (with a referer,
+/// following a link), "form" or "fetch".
+fn outgoing(
+    method: &str,
+    kind: &str,
+    body: Option<Vec<u8>>,
+    content_type: Option<String>,
+    referer: Option<String>,
+) -> PyResult<netweir_core::Outgoing> {
+    use netweir_core::Outgoing;
+    Ok(match kind {
+        "navigate" if method.eq_ignore_ascii_case("GET") && body.is_none() => match referer {
+            Some(referer) => Outgoing::link(referer),
+            None => Outgoing::navigate(),
+        },
+        "navigate" => {
+            return Err(PyValueError::new_err(
+                "a navigation is a GET without a body; send a form or a script's request",
+            ));
+        }
+        "form" => Outgoing::form(body.unwrap_or_default(), content_type, referer),
+        "fetch" => Outgoing::fetch(method, body, content_type, referer),
+        other => {
+            return Err(PyValueError::new_err(format!(
+                "unknown kind of request {other:?}"
+            )));
+        }
+    })
 }
 
 /// A response from its parts, as a worker process gets one.

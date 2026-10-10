@@ -374,5 +374,8 @@ async fn a_form_from_another_site_says_so_and_gives_only_its_origin() {
     assert_eq!(header("sec-fetch-site"), Some("cross-site"));
     assert_eq!(header("origin"), Some("https://shop.example"));
     assert_eq!(header("referer"), Some("https://shop.example/"));
-    assert_eq!((capture.method.as_str(), capture.body.as_str()), ("POST", "a=1"));
+    assert_eq!(
+        (capture.method.as_str(), capture.body.as_str()),
+        ("POST", "a=1")
+    );
 }

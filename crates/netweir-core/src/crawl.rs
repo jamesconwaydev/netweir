@@ -11,10 +11,10 @@ use netweir_browser::{Browser, Cookie, LaunchOptions, WaitUntil};
 use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore};
 use url::Url;
 
-use crate::canonical::{Fingerprint, fingerprint};
+use crate::canonical::{Fingerprint, fingerprint, fingerprint_with};
 use crate::checkpoint::{Checkpoint, Pending, Saved};
 use crate::classify::{BlockKind, Outcome, classify};
-use crate::fetch::{FetchError, FetchErrorKind, FetchOptions, Fetcher, Hop, Response};
+use crate::fetch::{FetchError, FetchErrorKind, FetchOptions, Fetcher, Hop, Outgoing, Response};
 use crate::profile::Profile;
 use crate::robots::Robots;
 use crate::tdmrep::{self, Reservation, TdmFile};
@@ -124,6 +124,12 @@ pub struct CrawlRequest {
     pub depth: u32,
     /// Fetch it in Chrome.
     pub browser: bool,
+    /// The method, body and kind of request, and the page it comes from;
+    /// typing the address by default.
+    pub outgoing: Outgoing,
+    /// Retry a POST or PATCH after a server error too. Off by default:
+    /// the server may have acted on it, and a retry would act twice.
+    pub retry_post: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -530,7 +536,8 @@ impl Crawler {
     }
 
     fn admit(&self, request: CrawlRequest, persist: Persist<'_>) -> Submitted {
-        let Some(fp) = fingerprint("GET", &request.url) else {
+        let o = &request.outgoing;
+        let Some(fp) = fingerprint_with(&o.method, &request.url, o.body.as_deref()) else {
             return Submitted::Invalid;
         };
         let Ok(parsed) = Url::parse(&request.url) else {
@@ -579,6 +586,12 @@ impl Crawler {
                             dont_filter: request.dont_filter,
                             depth: request.depth,
                             payload: payload.to_string(),
+                            method: request.outgoing.method.clone(),
+                            kind: request.outgoing.kind.as_str().to_string(),
+                            body: request.outgoing.body.clone(),
+                            content_type: request.outgoing.content_type.clone(),
+                            referer: request.outgoing.referer.clone(),
+                            retry_post: request.retry_post,
                         },
                     );
                     row
@@ -774,7 +787,9 @@ fn enqueue(
     };
     request.url = url.to_string();
     state.seq += 1;
-    let in_browser = request.browser || settings.browser == BrowserMode::Always;
+    // Chrome navigates to a URL; a POST stays with the HTTP client.
+    let in_browser = (request.browser || settings.browser == BrowserMode::Always)
+        && request.outgoing.method == "GET";
     let queued = Queued {
         priority: request.priority,
         seq: state.seq,
@@ -1006,8 +1021,9 @@ async fn guarded<T: Send + 'static>(
 async fn fetch(shared: Arc<Shared>, mut q: Queued, session: Fetcher) {
     let started = Instant::now();
     let (url, headers, hops) = (q.request.url.clone(), q.request.headers.clone(), q.hops);
+    let outgoing = q.request.outgoing.clone();
     let result = guarded(
-        async move { session.hop(&url, &headers, hops).await },
+        async move { session.hop_as(&url, &outgoing, &headers, hops).await },
         |why| {
             Err(FetchError {
                 kind: FetchErrorKind::Other,
@@ -1048,6 +1064,8 @@ async fn fetch(shared: Arc<Shared>, mut q: Queued, session: Fetcher) {
     }
     state.make_ready(&q.host);
     let can_retry = q.attempts < settings.retries;
+    // A POST the server may have acted on is only sent again when asked.
+    let may_repeat = q.request.outgoing.idempotent() || q.request.retry_post;
     let event = match (result, outcome) {
         (Ok(Hop::Done(response)), Some(Outcome::Blocked { vendor, kind })) => {
             state.stats.blocked += 1;
@@ -1058,9 +1076,11 @@ async fn fetch(shared: Arc<Shared>, mut q: Queued, session: Fetcher) {
             if can_retry {
                 retry(settings, &mut state, q);
                 None
-            } else if settings.browser == BrowserMode::OnBlock {
+            } else if settings.browser == BrowserMode::OnBlock && q.request.outgoing.method == "GET"
+            {
                 // One more go, in Chrome, once the host's delay is up. Not a
-                // retry: the retries are spent.
+                // retry: the retries are spent. Chrome replaying a POST could
+                // submit it twice, so only GETs go.
                 q.in_browser = true;
                 q.blocked = Some(Box::new((vendor, kind, response)));
                 requeue(&mut state, q, Duration::ZERO);
@@ -1097,7 +1117,7 @@ async fn fetch(shared: Arc<Shared>, mut q: Queued, session: Fetcher) {
             }
         }
         (Ok(Hop::Done(response)), Some(Outcome::HttpError(status)))
-            if can_retry && RETRY_STATUSES.contains(&status) =>
+            if can_retry && may_repeat && RETRY_STATUSES.contains(&status) =>
         {
             drop(response);
             retry(settings, &mut state, q);
@@ -1121,8 +1141,8 @@ async fn fetch(shared: Arc<Shared>, mut q: Queued, session: Fetcher) {
         // goes through that host's robots.txt, TDMRep and limits. Its URL
         // counts as seen, but is fetched even if seen: this request has to
         // end somewhere.
-        (Ok(Hop::Redirect(next, _)), _) => {
-            if let Some(fp) = fingerprint("GET", &next) {
+        (Ok(Hop::Redirect(next, then)), _) => {
+            if let Some(fp) = fingerprint_with(&then.method, &next, then.body.as_deref()) {
                 state.seen.insert(fp);
                 if let Some(cp) = &shared.checkpoint {
                     cp.seen(fp);
@@ -1130,6 +1150,7 @@ async fn fetch(shared: Arc<Shared>, mut q: Queued, session: Fetcher) {
             }
             let id = q.request.id;
             q.attempts = 0;
+            q.request.outgoing = then;
             if enqueue(settings, &mut state, q.request, &next, q.hops + 1) {
                 None
             } else {
@@ -1141,7 +1162,13 @@ async fn fetch(shared: Arc<Shared>, mut q: Queued, session: Fetcher) {
                 })
             }
         }
-        (Err(error), _) if can_retry && transient(&error) => {
+        // A connection that never opened never carried the request; any
+        // other failure may have come after the server acted on it.
+        (Err(error), _)
+            if can_retry
+                && transient(&error)
+                && (may_repeat || error.kind == FetchErrorKind::Connect) =>
+        {
             retry(settings, &mut state, q);
             None
         }
@@ -2003,6 +2030,8 @@ mod tests {
                 dont_filter: false,
                 depth: 0,
                 browser: false,
+                outgoing: Outgoing::navigate(),
+                retry_post: false,
             },
             host: String::new(),
             origin: String::new(),

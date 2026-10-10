@@ -17,7 +17,7 @@ use netweir_dom::extract::{self, TrackContext, Value};
 use netweir_dom::{Document, Query};
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
-use pyo3::types::{PyDict, PyList, PyTuple};
+use pyo3::types::{PyBytes, PyDict, PyList, PyTuple};
 use url::Url;
 
 use crate::browser::BrowserPage;
@@ -207,6 +207,8 @@ impl Engine {
                 dont_filter: false,
                 depth,
                 browser: false,
+                outgoing: netweir_core::Outgoing::navigate(),
+                retry_post: false,
             };
             let payload = format!(r#"{{"rule":{at}}}"#);
             if self.core.submit_with(request, &payload) != Submitted::Queued {
@@ -805,8 +807,10 @@ impl Crawler {
     /// "too_deep", "trap" or "domain_full".
     /// With `apply_rules`, the rules take links from the page; then the page
     /// reaches Python only if `to_python`, and a "handled" event says so
-    /// otherwise.
-    #[pyo3(signature = (id, url, priority=0, headers=None, dont_filter=false, apply_rules=false, to_python=true, depth=0, payload="{}", row=None, browser=false))]
+    /// otherwise. `method`, `kind` ("navigate", "form" or "fetch"), `body`,
+    /// `content_type` and `referer` say what to send, as Fetcher.send
+    /// takes them.
+    #[pyo3(signature = (id, url, priority=0, headers=None, dont_filter=false, apply_rules=false, to_python=true, depth=0, payload="{}", row=None, browser=false, method="GET", kind="navigate", body=None, content_type=None, referer=None, retry_post=false))]
     #[allow(clippy::too_many_arguments)]
     fn submit(
         &self,
@@ -821,7 +825,17 @@ impl Crawler {
         payload: &str,
         row: Option<i64>,
         browser: bool,
+        method: &str,
+        kind: &str,
+        body: Option<Vec<u8>>,
+        content_type: Option<String>,
+        referer: Option<String>,
+        retry_post: bool,
     ) -> PyResult<&'static str> {
+        let kind = netweir_core::Kind::parse(kind)
+            .ok_or_else(|| PyValueError::new_err(format!("unknown kind of request {kind:?}")))?;
+        let outgoing =
+            netweir_core::Outgoing::from_parts(method, kind, body, content_type, referer);
         if id >= RULE_IDS {
             return Err(PyValueError::new_err("request ids must be below 2**62"));
         }
@@ -845,6 +859,8 @@ impl Crawler {
             dont_filter,
             depth,
             browser,
+            outgoing,
+            retry_post,
         };
         let outcome = match row {
             Some(row) => self.engine.core.resubmit(request, row),
@@ -898,7 +914,8 @@ impl Crawler {
 
     /// What the checkpoint held, after requests the rules made are queued
     /// again: a dict with "pending" (Python's requests, as (row, url,
-    /// priority, headers, dont_filter, depth, payload)), "items" (ids of
+    /// priority, headers, dont_filter, depth, payload, method, kind, body,
+    /// content_type, referer, retry_post)), "items" (ids of
     /// items already delivered) and "counters" (JSON, or None). None
     /// without a checkpoint. Call it once, after adding the rules.
     fn resume<'py>(&self, py: Python<'py>) -> PyResult<Option<Bound<'py, PyDict>>> {
@@ -918,14 +935,25 @@ impl Crawler {
                 .and_then(|v| v.get("rule").and_then(serde_json::Value::as_u64))
                 .map(|r| r as usize);
             let Some(at) = rule.filter(|r| *r < rules.len()) else {
+                let body = p.body.map(|b| PyBytes::new(py, &b).unbind());
                 python.push((
-                    p.row,
-                    p.url,
-                    p.priority,
-                    p.headers,
-                    p.dont_filter,
-                    p.depth,
-                    p.payload,
+                    (
+                        p.row,
+                        p.url,
+                        p.priority,
+                        p.headers,
+                        p.dont_filter,
+                        p.depth,
+                        p.payload,
+                    ),
+                    (
+                        p.method,
+                        p.kind,
+                        body,
+                        p.content_type,
+                        p.referer,
+                        p.retry_post,
+                    ),
                 ));
                 continue;
             };
@@ -949,6 +977,8 @@ impl Crawler {
                 dont_filter: p.dont_filter,
                 depth: p.depth,
                 browser: false,
+                outgoing: netweir_core::Outgoing::navigate(),
+                retry_post: false,
             };
             if self.engine.core.resubmit(request, p.row) != Submitted::Queued {
                 self.engine.tags().remove(&id);
