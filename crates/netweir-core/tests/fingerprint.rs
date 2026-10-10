@@ -379,3 +379,29 @@ async fn a_form_from_another_site_says_so_and_gives_only_its_origin() {
         ("POST", "a=1")
     );
 }
+
+#[tokio::test]
+async fn firefox_156_forms_and_scripts_post_like_firefox_over_http2() {
+    let expected: Vec<Capture> = serde_json::from_str(include_str!(
+        "../../../profiles/firefox-156-macos.post.capture.json"
+    ))
+    .unwrap();
+    let mut server = Server::start().await.unwrap();
+    let fetcher = local_fetcher("firefox-156-macos");
+    let actual = post_scenario(&fetcher, &mut server).await;
+    assert_same_in_order(&expected, &actual, "Firefox posting over HTTP/2");
+}
+
+#[tokio::test]
+async fn firefox_156_forms_and_scripts_post_like_firefox_over_http1() {
+    let expected: Vec<Capture> = serde_json::from_str(include_str!(
+        "../../../profiles/firefox-156-macos.post.http1.capture.json"
+    ))
+    .unwrap();
+    let mut server = Server::start_http1(0).await.unwrap();
+    let fetcher = local_fetcher("firefox-156-macos");
+    let warm = [format!("https://localhost:{}/warm", server.port)];
+    run(&fetcher, &mut server, &warm).await;
+    let actual = post_scenario(&fetcher, &mut server).await;
+    assert_same_in_order(&expected, &actual, "Firefox posting over HTTP/1.1");
+}

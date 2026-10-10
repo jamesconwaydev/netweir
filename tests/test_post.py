@@ -238,7 +238,7 @@ def test_a_multipart_form_is_sent_as_multipart(base):
 
 def test_a_profile_without_a_capture_says_so(base):
     with pytest.raises(netweir.FetchError, match="no capture of a form submission"):
-        netweir.post(f"{base}/echo", form={"a": 1}, profile="firefox")
+        netweir.post(f"{base}/echo", form={"a": 1}, profile="safari")
 
 
 FAST = netweir.Settings(
