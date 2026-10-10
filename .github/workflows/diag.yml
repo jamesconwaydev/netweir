@@ -1,0 +1,82 @@
+name: diag
+
+# Runs the Chrome crawl tests over and over on macOS, and when one stalls,
+# records what Chrome and the machine were doing.
+on:
+  pull_request:
+    paths: [.github/workflows/diag.yml]
+
+permissions:
+  contents: read
+
+jobs:
+  stall:
+    strategy:
+      fail-fast: false
+      matrix:
+        run: [1, 2, 3]
+    runs-on: macos-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          submodules: true
+      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master
+        with:
+          toolchain: stable
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          python-version: "3.14"
+      - run: uv sync --group dev
+      - run: uv run maturin develop --uv
+      - run: uv run netweir install chrome
+      - run: cargo test -p netweir-core --test browser --no-run
+      - name: Run the browser tests until one stalls
+        shell: bash
+        run: |
+          for f in target/debug/deps/browser-*; do
+            case "$f" in *.d) ;; *) bin=$f ;; esac
+          done
+          mkdir -p diag
+          snapshot() {
+            local out=diag/$1
+            mkdir -p "$out"
+            ps -axo pid,ppid,%cpu,%mem,rss,etime,state,command > "$out/ps.txt"
+            top -l 1 -n 20 -o cpu > "$out/top.txt" 2>&1
+            vm_stat > "$out/vm_stat.txt"
+            sysctl -n vm.loadavg > "$out/loadavg.txt"
+            for pid in $(pgrep -f "Google Chrome for Testing" ); do
+              args=$(ps -o command= -p "$pid" | cut -c1-200)
+              case "$args" in
+                *--type=*) kind=$(echo "$args" | grep -oE -- '--type=[a-z-]+' | head -1) ;;
+                *) kind=browser ;;
+              esac
+              sample "$pid" 2 -mayDie -file "$out/sample-$pid-${kind#--type=}.txt" > /dev/null 2>&1 &
+            done
+            wait
+            log show --last 2m --style compact \
+              --predicate 'process CONTAINS "Chrome" OR eventMessage CONTAINS[c] "chrome"' \
+              > "$out/log.txt" 2>&1 || true
+          }
+          stalls=0
+          for i in $(seq 1 25); do
+            "$bin" > "diag/run-$i.txt" 2>&1 &
+            test=$!
+            waited=0
+            while kill -0 "$test" 2>/dev/null; do
+              sleep 5
+              waited=$((waited + 5))
+              if [ "$waited" -eq 45 ]; then
+                echo "run $i still going after 45s: taking a snapshot"
+                snapshot "stall-$i"
+                stalls=$((stalls + 1))
+              fi
+            done
+            wait "$test" && echo "run $i passed in ${waited}s" || echo "run $i FAILED after ${waited}s"
+          done
+          echo "runs that went past 45s: $stalls"
+      - if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: diag-${{ matrix.run }}
+          path: diag/
