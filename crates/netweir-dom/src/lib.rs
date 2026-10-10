@@ -8,6 +8,7 @@ mod document;
 pub mod extract;
 mod ffi;
 mod index;
+pub mod metadata;
 mod query;
 pub mod track;
 mod xpath;

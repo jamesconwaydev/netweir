@@ -564,8 +564,8 @@ fn cookie_from(d: &Bound<'_, PyAny>) -> PyResult<Cookie> {
     })
 }
 
-/// JSON from the page as Python values.
-fn to_python(py: Python<'_>, value: &serde_json::Value) -> PyResult<Py<PyAny>> {
+/// JSON as Python values.
+pub(crate) fn to_python(py: Python<'_>, value: &serde_json::Value) -> PyResult<Py<PyAny>> {
     use serde_json::Value;
     Ok(match value {
         Value::Null => py.None(),

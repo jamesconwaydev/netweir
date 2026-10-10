@@ -34,6 +34,8 @@ Working today:
 - CSS queries with Scrapy's `::text` and `::attr()`, all of XPath 1.0, and
   Beautiful Soup's `find_all` family, each faster than the library you'd
   otherwise use for it.
+- Structured data: `page.metadata()` reads a page's JSON-LD, microdata,
+  Open Graph, Twitter cards and Dublin Core in one call, in Rust.
 - Crawling: spiders, robots.txt, per-site throttling, and items written
   to JSON Lines, CSV or Parquet.
 - Declarative spiders, where you describe the item and the links and

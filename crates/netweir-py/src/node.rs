@@ -557,6 +557,21 @@ impl Node {
         py.detach(move || unsafe { doc.node(id) }.readable_text_pieces().concat())
     }
 
+    /// The structured data the page carries about itself: a dict with
+    /// "json_ld", "microdata", "opengraph", "twitter" and "dublin_core".
+    /// Relative URLs in microdata are made absolute against `base_url`.
+    #[pyo3(signature = (base_url=None))]
+    fn metadata(&self, py: Python<'_>, base_url: Option<&str>) -> PyResult<Py<PyAny>> {
+        let doc = self.doc.clone();
+        let id = self.id;
+        let base = base_url.and_then(|b| url::Url::parse(b).ok());
+        // SAFETY: `id` belongs to `doc`.
+        let value = py.detach(move || {
+            netweir_dom::metadata::metadata(unsafe { doc.node(id) }, base.as_ref())
+        });
+        crate::browser::to_python(py, &value)
+    }
+
     /// The node as HTML.
     #[getter]
     fn html(&self, py: Python<'_>) -> String {
