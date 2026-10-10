@@ -264,6 +264,7 @@ class Fetcher:
         proxy: str | None = None,
         timeout: float = 30.0,
         verify: bool = True,
+        max_size: int | None = None,
     ) -> None: ...
     async def get(self, url: str, headers: list[tuple[str, str]] | None = None) -> Response: ...
     def get_blocking(self, url: str, headers: list[tuple[str, str]] | None = None) -> Response: ...
@@ -317,6 +318,7 @@ class Crawler:
         checkpoint: str | None = None,
         browser: str = "off",
         browser_pages: int = 4,
+        max_response_size: int | None = None,
     ) -> None: ...
     def add_rule(
         self,

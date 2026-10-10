@@ -245,8 +245,14 @@ class Client:
     Chrome). ``timeout`` covers a whole request, in seconds.
     """
 
-    def __init__(self, profile: str = "chrome", proxy: str | None = None, timeout: float = 30.0):
-        self._fetcher = Fetcher(profile, proxy, timeout)
+    def __init__(
+        self,
+        profile: str = "chrome",
+        proxy: str | None = None,
+        timeout: float = 30.0,
+        max_size: int | None = None,
+    ):
+        self._fetcher = Fetcher(profile, proxy, timeout, max_size=max_size)
 
     async def get(
         self,
@@ -321,6 +327,7 @@ def get(
     timeout: float = 30.0,
     raise_on_block: bool = True,
     referer: str | None = None,
+    max_size: int | None = None,
 ) -> Page:
     """Fetches one page and waits for it. For many pages, use Client.
 
@@ -337,6 +344,7 @@ def get(
         timeout=timeout,
         raise_on_block=raise_on_block,
         referer=referer,
+        max_size=max_size,
     )
 
 
@@ -353,13 +361,14 @@ def request(
     timeout: float = 30.0,
     raise_on_block: bool = True,
     referer: str | None = None,
+    max_size: int | None = None,
 ) -> Page:
     """Sends any request and waits for the page. ``form`` is submitted as
     a form (URL-encoded); ``json`` or a raw ``body`` as a page's script
     would send it. ``referer`` is the page the request comes from; a form
     or a script without one comes from the root of the target's site."""
     how = payload(method, form, json, body)
-    fetcher = Fetcher(profile, proxy, timeout)
+    fetcher = Fetcher(profile, proxy, timeout, max_size=max_size)
     response = fetcher.send_blocking(url, headers=_pairs(headers), referer=referer, **how)
     return _checked(Page(response), raise_on_block)
 
@@ -376,11 +385,12 @@ def submit(
     proxy: str | None = None,
     timeout: float = 30.0,
     raise_on_block: bool = True,
+    max_size: int | None = None,
 ) -> Page:
     """Submits a form read with ``page.form()``, from its page. Use a
     Client's ``submit`` to keep the cookies the page was fetched with."""
     url, how = _from_form(form)
-    fetcher = Fetcher(profile, proxy, timeout)
+    fetcher = Fetcher(profile, proxy, timeout, max_size=max_size)
     response = fetcher.send_blocking(url, headers=_pairs(headers), referer=form.referer, **how)
     return _checked(Page(response), raise_on_block)
 

@@ -37,6 +37,9 @@ class Settings:
     proxy: str | None = None
     #: Seconds for a whole request.
     timeout: float = 30.0
+    #: Bytes of a response body, after decompression, beyond which the
+    #: request fails with FetchError(kind="too_large"); None for no limit.
+    max_response_size: int | None = 64 * 1024 * 1024
     #: Requests in flight across all sites, and to one host.
     concurrency: int = 64
     per_domain: int = 8
@@ -126,6 +129,7 @@ class Settings:
             profile=self.profile,
             proxy=self.proxy,
             timeout=self.timeout,
+            max_response_size=self.max_response_size,
             concurrency=self.concurrency,
             per_domain=self.per_domain,
             obey_robots=self.obey_robots,

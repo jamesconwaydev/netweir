@@ -19,6 +19,7 @@ ignored. Times are in seconds.
 | `proxy` | `None` | an `http://`, `https://` or `socks5://` proxy for every request |
 | `proxies` | `()` | proxies a site moves through each time it blocks a session |
 | `timeout` | `30.0` | the limit for one whole request |
+| `max_response_size` | `67108864` | the most bytes of a response body (64 MiB), counted after decompression, so a small compressed answer that unpacks to gigabytes is stopped too; a larger one fails with `FetchError(kind="too_large")`, and `None` reads any size |
 
 ## Pace and politeness
 

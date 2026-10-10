@@ -62,6 +62,9 @@ class Handler(BaseHTTPRequestHandler):
         self.send(200, json.dumps(reply).encode(), [("Content-Type", "application/json")])
 
     def do_GET(self):
+        if self.path == "/big":
+            self.send(200, b"x" * 50_000, [("Content-Type", "text/plain")])
+            return
         if self.path == "/form":
             self.send(200, FORM_PAGE.encode(), [("Content-Type", "text/html; charset=utf-8")])
         else:
@@ -420,3 +423,31 @@ def test_a_body_needs_a_method_that_can_carry_one():
     # Leaving the method out with a body means POST.
     assert netweir.Request("https://example.com/", form={"a": 1}).method == "POST"
     assert netweir.Request("https://example.com/").method == "GET"
+
+
+def test_a_response_over_the_size_limit_fails(base):
+    with pytest.raises(netweir.FetchError) as caught:
+        netweir.get(f"{base}/big", max_size=10_000)
+    assert caught.value.kind == "too_large"
+    assert len(netweir.get(f"{base}/big").body) == 50_000
+
+
+def test_a_crawl_stops_reading_a_response_over_its_limit(base):
+    errors = []
+
+    class Big(netweir.Spider):
+        settings = netweir.Settings(
+            throttle=False, start_delay=0, obey_robots=False, max_response_size=10_000
+        )
+
+        def start(self):
+            yield netweir.Request(f"{base}/big", errback=self.lost)
+
+        def parse(self, page):
+            pass
+
+        def lost(self, request, error):
+            errors.append(error.kind)
+
+    Big().run()
+    assert errors == ["too_large"]

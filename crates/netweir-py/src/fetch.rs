@@ -26,6 +26,7 @@ pub(crate) fn fetch_error_value(py: Python<'_>, e: &CoreError) -> PyResult<Py<Py
         FetchErrorKind::Tls => "tls",
         FetchErrorKind::TooManyRedirects => "too_many_redirects",
         FetchErrorKind::Body => "body",
+        FetchErrorKind::TooLarge => "too_large",
         FetchErrorKind::Other => "other",
     };
     let class = py.import("netweir._errors")?.getattr("FetchError")?;
@@ -69,9 +70,16 @@ pub struct Fetcher {
 #[pymethods]
 impl Fetcher {
     #[new]
-    #[pyo3(signature = (profile="chrome", proxy=None, timeout=30.0, verify=true))]
-    fn new(profile: &str, proxy: Option<String>, timeout: f64, verify: bool) -> PyResult<Fetcher> {
-        let options = fetch_options(profile, proxy, timeout, verify)?;
+    #[pyo3(signature = (profile="chrome", proxy=None, timeout=30.0, verify=true, max_size=None))]
+    fn new(
+        profile: &str,
+        proxy: Option<String>,
+        timeout: f64,
+        verify: bool,
+        max_size: Option<u64>,
+    ) -> PyResult<Fetcher> {
+        let mut options = fetch_options(profile, proxy, timeout, verify)?;
+        options.max_body = max_size;
         // Everything that can fail here is a bad argument (profile, proxy).
         let inner = CoreFetcher::new(options).map_err(|e| PyValueError::new_err(e.message))?;
         Ok(Fetcher { inner })

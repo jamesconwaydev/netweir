@@ -663,7 +663,7 @@ impl Crawler {
         max_depth=None, max_pages_per_domain=None,
         retries=3, backoff_base=1.0, backoff_max=60.0, proxies=None,
         breaker_window=50, breaker_ratio=0.3, breaker_pause=300.0, checkpoint=None,
-        browser="off", browser_pages=4,
+        browser="off", browser_pages=4, max_response_size=None,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -693,6 +693,7 @@ impl Crawler {
         checkpoint: Option<std::path::PathBuf>,
         browser: &str,
         browser_pages: usize,
+        max_response_size: Option<u64>,
     ) -> PyResult<Crawler> {
         let browser = match browser {
             "off" => BrowserMode::Off,
@@ -754,7 +755,8 @@ impl Crawler {
             browser_pages,
             browser_launch: Default::default(),
         };
-        let options = fetch_options(profile, proxy, timeout, verify)?;
+        let mut options = fetch_options(profile, proxy, timeout, verify)?;
+        options.max_body = max_response_size;
         // The scheduler runs on the shared runtime.
         let _runtime = pyo3_async_runtimes::tokio::get_runtime().enter();
         let core =

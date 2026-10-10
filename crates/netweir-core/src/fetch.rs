@@ -22,6 +22,9 @@ pub struct FetchOptions {
     pub timeout: Duration,
     /// Only for talking to local test servers with self-signed certificates.
     pub verify_certificates: bool,
+    /// The most bytes of a response body to read, after decompression; a
+    /// larger one fails with `TooLarge`. None reads any size.
+    pub max_body: Option<u64>,
 }
 
 impl FetchOptions {
@@ -31,6 +34,7 @@ impl FetchOptions {
             proxy: None,
             timeout: Duration::from_secs(30),
             verify_certificates: true,
+            max_body: None,
         }
     }
 }
@@ -106,6 +110,8 @@ impl wreq::cookie::CookieStore for OrderedJar {
 #[derive(Clone)]
 pub struct Fetcher {
     client: wreq::Client,
+    /// The most bytes of a body to read.
+    max_body: Option<u64>,
     /// For a script's requests, where they have a priority of their own.
     script_client: Option<wreq::Client>,
     http2_headers: Arc<Vec<(HeaderName, HeaderValue)>>,
@@ -170,6 +176,8 @@ pub enum FetchErrorKind {
     TooManyRedirects,
     /// The connection broke while reading the response.
     Body,
+    /// The body was larger than the limit.
+    TooLarge,
     Other,
 }
 
@@ -310,6 +318,38 @@ impl Relation {
             Relation::CrossSite => "cross-site",
         }
     }
+}
+
+/// The body, or `TooLarge` as soon as it's known to be over `max` bytes:
+/// from a Content-Length that says so, or while reading, which counts the
+/// bytes after decompression, so a small compressed body that unpacks to
+/// gigabytes is stopped too.
+async fn read_at_most(url: &str, response: wreq::Response, max: u64) -> Result<Bytes, FetchError> {
+    use http_body_util::BodyExt;
+    let too_large = || FetchError {
+        kind: FetchErrorKind::TooLarge,
+        message: format!("{url}: the response is larger than the limit of {max} bytes"),
+    };
+    let declared = response
+        .headers()
+        .get(wreq::header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<u64>().ok());
+    if declared.is_some_and(|n| n > max) {
+        return Err(too_large());
+    }
+    let mut body = Vec::new();
+    let mut stream = wreq::Body::from(response);
+    while let Some(frame) = stream.frame().await {
+        let Ok(chunk) = frame?.into_data() else {
+            continue; // trailers
+        };
+        if body.len() as u64 + chunk.len() as u64 > max {
+            return Err(too_large());
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body.into())
 }
 
 /// From an https page to an http URL, where browsers send no Referer.
@@ -596,6 +636,7 @@ impl Fetcher {
             .collect::<Result<Vec<_>, _>>()?;
         Ok(Fetcher {
             client,
+            max_body: options.max_body,
             script_client,
             http2_headers: Arc::new(http2_headers),
             navigation_order: Arc::new(profile.header_order(false)),
@@ -758,7 +799,7 @@ impl Fetcher {
             .and_then(|l| l.to_str().ok());
         let Some(location) = location else {
             return Ok(Hop::Done(
-                into_response(current.to_string(), response).await?,
+                into_response(current.to_string(), response, self.max_body).await?,
             ));
         };
         if hop >= MAX_REDIRECTS {
@@ -978,7 +1019,11 @@ fn https_origin(url: &Uri) -> Option<String> {
     })
 }
 
-async fn into_response(url: String, response: wreq::Response) -> Result<Response, FetchError> {
+async fn into_response(
+    url: String,
+    response: wreq::Response,
+    max_body: Option<u64>,
+) -> Result<Response, FetchError> {
     let status = response.status().as_u16();
     let version = match response.version() {
         Version::HTTP_09 => "HTTP/0.9",
@@ -998,7 +1043,10 @@ async fn into_response(url: String, response: wreq::Response) -> Result<Response
             )
         })
         .collect();
-    let body = response.bytes().await?;
+    let body = match max_body {
+        None => response.bytes().await?,
+        Some(max) => read_at_most(&url, response, max).await?,
+    };
     Ok(Response {
         url,
         status,

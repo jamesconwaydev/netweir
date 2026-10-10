@@ -3,7 +3,8 @@ class FetchError(Exception):
 
     ``kind`` says why: ``"invalid"`` (bad URL, header or proxy),
     ``"timeout"``, ``"connect"``, ``"tls"``, ``"too_many_redirects"``,
-    ``"body"`` (the connection broke mid-response) or ``"other"``.
+    ``"body"`` (the connection broke mid-response), ``"too_large"`` (the
+    body passed the size limit) or ``"other"``.
     """
 
     def __init__(self, message: str, kind: str = "other"):
