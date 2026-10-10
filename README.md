@@ -365,9 +365,14 @@ netweir gives up instead of hanging:
 netweir.parse(html, timeout=2.0)  # raises netweir.ParseTimeout
 ```
 
-The timeout bounds time, not memory. A small page built to abuse the HTML5
-spec's rules for misnested formatting tags can still make any spec-compliant
-parser allocate gigabytes; a cap on that comes with the crawler.
+The timeout bounds time, not memory. A crawl reads at most 64 MiB of a
+response, counted after decompression, so a huge page or a small compressed
+one that unpacks to gigabytes fails instead of filling memory
+(`max_response_size` sets the limit; `max_size=` does the same for
+`netweir.get`). It doesn't stop a small page built to abuse the HTML5
+spec's rules for misnested formatting tags, which can make any
+spec-compliant parser allocate gigabytes; nothing in netweir caps the
+parser's memory yet.
 
 ## When a page needs a real browser
 

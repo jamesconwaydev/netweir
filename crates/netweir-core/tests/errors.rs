@@ -72,3 +72,67 @@ async fn bad_input_is_invalid() {
         FetchErrorKind::Invalid
     );
 }
+
+/// Serves `head` and `body` once, as raw HTTP/1.1, and returns the URL.
+async fn serve_once(head: String, body: Vec<u8>) -> String {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        let (mut s, _) = listener.accept().await.unwrap();
+        let mut buf = [0u8; 4096];
+        let _ = s.read(&mut buf).await;
+        let _ = s.write_all(head.as_bytes()).await;
+        let _ = s.write_all(&body).await;
+        let _ = s.shutdown().await;
+    });
+    format!("http://127.0.0.1:{port}/")
+}
+
+fn capped(max: u64) -> Fetcher {
+    let mut options = FetchOptions::new(Profile::named("chrome").unwrap());
+    options.timeout = Duration::from_secs(5);
+    options.max_body = Some(max);
+    Fetcher::new(options).unwrap()
+}
+
+#[tokio::test]
+async fn a_response_that_says_its_too_large_is_refused() {
+    let head = "HTTP/1.1 200 OK\r\nContent-Length: 2000\r\nConnection: close\r\n\r\n".to_string();
+    let url = serve_once(head, vec![b'x'; 2000]).await;
+    let err = capped(1000).get(&url, &[]).await.unwrap_err();
+    assert_eq!(err.kind, FetchErrorKind::TooLarge, "{err}");
+    assert!(err.message.contains("1000"), "{err}");
+}
+
+#[tokio::test]
+async fn a_response_that_doesnt_say_is_cut_off_at_the_limit() {
+    let head = "HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n".to_string();
+    let url = serve_once(head, vec![b'x'; 5000]).await;
+    let err = capped(1000).get(&url, &[]).await.unwrap_err();
+    assert_eq!(err.kind, FetchErrorKind::TooLarge, "{err}");
+}
+
+#[tokio::test]
+async fn the_limit_counts_what_a_compressed_body_unpacks_to() {
+    use std::io::Write;
+    let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::best());
+    gz.write_all(&vec![b'x'; 100_000]).unwrap();
+    let small = gz.finish().unwrap();
+    assert!(small.len() < 1000);
+    let head = format!(
+        "HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        small.len()
+    );
+    let url = serve_once(head, small).await;
+    let err = capped(10_000).get(&url, &[]).await.unwrap_err();
+    assert_eq!(err.kind, FetchErrorKind::TooLarge, "{err}");
+}
+
+#[tokio::test]
+async fn a_response_within_the_limit_arrives_whole() {
+    let head = "HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n".to_string();
+    let url = serve_once(head, vec![b'x'; 1000]).await;
+    let response = capped(1000).get(&url, &[]).await.unwrap();
+    assert_eq!(response.body.len(), 1000);
+}
