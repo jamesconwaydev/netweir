@@ -196,6 +196,17 @@ impl Said {
         said
     }
 
+    /// `message`, with what Chrome has said lately, if anything, after
+    /// it; for a Chrome still running.
+    pub(crate) fn lately(&self, message: String) -> String {
+        let lines = self.0.0.lock().unwrap_or_else(|e| e.into_inner());
+        if lines.0.is_empty() {
+            return message;
+        }
+        let said: Vec<&str> = lines.0.iter().map(String::as_str).collect();
+        format!("{message}; Chrome said lately:\n{}", said.join("\n"))
+    }
+
     /// `message`, with what Chrome said, if anything, after it. Waits up
     /// to a second for a Chrome that has just exited to finish saying it;
     /// only ever on the way to an error.

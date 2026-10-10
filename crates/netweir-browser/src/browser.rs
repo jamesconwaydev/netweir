@@ -98,6 +98,8 @@ pub(crate) struct Inner {
     pub timeout: Duration,
     /// The proxy's username and password, for its challenges.
     pub proxy_login: Option<(String, String)>,
+    /// What the launched Chrome has lately written to stderr.
+    pub said: Option<launch::Said>,
 }
 
 impl Browser {
@@ -159,6 +161,7 @@ impl Browser {
             identity: None,
             timeout: options.timeout,
             proxy_login,
+            said: Some(said.clone()),
         };
         Browser::finish(inner, &options, &executable.display().to_string(), hints)
             .await
@@ -206,6 +209,7 @@ impl Browser {
             identity: None,
             timeout: options.timeout,
             proxy_login: None,
+            said: None,
         };
         Browser::finish(inner, &options, &ws, None).await
     }
@@ -384,12 +388,10 @@ impl Browser {
     }
 
     async fn create_context(&self) -> Result<String> {
+        // Gone when the connection is, however netweir lets go of it.
         let r = self
             .inner
-            .conn
-            // Gone when the connection is, however netweir lets go of it.
-            .call_within(
-                self.inner.timeout,
+            .call(
                 "",
                 "Target.createBrowserContext",
                 json!({"disposeOnDetach": true}),
@@ -450,6 +452,25 @@ impl Browser {
 }
 
 impl Inner {
+    /// Sends `method` and waits for the answer, for no longer than the
+    /// timeout, with what Chrome has lately said in the error if it
+    /// doesn't come.
+    pub(crate) async fn call(&self, session: &str, method: &str, params: Value) -> Result<Value> {
+        self.conn
+            .call_within(self.timeout, session, method, params)
+            .await
+            .map_err(|e| self.explain(e))
+    }
+
+    /// A timeout, with what Chrome has lately said after it: why Chrome
+    /// stopped answering is often there.
+    pub(crate) fn explain(&self, e: Error) -> Error {
+        match (e, &self.said) {
+            (Error::Timeout(m), Some(said)) => Error::Timeout(said.lately(m)),
+            (e, _) => e,
+        }
+    }
+
     fn shut_down(&self, grace: Duration) -> Result<()> {
         let Some(mut child) = self.child.lock().unwrap_or_else(|e| e.into_inner()).take() else {
             // Connected, not launched: let go of the browser. Its contexts
@@ -596,6 +617,7 @@ async fn headless_identity(executable: &Path, extra: &[String]) -> Result<(Strin
             identity: None,
             timeout: Duration::from_secs(30),
             proxy_login: None,
+            said: Some(said.clone()),
         }),
     };
     let what = executable.display().to_string();
@@ -863,9 +885,7 @@ impl Context {
     pub async fn close(&self) -> Result<()> {
         match self
             .browser
-            .conn
-            .call_within(
-                self.browser.timeout,
+            .call(
                 "",
                 "Target.disposeBrowserContext",
                 json!({"browserContextId": self.id}),
@@ -885,10 +905,7 @@ pub(crate) async fn context_cookies(browser: &Inner, context: Option<&str>) -> R
     if let Some(id) = context {
         params["browserContextId"] = Value::from(id);
     }
-    let r = browser
-        .conn
-        .call_within(browser.timeout, "", "Storage.getCookies", params)
-        .await?;
+    let r = browser.call("", "Storage.getCookies", params).await?;
     Ok(cookies_from(&r["cookies"]))
 }
 
@@ -901,10 +918,7 @@ pub(crate) async fn set_context_cookies(
     if let Some(id) = context {
         params["browserContextId"] = Value::from(id);
     }
-    browser
-        .conn
-        .call_within(browser.timeout, "", "Storage.setCookies", params)
-        .await?;
+    browser.call("", "Storage.setCookies", params).await?;
     Ok(())
 }
 
